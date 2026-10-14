@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/convesso-core", "crates/convesso-embassy", "crates/convesso-relay", "crates/convesso-stream", "crates/convesso-tokio", "crates/convesso-vectors"]
+exclude = ["firmware", "fuzz"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+
+# Chosen under the crate rule of DESIGN.md §3, declared once so that the
+# core and the vectors that check it use exactly the same versions and features.
+# Default features are off throughout: they bring in `alloc`, `getrandom` and, for
+# curve25519-dalek, ~30 KiB of precomputed tables that X25519 does not use.
+[workspace.dependencies]
+blake2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# >= 4.1.3 for RUSTSEC-2024-0344; enforced by cargo-deny.
+curve25519-dalek = { version = "5.0.0", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13.0", features = ["zeroize"] }
+# Only to derive the X25519 scalar from an Ed25519 seed (feature `ed25519-seed`);
+# the transport key never signs.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1.9.1", default-features = false }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
+proptest = "1.11.0"
+serde_json = "1.0.151"
+snow = "0.10.0"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+
+# Host builds (the tokio driver, the relay) run for speed:
+# opt-level "s" made the AEAD more than twice as slow. The firmware has a
+# workspace of its own, optimised for size, which the footprint budget measures.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false

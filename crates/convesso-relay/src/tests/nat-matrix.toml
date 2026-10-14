@@ -1,0 +1,23 @@
+# The expected outcome of every pair of NAT profiles (PROTOCOL.md §7).
+# One run per line: profile-a profile-b family expected-path. The simulator
+# checks this table (tests/matrix.rs), and so does a run on real NATs.
+#
+# direct        the session moved to a direct path
+# relayed       it stayed on the relay over UDP
+# relayed-tcp   it stayed on the relay, over the TCP link (UDP blocked)
+#
+# The path is the dialling side's (profile-a): with UDP blocked only on the
+# other side, the dialling side still reaches the relay over UDP.
+
+eim         eim         ipv4  direct
+eim         full-cone   ipv4  direct
+eim         symmetric   ipv4  relayed
+eim         cgnat       ipv4  direct
+full-cone   full-cone   ipv4  direct
+full-cone   symmetric   ipv4  direct
+symmetric   symmetric   ipv4  relayed
+cgnat       cgnat       ipv4  direct
+cgnat       symmetric   ipv4  relayed
+eim         no-udp      ipv4  relayed
+no-udp      eim         ipv4  relayed-tcp
+v6-firewall v6-firewall ipv6  direct

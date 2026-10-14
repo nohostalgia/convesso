@@ -1,0 +1,33 @@
+# Build output: the root workspace, the firmware workspace, and any other
+# workspace added later (fuzz targets included).
+target/
+
+# Cargo.lock is committed on purpose, in every workspace: the dependency
+# policy (cargo-deny), the footprint budget and the vectors are checked against
+# exact versions, so every machine and CI must resolve the same ones.
+
+# cargo-fuzz: crashes, minimised inputs and coverage stay local; a corpus worth
+# keeping is committed explicitly, not by default.
+fuzz/artifacts/
+fuzz/coverage/
+
+# Coverage and profiling output.
+*.profraw
+*.profdata
+perf.data*
+
+# Python bytecode from the scripts (the vector generators, footprint.py).
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local environment.
+.env
+.env.*

@@ -1,0 +1,6 @@
+# Static Linux binaries (`--target x86_64-unknown-linux-musl`), built on any
+# host without a C toolchain: the code is pure Rust, and Rust ships the musl
+# C runtime and its own linker.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]

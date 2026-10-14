@@ -1,0 +1,39 @@
+[package]
+name = "convesso-core"
+version = "0.0.0"
+description = "The convesso protocol core: no_std, no allocator, sans-IO."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Growable storage over `alloc` collections, for servers. The core's own logic
+# never allocates; this only adds a storage implementation that does.
+alloc = []
+# Builds an identity from an Ed25519 seed, deriving its X25519 scalar with
+# SHA-512. Without it, an identity is provisioned with the derived scalar, and
+# a microcontroller links neither SHA-512 nor Ed25519 code.
+ed25519-seed = ["dep:ed25519-dalek"]
+# Exposes `Endpoint::through_relay`, which wraps any packet in a forward: for
+# tests and fuzzing, which put arbitrary packets through the relay. Never
+# needed by an application: the core chooses every path.
+testing = []
+
+[dependencies]
+blake2.workspace = true
+chacha20poly1305.workspace = true
+curve25519-dalek.workspace = true
+ed25519-dalek = { workspace = true, optional = true }
+hmac.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+# The audited Noise implementation the handshake is checked against. Tests only.
+snow.workspace = true
+
+[lints]
+workspace = true

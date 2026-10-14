@@ -1,0 +1,51 @@
+[package]
+name = "convesso-embassy"
+version = "0.0.0"
+description = "The convesso driver for microcontrollers, on Embassy: sockets, timers and the chip's generator around the sans-IO core. No allocator."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["embassy-net", "medium-ethernet"]
+# The socket interface over embassy-net (UDP, TCP, IPv4 and IPv6).
+embassy-net = ["dep:embassy-net"]
+# The link embassy-net runs over: Ethernet framing (Wi-Fi chips, Ethernet,
+# TAP), or bare IP (PPP, TUN). At least one, with `embassy-net`.
+medium-ethernet = ["embassy-net?/medium-ethernet"]
+medium-ip = ["embassy-net?/medium-ip"]
+# An adapter from rand_core 0.9's `TryCryptoRng`, which HALs put on a hardware
+# generator fit for cryptography.
+rand_core = ["dep:rand_core"]
+# Reliable messages (convesso-stream, the `Mcu` configuration), beside the
+# datagrams: off by default, the application's choice. No allocator.
+stream = ["dep:convesso-stream"]
+
+[dependencies]
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", default-features = false, features = ["udp", "tcp", "proto-ipv4", "proto-ipv6"], optional = true }
+embassy-sync = "0.8.0"
+embassy-time = "0.5.1"
+embedded-io-async = "0.7.0"
+convesso-core = { path = "../convesso-core", version = "0.0.0" }
+convesso-stream = { path = "../convesso-stream", version = "0.0.0", optional = true }
+rand_core = { version = "0.9.3", default-features = false, optional = true }
+
+[dev-dependencies]
+# On the host, the critical sections of embassy-sync are std's; on a
+# microcontroller, the HAL's.
+critical-section = { version = "1.2.0", features = ["std"] }
+embassy-futures = "0.1.2"
+embassy-sync = "0.8.0"
+embassy-executor = { version = "0.10.0", features = ["platform-std", "executor-thread"] }
+embassy-net-driver = "0.2.0"
+embassy-time = { version = "0.5.1", features = ["std", "generic-queue-64"] }
+convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc"] }
+convesso-relay = { path = "../convesso-relay", version = "0.0.0" }
+proptest.workspace = true
+tokio = { version = "1.53.2", features = ["macros", "rt", "time"] }
+embedded-io-async = "0.7.0"
+serde_json.workspace = true
+
+[lints]
+workspace = true

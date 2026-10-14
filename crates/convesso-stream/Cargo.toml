@@ -1,0 +1,23 @@
+[package]
+name = "convesso-stream"
+version = "0.0.0"
+description = "Optional reliable messages over convesso sessions: no_std, no allocator required, sans-IO."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Growable buffers over `alloc` collections, for servers (the `Server`
+# configuration). Without it, every buffer is a fixed array.
+alloc = ["convesso-core/alloc"]
+
+[dependencies]
+convesso-core = { path = "../convesso-core", version = "0.0.0" }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+# The containerised relay's configuration (crates/convesso-tokio/src/relay_config.rs).
+udp = "0.0.0.0:7400"
+tcp = "0.0.0.0:7400"
+identity = "/data/relay.key"
+
+# Optional limits; each field left out keeps the relay's default, shown here.
+# [limits]
+# bytes_per_second = 2500000          # forwards per client
+# bytes_burst = 10000000
+# packets_per_second = 5000
+# packets_burst = 5000
+# first_contacts_per_recipient = 20
+# first_contacts_burst = 5
+# handshakes_per_ip = 20              # handshakes with the relay
+# handshakes_burst = 20
+# links_per_ip = 64                   # TCP links at once
+# new_links_per_second = 5            # new TCP links, over all addresses: how fast
+# new_links_burst = 50                #   clients come back after a restart
+# queue_per_recipient = 262144        # bytes waiting on one link
+# link_silence_seconds = 180          # a silent link is closed
+# not_connected_every_ms = 1000       # one not-connected notice per sender and recipient

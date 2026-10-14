@@ -1,0 +1,16 @@
+[package]
+name = "convesso-vectors"
+version = "0.0.0"
+description = "The official test vectors of convesso's cryptographic primitives, runnable on every target."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake2.workspace = true
+chacha20poly1305.workspace = true
+hmac.workspace = true
+x25519-dalek.workspace = true
+
+[lints]
+workspace = true

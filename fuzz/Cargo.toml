@@ -1,0 +1,147 @@
+# Fuzz targets for every decoder of network input (DESIGN.md §9).
+# A workspace of its own, on a nightly toolchain pinned in fuzz/rust-toolchain.toml:
+# cargo-fuzz needs nightly, and nothing shipped is built with it.
+#
+#   sh scripts/fuzz.sh [seconds per target]
+[workspace]
+
+[package]
+name = "convesso-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+convesso-core = { path = "../crates/convesso-core", features = ["testing"] }
+convesso-relay = { path = "../crates/convesso-relay" }
+convesso-stream = { path = "../crates/convesso-stream" }
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "version_not_supported"
+path = "fuzz_targets/version_not_supported.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_first_contact"
+path = "fuzz_targets/handshake_first_contact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_response"
+path = "fuzz_targets/handshake_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_decision"
+path = "fuzz_targets/handshake_decision.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_responder"
+path = "fuzz_targets/handshake_responder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_initiator"
+path = "fuzz_targets/handshake_initiator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dos_cookie_reply"
+path = "fuzz_targets/dos_cookie_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_packet"
+path = "fuzz_targets/transport_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint"
+path = "fuzz_targets/endpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_payload"
+path = "fuzz_targets/handshake_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_frame"
+path = "fuzz_targets/relay_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_deframer"
+path = "fuzz_targets/relay_deframer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_client"
+path = "fuzz_targets/relay_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_server"
+path = "fuzz_targets/relay_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths"
+path = "fuzz_targets/paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_frame"
+path = "fuzz_targets/stream_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_channel"
+path = "fuzz_targets/stream_channel.rs"
+test = false
+doc = false
+bench = false

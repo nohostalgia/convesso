@@ -1,0 +1,30 @@
+# The footprint budget: flash (.text + .rodata) and static RAM (.data + .bss) of
+# the reference firmware, in bytes, per embedded target: `reference` (the core,
+# the tables named by target) and `reference-embassy` (the embedded driver over
+# embassy-net, the tables prefixed with its name). Checked by scripts/footprint.py
+# on every change. A change that grows either raises its figures in the same
+# diff, so the growth is seen in review.
+
+["thumbv7em-none-eabihf"]
+flash = 87952
+ram = 0
+
+["riscv32imc-unknown-none-elf"]
+flash = 113088
+ram = 0
+
+["reference-embassy/thumbv7em-none-eabihf"]
+flash = 114816
+ram = 56632
+
+["reference-embassy/riscv32imc-unknown-none-elf"]
+flash = 148724
+ram = 56620
+
+["reference-stream/thumbv7em-none-eabihf"]
+flash = 134992
+ram = 81200
+
+["reference-stream/riscv32imc-unknown-none-elf"]
+flash = 174384
+ram = 81188

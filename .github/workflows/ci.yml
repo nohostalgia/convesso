@@ -1,0 +1,101 @@
+# The checks every change must pass (DESIGN.md §9). The scripts
+# they call are the same ones a developer runs locally.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Host: formatting, lints, tests and the dependency policy.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: The repository explains itself (what the files cite)
+        run: python3 scripts/check-public.py
+      - name: Formatting
+        run: |
+          cargo fmt --all --check
+          (cd firmware && cargo fmt --check)
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-features
+      - name: Dependency policy (advisories, minimum versions, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources
+
+  # Embedded targets: the core builds without an allocator, a core that needs
+  # one is refused, the primitives reproduce their vectors under QEMU, and the
+  # footprint stays within the committed budget.
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned toolchain and its embedded targets
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            firmware -> target
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm qemu-system-misc
+      - name: Build the core, the embedded driver and the stream crate for the embedded targets
+        run: |
+          for target in thumbv7em-none-eabihf riscv32imc-unknown-none-elf; do
+            cargo build -p convesso-core --target "$target"
+            cargo build -p convesso-embassy --target "$target"
+            cargo build -p convesso-embassy --features stream --target "$target"
+            cargo build -p convesso-stream --target "$target"
+          done
+      - name: Build the firmware (reference, reference-embassy, reference-stream, vectors)
+        run: |
+          cd firmware
+          for target in thumbv7em-none-eabihf riscv32imc-unknown-none-elf; do
+            cargo build --release --target "$target"
+            cargo build --release --target "$target" --features stream --bin reference-stream
+          done
+      - name: Clippy on the firmware
+        run: |
+          cd firmware
+          for target in thumbv7em-none-eabihf riscv32imc-unknown-none-elf; do
+            cargo clippy --release --target "$target" -- -D warnings
+            cargo clippy --release --target "$target" --features stream --bin reference-stream -- -D warnings
+          done
+      - name: A core or a stream crate that needs an allocator is refused
+        run: |
+          sh scripts/check-no-alloc.sh thumbv7em-none-eabihf
+          sh scripts/check-no-alloc.sh riscv32imc-unknown-none-elf
+      - name: Official vectors under QEMU (Cortex-M4)
+        run: sh scripts/run-vectors-qemu.sh thumbv7em-none-eabihf
+      - name: Official vectors under QEMU (RISC-V RV32)
+        run: sh scripts/run-vectors-qemu.sh riscv32imc-unknown-none-elf
+      - name: Footprint within budget
+        run: python3 scripts/footprint.py
+
+  # Every decoder of network input, fuzzed for a bounded time.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the nightly pinned for fuzzing
+        run: cd fuzz && rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz@0.13.2
+      - name: Fuzz every target for 60 seconds
+        run: sh scripts/fuzz.sh 60

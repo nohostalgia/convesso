@@ -1,0 +1,38 @@
+# Dependency policy, checked with `cargo deny check advisories bans sources`.
+#
+# The cryptographic-crate rule of DESIGN.md §3 says each crate is held at
+# or above a minimum version that excludes its known advisories. `advisories`
+# refuses any crate with a published advisory; `bans.deny` states the minimums
+# explicitly, so a minimum survives even if an advisory were withdrawn.
+#
+# Licences are not checked yet: the project's own licence is still to be chosen.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "thumbv7em-none-eabihf",
+    "riscv32imc-unknown-none-elf",
+]
+all-features = true
+
+[advisories]
+# Unmaintained crates are reported, not refused: an advisory with a fix is the
+# thing that must block.
+unmaintained = "workspace"
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "curve25519-dalek", version = "<4.1.3", reason = "RUSTSEC-2024-0344: timing variability in scalar subtraction" },
+    { name = "blake2", version = "<0.8.1", reason = "RUSTSEC-2019-0019: HMAC-BLAKE2 computed with the wrong block size" },
+    { name = "ed25519-dalek", version = "<2.0.0", reason = "RUSTSEC-2022-0093: the double public key signing function oracle" },
+    { name = "snow", version = "<0.9.5", reason = "RUSTSEC-2024-0011: unauthenticated payloads could advance the nonce" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

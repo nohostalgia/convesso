@@ -1,0 +1,48 @@
+[package]
+name = "convesso-tokio"
+version = "0.0.0"
+description = "The convesso driver for tokio: sockets, timers and the OS generator around the sans-IO core, and the relay server."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# The relay server binary, `convesso-relay`, with its TOML configuration.
+relay-bin = ["dep:serde", "dep:toml"]
+# Reliable messages (convesso-stream), beside the datagrams: off by default, the
+# application's choice.
+stream = ["dep:convesso-stream"]
+
+[dependencies]
+getrandom = "0.4.3"
+if-addrs = "0.15.0"
+convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc", "ed25519-seed"] }
+convesso-relay = { path = "../convesso-relay", version = "0.0.0" }
+convesso-stream = { path = "../convesso-stream", version = "0.0.0", features = ["alloc"], optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+socket2 = "0.6.5"
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+toml = { version = "1.1.8", optional = true }
+
+[dev-dependencies]
+# The provision example: the scalar of a key file's seed, and the record's layout.
+ed25519-dalek.workspace = true
+convesso-embassy = { path = "../convesso-embassy", version = "0.0.0" }
+tokio = { version = "1.53.2", features = ["io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "convesso-relay"
+path = "src/bin/relay.rs"
+required-features = ["relay-bin"]
+
+[[example]]
+name = "chat"
+path = "examples/chat.rs"
+
+[[example]]
+name = "provision"
+path = "examples/provision.rs"
+
+[lints]
+workspace = true

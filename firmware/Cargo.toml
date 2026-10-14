@@ -1,0 +1,80 @@
+# Firmware that links convesso-core on the embedded targets. A workspace of its
+# own: a `no_main` binary cannot build for the host, so it must stay out of the
+# root workspace's `cargo build`.
+[workspace]
+
+[package]
+name = "convesso-firmware"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+# Reliable messages in the embedded driver, for `reference-stream` only.
+stream = ["convesso-embassy/stream"]
+
+[[bin]]
+name = "reference"
+test = false
+bench = false
+
+# The embedded driver over embassy-net, measured with a budget of its own.
+[[bin]]
+name = "reference-embassy"
+path = "src/bin/reference_embassy.rs"
+test = false
+bench = false
+
+# The embedded driver with reliable messages (convesso-stream, `Mcu`), measured
+# with a budget of its own. Built on its own, with `--features stream`, so that
+# `reference-embassy` stays without them.
+[[bin]]
+name = "reference-stream"
+path = "src/bin/reference_stream.rs"
+required-features = ["stream"]
+test = false
+bench = false
+
+# Runs the official vectors of the primitives under QEMU, reporting through
+# semihosting. Not measured by the footprint budget.
+[[bin]]
+name = "vectors"
+test = false
+bench = false
+
+[dependencies]
+convesso-core = { path = "../crates/convesso-core" }
+convesso-vectors = { path = "../crates/convesso-vectors" }
+convesso-stream = { path = "../crates/convesso-stream" }
+panic-halt = "1.0.0"
+semihosting = { version = "0.1.25", features = ["stdio", "panic-handler"] }
+
+# reference-embassy: the driver, embassy-net, an executor, a clock.
+critical-section = "1.2.0"
+embassy-net = { version = "0.9.1", default-features = false, features = ["udp", "tcp", "proto-ipv4", "proto-ipv6", "medium-ethernet"] }
+embassy-net-driver = "0.2.0"
+embassy-sync = "0.8.0"
+embassy-time-driver = "0.2.2"
+convesso-embassy = { path = "../crates/convesso-embassy" }
+static_cell = "2.1.1"
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.7"
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+embassy-executor = { version = "0.10.0", features = ["platform-riscv32", "executor-thread"] }
+portable-atomic = { version = "1.15.0", default-features = false, features = ["critical-section"] }
+riscv = { version = "0.16.1", features = ["critical-section-single-hart"] }
+riscv-rt = "0.18.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+panic = "abort"

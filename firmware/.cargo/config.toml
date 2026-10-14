@@ -1,0 +1,6 @@
+# The runtimes' linker scripts. `memory.x` is chosen per architecture by build.rs.
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x"]

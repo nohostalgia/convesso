@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly. Pinned by date so a fuzz run is reproducible; the
+# core itself is built with the stable toolchain pinned at the repository root.
+[toolchain]
+channel = "nightly-2026-10-01"

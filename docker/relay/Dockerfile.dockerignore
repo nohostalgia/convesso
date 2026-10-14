@@ -1,0 +1,7 @@
+# The build context is the repository: only what the relay's build reads.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!docker/relay/relay.toml
+crates/*/target
