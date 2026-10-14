@@ -1,0 +1,3 @@
+# LF in every checkout: the scripts run in Linux containers, and the vector
+# generators must reproduce the committed files byte for byte.
+* text=auto eol=lf
