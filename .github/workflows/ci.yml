@@ -1,18 +1,91 @@
 # The checks every change must pass (DESIGN.md §9). The scripts
 # they call are the same ones a developer runs locally.
+#
+# A change reaches main through a pull request, and the checks run on it: on
+# the branch merged with main as it is, which is what main becomes. A pull
+# request merged while up to date puts on main exactly what was checked, so
+# main is not checked again. A pull request that main has moved past is
+# updated, and checked again.
+#
+# On a pull request, each job runs when the files it checks changed (the
+# `changes` job below); the host checks always run. A file every job depends
+# on (the lock file, the toolchain, the scripts, this workflow) runs them all.
+# A full run also comes every week, for advisories published since and for
+# what a path filter could miss, and can be started by hand, on main before a
+# release for instance.
 name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+# A newer push to a pull request makes its older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read the code, nothing more; the job that lists a pull request's files also
+# reads the pull request.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # What the pull request changed; everything, for a run by hand or by
+  # schedule.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      full: ${{ steps.mode.outputs.full }}
+      deps: ${{ steps.filter.outputs.deps == 'true' }}
+      embedded: ${{ steps.filter.outputs.embedded == 'true' }}
+      core: ${{ steps.filter.outputs.core == 'true' }}
+      stream: ${{ steps.filter.outputs.stream == 'true' }}
+      relay: ${{ steps.filter.outputs.relay == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            shared:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'rust-toolchain.toml'
+              - '.github/**'
+              - 'scripts/**'
+              - 'fuzz/**'
+            deps:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'deny.toml'
+            embedded:
+              - 'crates/convesso-core/**'
+              - 'crates/convesso-stream/**'
+              - 'crates/convesso-embassy/**'
+              - 'crates/convesso-vectors/**'
+              - 'firmware/**'
+              - 'footprint-budget.toml'
+            core:
+              - 'crates/convesso-core/**'
+            stream:
+              - 'crates/convesso-stream/**'
+            relay:
+              - 'crates/convesso-relay/**'
+      - id: mode
+        run: echo "full=${{ github.event_name != 'pull_request' || steps.filter.outputs.shared == 'true' }}" >> "$GITHUB_OUTPUT"
+
   # Host: formatting, lints, tests and the dependency policy.
   checks:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -32,14 +105,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features
       - name: Dependency policy (advisories, minimum versions, sources)
+        if: needs.changes.outputs.full == 'true' || needs.changes.outputs.deps == 'true'
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans sources
 
   # Embedded targets: the core builds without an allocator, a core that needs
   # one is refused, the primitives reproduce their vectors under QEMU, and the
-  # footprint stays within the committed budget.
+  # footprint stays within the committed budget. Only what the firmware links
+  # can change any of it.
   embedded:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.embedded == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -85,8 +162,14 @@ jobs:
       - name: Footprint within budget
         run: python3 scripts/footprint.py
 
-  # Every decoder of network input, fuzzed for a bounded time.
+  # Every decoder of network input, fuzzed for a bounded time: the targets of
+  # the crates that changed. Sixteen of them fuzz the core, so a change to it
+  # fuzzes them all.
   fuzz:
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' || needs.changes.outputs.core == 'true' ||
+      needs.changes.outputs.stream == 'true' || needs.changes.outputs.relay == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -97,5 +180,17 @@ jobs:
           workspaces: "fuzz -> target"
       - name: Install cargo-fuzz
         run: cargo install --locked cargo-fuzz@0.13.2
-      - name: Fuzz every target for 60 seconds
-        run: sh scripts/fuzz.sh 60
+      - name: Fuzz the targets of what changed, 60 seconds each
+        env:
+          FULL: ${{ needs.changes.outputs.full == 'true' || needs.changes.outputs.core == 'true' }}
+          STREAM: ${{ needs.changes.outputs.stream }}
+          RELAY: ${{ needs.changes.outputs.relay }}
+        run: |
+          if [ "$FULL" = true ]; then
+            sh scripts/fuzz.sh 60
+          else
+            targets=""
+            [ "$STREAM" = true ] && targets="$targets stream_channel stream_frame"
+            [ "$RELAY" = true ] && targets="$targets relay_server"
+            sh scripts/fuzz.sh 60 $targets
+          fi

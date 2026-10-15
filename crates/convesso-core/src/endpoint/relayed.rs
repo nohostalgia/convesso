@@ -106,19 +106,37 @@ pub enum RelayPath {
     UdpOther,
 }
 
-/// Why the relay session could not be used.
+/// Why the relay cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayError {
-    /// Its dial failed: refused by the relay (with the relay's code), not
-    /// answered, or answered with an unknown version.
+    /// Its session's dial failed: refused by the relay (with the relay's
+    /// code), not answered, or answered with an unknown version.
     Dial(DialError),
-    /// It was closed, by the relay or by this endpoint, with this code.
+    /// Its session was closed, by the relay or by this endpoint, with this
+    /// code.
     Closed {
         /// The code.
         code: u16,
         /// Whether the relay closed it.
         by_relay: bool,
     },
+    /// The TCP link to it failed.
+    Link(LinkFailure),
+}
+
+/// How a TCP link to the relay failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkFailure {
+    /// The driver reported it closed while it was opening: refused, or not
+    /// reached.
+    NotOpened,
+    /// Its opening was not reported within [`LINK_ANSWER_WITHIN`].
+    Hung,
+    /// No frame came from the relay within [`LINK_ANSWER_WITHIN`] of a
+    /// keep-alive.
+    Dead,
+    /// The driver reported it closed after it opened.
+    Lost,
 }
 
 /// A keep-alive interval below [`MIN_KEEPALIVE`].
@@ -169,8 +187,16 @@ pub(crate) struct RelayClient {
     context: Context,
     reachable: bool,
     link: LinkState,
-    /// Consecutive link attempts that ended before the link was established.
+    /// Consecutive link attempts that ended before this endpoint was
+    /// registered on the link.
     failures: u32,
+    /// Registered on the current link: its relay session live on it, and its
+    /// register sent. Only this resets the backoff (`DESIGN.md §6`).
+    registered: bool,
+    /// What to tell the application next about the relay: available, or
+    /// unavailable and why. Small, rather than a whole event, for the
+    /// microcontroller's RAM.
+    pending: Option<Result<(), RelayError>>,
     /// The driver is to be asked to close the link.
     close_due: bool,
     udp_proven: Option<Instant>,
@@ -239,7 +265,7 @@ impl RelayClient {
             LinkState::Waiting(at) => Some(at.unwrap_or(Instant::from_millis(0))),
             _ => None,
         };
-        let close = self.close_due.then_some(Instant::from_millis(0));
+        let close = (self.close_due || self.pending.is_some()).then_some(Instant::from_millis(0));
         [
             self.keepalive_due(),
             self.answer_due(),
@@ -253,37 +279,55 @@ impl RelayClient {
     }
 
     /// A frame from the relay arrived on the link: it is established, and
-    /// nothing more is awaited.
+    /// nothing more is awaited. The backoff waits for registration.
     pub(super) fn heard_on_link(&mut self) {
         if let LinkState::Open { .. } = self.link {
             self.link = LinkState::Open {
                 established: true,
                 awaiting: None,
             };
-            self.failures = 0;
         }
     }
 
-    /// The link is gone. `cause`: it was established and is lost, so a new
-    /// one is wanted at once; otherwise the attempt failed, and the next waits
-    /// for the backoff.
-    fn link_gone(&mut self, now: Instant) {
-        let established = matches!(
-            self.link,
-            LinkState::Open {
-                established: true,
-                ..
-            }
-        );
+    /// The link is gone: `reported` by the driver as closed, or given up for
+    /// want of an answer. A link this endpoint was registered on is replaced
+    /// at once; any other ends a failed attempt, and the next waits for the
+    /// backoff. The application is told why.
+    fn link_gone(&mut self, now: Instant, reported: bool) {
+        let failure = match (self.link, reported) {
+            (LinkState::Opening(_), true) => LinkFailure::NotOpened,
+            (LinkState::Opening(_), false) => LinkFailure::Hung,
+            (_, true) => LinkFailure::Lost,
+            (_, false) => LinkFailure::Dead,
+        };
+        let registered = core::mem::take(&mut self.registered);
+        self.register_due = false;
         self.link = if !self.reachable {
             LinkState::None
-        } else if established {
+        } else if registered {
             self.failures = 0;
             LinkState::Waiting(Some(now))
         } else {
             self.failures = self.failures.saturating_add(1);
             LinkState::Waiting(None)
         };
+        if self.reachable {
+            self.pending = Some(Err(RelayError::Link(failure)));
+        }
+    }
+
+    /// The relay session's dial failed, refused or unanswered. On an open
+    /// link this endpoint is not yet registered on, that attempt is over: the
+    /// link is closed, and the next one waits for the backoff, rather than
+    /// the session being dialled again at once. The dial's own event tells
+    /// the application.
+    pub(super) fn session_failed(&mut self) {
+        if self.reachable && !self.registered && self.link_open() {
+            self.close_due = true;
+            self.register_due = false;
+            self.failures = self.failures.saturating_add(1);
+            self.link = LinkState::Waiting(None);
+        }
     }
 
     fn udp_proven(&self, now: Instant) -> bool {
@@ -451,6 +495,8 @@ impl<C: Config> Endpoint<C> {
             reachable: false,
             link: LinkState::None,
             failures: 0,
+            registered: false,
+            pending: None,
             close_due: false,
             udp_proven: None,
             last_probe: None,
@@ -565,6 +611,9 @@ impl<C: Config> Endpoint<C> {
             return;
         };
         relay.reachable = reachable;
+        if !reachable {
+            relay.registered = false;
+        }
         match (reachable, relay.link) {
             (true, LinkState::None) => {
                 relay.failures = 0;
@@ -595,6 +644,7 @@ impl<C: Config> Endpoint<C> {
             // even when everything else reaches this endpoint over UDP.
             relay.keepalive_now = true;
             relay.register_due = true;
+            relay.registered = false;
         } else {
             // A link nobody asks for any more.
             relay.close_due = true;
@@ -606,7 +656,7 @@ impl<C: Config> Endpoint<C> {
         if let Some(relay) = self.relay.as_mut()
             && matches!(relay.link, LinkState::Opening(_) | LinkState::Open { .. })
         {
-            relay.link_gone(now);
+            relay.link_gone(now, true);
         }
     }
 
@@ -639,6 +689,7 @@ impl<C: Config> Endpoint<C> {
             relay.close_due = true;
         }
         relay.failures = 0;
+        relay.registered = false;
         relay.link = LinkState::Waiting(Some(now));
     }
 
@@ -1371,9 +1422,15 @@ impl<C: Config> Endpoint<C> {
             relay.close_due = false;
             return Some(Poll::CloseRelayLink);
         }
+        if let Some(state) = relay.pending.take() {
+            return Some(Poll::Event(match state {
+                Ok(()) => Event::RelayAvailable,
+                Err(error) => Event::RelayUnavailable { error },
+            }));
+        }
         if relay.answer_due().is_some_and(|due| now >= due) {
             // Nothing from the relay in time: the link is dead.
-            relay.link_gone(now);
+            relay.link_gone(now, false);
             return Some(Poll::CloseRelayLink);
         }
         if relay.link == LinkState::Waiting(None) {
@@ -1432,6 +1489,12 @@ impl<C: Config> Endpoint<C> {
                     .ok()
                     .flatten()?;
                 self.note_sent(to, now);
+                // Registered: peers reach this endpoint through the relay.
+                if let Some(relay) = self.relay.as_mut() {
+                    relay.registered = true;
+                    relay.failures = 0;
+                    relay.pending = Some(Ok(()));
+                }
                 return Some(Poll::Transmit { to, len });
             }
             if !opening {
@@ -1492,6 +1555,7 @@ impl Event<'_> {
             Event::PeerNotAtRelay { peer } => Event::PeerNotAtRelay { peer },
             Event::ObservedAddress { link, address } => Event::ObservedAddress { link, address },
             Event::RelayUnavailable { error } => Event::RelayUnavailable { error },
+            Event::RelayAvailable => Event::RelayAvailable,
             Event::PathChanged {
                 peer,
                 context,

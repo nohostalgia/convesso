@@ -79,11 +79,15 @@ pub enum NodeEvent<'a> {
         /// The address.
         address: SocketAddr,
     },
-    /// The relay session could not be opened, or ended.
+    /// The relay cannot be used: its session could not be opened, or ended,
+    /// or the link to it failed. Peers cannot reach this node through it
+    /// until the next relay-available event.
     RelayUnavailable {
         /// Why.
         error: RelayError,
     },
+    /// The node is registered with its relay: peers reach it through it.
+    RelayAvailable,
     /// The path to a peer changed.
     PathChanged {
         /// The peer.
@@ -404,7 +408,8 @@ fn key(event: &NodeEvent<'static>) -> (Option<PeerId>, u8) {
         NodeEvent::ReopenFailed { peer, .. } => (Some(peer), 2),
         NodeEvent::PeerNotAtRelay { peer } => (Some(peer), 3),
         NodeEvent::ObservedAddress { link, .. } => (None, 4 + u8::from(link == Link::Tcp)),
-        NodeEvent::RelayUnavailable { .. } => (None, 6),
+        // The relay's state: whether it is available, the latest only.
+        NodeEvent::RelayUnavailable { .. } | NodeEvent::RelayAvailable => (None, 6),
         NodeEvent::PathChanged { peer, .. } => (Some(peer), 7),
         NodeEvent::Datagram { peer, .. } => (Some(peer), 8),
         #[cfg(feature = "stream")]
@@ -433,6 +438,7 @@ fn owned(event: NodeEvent<'_>) -> NodeEvent<'static> {
             NodeEvent::ObservedAddress { link, address }
         }
         NodeEvent::RelayUnavailable { error } => NodeEvent::RelayUnavailable { error },
+        NodeEvent::RelayAvailable => NodeEvent::RelayAvailable,
         NodeEvent::PathChanged { peer, path } => NodeEvent::PathChanged { peer, path },
         // Datagrams go through the byte ring, never here.
         NodeEvent::Datagram { peer, .. } => NodeEvent::Connected { peer },
@@ -472,6 +478,7 @@ pub(crate) fn from_core(event: convesso_core::endpoint::Event<'_>) -> Option<Nod
         Event::PeerNotAtRelay { peer } => NodeEvent::PeerNotAtRelay { peer },
         Event::ObservedAddress { link, address } => NodeEvent::ObservedAddress { link, address },
         Event::RelayUnavailable { error } => NodeEvent::RelayUnavailable { error },
+        Event::RelayAvailable => NodeEvent::RelayAvailable,
         Event::PathChanged { peer, path, .. } => NodeEvent::PathChanged { peer, path },
         // Without the stream layer, a frame is not the application's: only
         // the connection it may confirm is.
@@ -614,6 +621,34 @@ mod tests {
         assert_eq!(queue.pop(&mut buf), Some(relayed), "the latest path");
         assert_eq!(queue.pop(&mut buf), None);
         assert!(queue.readable(0));
+    }
+
+    /// The relay's two events are one state: while the queue is full, only the
+    /// latest of them waits.
+    #[test]
+    fn the_relays_events_coalesce_as_one_state() {
+        let mut bytes = [0u8; 4];
+        let mut queue = EventQueue::new(&mut bytes);
+        full(&mut queue);
+        queue.push_or_hold(NodeEvent::RelayUnavailable {
+            error: RelayError::Link(convesso_core::endpoint::LinkFailure::Lost),
+        });
+        queue.push_or_hold(NodeEvent::RelayAvailable);
+        queue.push_or_hold(NodeEvent::RelayUnavailable {
+            error: RelayError::Link(convesso_core::endpoint::LinkFailure::Dead),
+        });
+        let mut buf = [0u8; 4];
+        let mut out = std::vec::Vec::new();
+        while let Some(event) = queue.pop(&mut buf) {
+            out.push(owned(event));
+        }
+        assert_eq!(
+            out.last(),
+            Some(&NodeEvent::RelayUnavailable {
+                error: RelayError::Link(convesso_core::endpoint::LinkFailure::Dead),
+            })
+        );
+        assert_eq!(out.len(), ENTRIES + 1, "one relay state waited");
     }
 
     /// An event that arrives while others wait aside goes behind them, even

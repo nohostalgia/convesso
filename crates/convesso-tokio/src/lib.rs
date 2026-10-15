@@ -22,6 +22,8 @@ pub mod relay_server;
 #[cfg(feature = "relay-bin")]
 pub mod relay_config;
 
+#[cfg(feature = "stream")]
+pub use node::start_with_stream;
 pub use node::{
     Config, DIRECT_PATH_MAX, Delivery, Events, Node, NodeError, NodeEvent, RelayLocation,
     SocketHandle, SocketHook, StartError, Stats, start, start_with,

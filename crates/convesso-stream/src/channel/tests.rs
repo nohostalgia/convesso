@@ -1353,3 +1353,64 @@ fn channels_with_credit_are_at_rest_after_an_exchange() {
     );
     assert!(pair.at_rest());
 }
+
+/// A reader that resumes after a long pause is told to its sender at once:
+/// the fragments held behind the message it was not taking are acknowledged
+/// as soon as that message is handed out, rather than at the sender's
+/// retransmission timeout, grown up to 15 s during the pause.
+#[cfg(feature = "alloc")]
+#[test]
+fn a_reader_that_resumes_is_told_to_the_sender_at_once() {
+    use crate::config::Server;
+    let mut pair: Pair<Server, Server> = Pair::new(40);
+    pair.b.channels = Channels::with_credit();
+    let a = pair.a.peer;
+    let mut sent = Vec::new();
+    for i in 0..40 {
+        let m = message(i, 20_000);
+        if pair.a_sends(&m).is_ok() {
+            sent.push(m);
+        }
+    }
+    pair.run_for(60_000);
+    assert!(pair.b.messages().is_empty());
+    let resumed = pair.now;
+    pair.b.channels.grant(a, b"ctx", 10_000_000).unwrap();
+    while pair.b.messages().len() < sent.len() && pair.now - resumed < 30_000 {
+        pair.run_for(100);
+    }
+    let took = pair.now - resumed;
+    assert_eq!(pair.b.messages(), sent);
+    assert!(
+        took < 3_000,
+        "every message {took} ms after the reader resumed"
+    );
+}
+
+/// A sender owed "room opened" is still told after a second reset in a row:
+/// the first reset moved its refusal into a pending Writable, and the second
+/// does not drop it.
+#[test]
+fn two_resets_in_a_row_keep_the_room_a_sender_is_owed() {
+    let mut channels: Channels<Mcu> = Channels::new();
+    let mut entropy = Counter(3);
+    let peer = address(1).peer_id();
+    let now = Instant::from_millis(0);
+    while channels
+        .send_message(peer, None, b"ctx", &[7; 1000], now, &mut entropy)
+        .is_ok()
+    {}
+    // Two resets before the driver polls: a close, then a reset asked here.
+    channels.session_closed(peer, ctx(), 1);
+    channels.reset_here(peer, ctx(), now);
+    let mut out = [0u8; MAX_DATA_LEN];
+    let mut writable = false;
+    for _ in 0..8 {
+        match channels.poll(now, true, &mut out) {
+            Poll::Event(Event::Writable { .. }) => writable = true,
+            Poll::Idle | Poll::Wait(_) => break,
+            _ => {}
+        }
+    }
+    assert!(writable, "the sender is told room opened");
+}

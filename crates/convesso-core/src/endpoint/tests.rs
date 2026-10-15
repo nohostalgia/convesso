@@ -78,6 +78,7 @@ enum Ev {
     NotAtRelay(PeerId),
     Observed(crate::relay::Link, core::net::SocketAddr),
     RelayUnavailable(RelayError),
+    RelayAvailable,
     PathChanged(crate::paths::PathKind),
     /// A stream frame: context, kind, data, whether it came through the relay.
     Frame(Vec<u8>, FrameKind, Vec<u8>, bool),
@@ -115,6 +116,7 @@ fn own(event: Event<'_>) -> Ev {
         Event::PeerNotAtRelay { peer } => Ev::NotAtRelay(peer),
         Event::ObservedAddress { link, address } => Ev::Observed(link, address),
         Event::RelayUnavailable { error } => Ev::RelayUnavailable(error),
+        Event::RelayAvailable => Ev::RelayAvailable,
         Event::PathChanged { path, .. } => Ev::PathChanged(path),
         Event::Frame {
             context,

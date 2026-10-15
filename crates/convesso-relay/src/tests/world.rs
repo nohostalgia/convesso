@@ -82,6 +82,7 @@ pub(crate) enum Ev {
     NotAtRelay(PeerId),
     Observed(Link, SocketAddr),
     RelayUnavailable(RelayError),
+    RelayAvailable,
     Payload,
     PathChanged(PeerId, PathKind),
     Frame {
@@ -122,6 +123,7 @@ fn own(event: Event<'_>) -> Ev {
         Event::PeerNotAtRelay { peer } => Ev::NotAtRelay(peer),
         Event::ObservedAddress { link, address } => Ev::Observed(link, address),
         Event::RelayUnavailable { error } => Ev::RelayUnavailable(error),
+        Event::RelayAvailable => Ev::RelayAvailable,
         Event::Payload { .. } => Ev::Payload,
         Event::PathChanged { peer, path, .. } => Ev::PathChanged(peer, path),
     }
@@ -306,6 +308,9 @@ pub(crate) struct Client {
     /// This client's link silently drops everything, both ways, without a
     /// close reaching either end.
     pub(crate) link_blackhole: bool,
+    /// The relay answers this client's keep-alives but never its handshakes:
+    /// its first contacts to the relay are lost.
+    pub(crate) handshakes_ignored: bool,
     /// When the core asked for a link, in ms.
     pub(crate) opens: Vec<u64>,
     /// When the core asked to close the link, in ms.
@@ -471,6 +476,7 @@ impl<P: Policy> World<P> {
                 tcp_refused: false,
                 tcp_hangs: false,
                 link_blackhole: false,
+                handshakes_ignored: false,
                 opens: Vec::new(),
                 closes: Vec::new(),
                 keepalive_answers: 0,
@@ -951,6 +957,9 @@ impl<P: Policy> World<P> {
 
     fn client_to_relay(&mut self, i: usize, path: RelayPath, packet: Vec<u8>) {
         let client = &mut self.clients[i];
+        if client.handshakes_ignored && crate::is_first_contact(&packet) {
+            return;
+        }
         if matches!(path, RelayPath::UdpOther) {
             if let (Some(from), false) = (client.nat6, client.udp_blocked) {
                 client.sent.udp += 1;

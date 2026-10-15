@@ -970,10 +970,15 @@ impl<C: StreamConfig> Channel<C> {
             arena.copy_within(length..used, 0);
         }
         self.asm_len -= length;
-        if self.advertised_closed {
+        let before = self.rcv_next;
+        self.pull_early();
+        // Tell the sender at once when the window reopens, or when fragments
+        // held behind the message just handed out are now in order: it may be
+        // waiting for its retransmission timeout, grown while the reader
+        // paused, up to 15 s.
+        if self.advertised_closed || self.rcv_next != before {
             self.ack_now = true;
         }
-        self.pull_early();
         if self.asm_len + self.early_len == 0 {
             self.arena.release();
         }
@@ -1071,7 +1076,10 @@ impl<C: StreamConfig> Channel<C> {
         self.waiting_since = None;
         self.peer_window = INITIAL_PEER_WINDOW;
         self.peer_max = None;
-        self.writable = self.blocked;
+        // A sender told "full" is told room opened; and one already owed it,
+        // not yet told, still is: losing it would leave that sender waiting
+        // on an empty channel.
+        self.writable = self.writable || self.blocked;
         self.blocked = false;
         self.keys_retry = None;
         self.keys_backoff = KEYS_RETRY;

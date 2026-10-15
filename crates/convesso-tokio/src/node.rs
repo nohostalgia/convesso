@@ -61,6 +61,23 @@ use convesso_stream::config::Server as StreamServer;
 #[cfg(feature = "stream")]
 use convesso_stream::{Channels, Event as StreamEvent, Poll as StreamPoll};
 
+/// The stream configuration of [`start`] and [`start_with`].
+#[cfg(feature = "stream")]
+type DefaultStream = StreamServer;
+#[cfg(not(feature = "stream"))]
+type DefaultStream = ();
+
+/// What a task's stream configuration is: one of the stream layer's, or,
+/// without the stream layer, nothing.
+#[cfg(feature = "stream")]
+trait Profile: convesso_stream::config::StreamConfig + 'static {}
+#[cfg(feature = "stream")]
+impl<T: convesso_stream::config::StreamConfig + 'static> Profile for T {}
+#[cfg(not(feature = "stream"))]
+trait Profile: 'static {}
+#[cfg(not(feature = "stream"))]
+impl<T: 'static> Profile for T {}
+
 /// The largest datagram a direct path is given: a UDP payload that fits a
 /// 1,500-byte IPv6 path.
 pub const DIRECT_PATH_MAX: usize = 1452;
@@ -273,11 +290,15 @@ pub enum NodeEvent {
         /// The address.
         address: SocketAddr,
     },
-    /// The relay session could not be opened, or ended.
+    /// The relay cannot be used: its session could not be opened, or ended,
+    /// or the link to it failed. Peers cannot reach this node through it
+    /// until the next relay-available event.
     RelayUnavailable {
         /// Why.
         error: RelayError,
     },
+    /// The node is registered with its relay: peers reach it through it.
+    RelayAvailable,
     /// The path to a peer changed: a direct path was found, or lost and the
     /// relay carries the session again.
     PathChanged {
@@ -632,14 +653,51 @@ pub async fn start(identity: Identity, config: Config) -> Result<(Node, Events),
 /// A [`StartError`]: [`StartError::Entropy`] before anything else is done.
 pub async fn start_with<E: SystemEntropy>(
     identity: Identity,
+    config: Config,
+    entropy: E,
+) -> Result<(Node, Events), StartError> {
+    let (task, node, events) = build::<E, DefaultStream>(identity, config, entropy).await?;
+    tokio::spawn(task.run());
+    Ok((node, events))
+}
+
+/// Starts a node whose message channels use the stream configuration `C`
+/// (feature `stream`): its largest message and its buffers. [`start`] and
+/// [`start_with`] use [`convesso_stream::config::Server`]. A peer refuses a
+/// message larger than the largest it advertised, so peers that exchange
+/// such messages use configurations that accept them.
+///
+/// # Errors
+///
+/// As [`start_with`]; in the per-peer mode, [`StartError::Budget`] against
+/// `C`'s largest message.
+#[cfg(feature = "stream")]
+pub async fn start_with_stream<C, E>(
+    identity: Identity,
+    config: Config,
+    entropy: E,
+) -> Result<(Node, Events), StartError>
+where
+    C: convesso_stream::config::StreamConfig + 'static,
+    Channels<C>: Send,
+    E: SystemEntropy,
+{
+    let (task, node, events) = build::<E, C>(identity, config, entropy).await?;
+    tokio::spawn(task.run());
+    Ok((node, events))
+}
+
+/// The task of a node, not yet running, and its handles: spawned by the
+/// caller, which knows the task can be sent to another thread.
+async fn build<E: SystemEntropy, C: Profile>(
+    identity: Identity,
     mut config: Config,
     mut entropy: E,
-) -> Result<(Node, Events), StartError> {
+) -> Result<(Task<E, C>, Node, Events), StartError> {
     entropy.check().map_err(StartError::Entropy)?;
     #[cfg(feature = "stream")]
     if let Delivery::PerPeer { messages, .. } = config.delivery {
-        use convesso_stream::config::StreamConfig;
-        let needed = StreamServer::MAX_MESSAGE + ELEMENT_COST;
+        let needed = C::MAX_MESSAGE + ELEMENT_COST;
         if messages < needed {
             return Err(StartError::Budget {
                 budget: messages,
@@ -704,16 +762,18 @@ pub async fn start_with<E: SystemEntropy>(
         held: VecDeque::new(),
         #[cfg(feature = "stream")]
         channels: Box::new(match config.delivery {
-            Delivery::Events => Channels::new(),
-            Delivery::PerPeer { .. } => Channels::with_credit(),
+            Delivery::Events => Channels::<C>::new(),
+            Delivery::PerPeer { .. } => Channels::<C>::with_credit(),
         }),
         #[cfg(feature = "stream")]
         frame: vec![0; convesso_stream::frame::MAX_DATA_LEN],
         #[cfg(feature = "stream")]
         parked: Vec::new(),
+        #[cfg(not(feature = "stream"))]
+        stream: std::marker::PhantomData,
     };
-    tokio::spawn(task.run());
     Ok((
+        task,
         Node {
             commands: commands_tx,
             local,
@@ -981,6 +1041,7 @@ fn event_of(event: Event<'_>) -> Option<NodeEvent> {
         Event::PeerNotAtRelay { peer } => NodeEvent::PeerNotAtRelay { peer },
         Event::ObservedAddress { link, address } => NodeEvent::ObservedAddress { link, address },
         Event::RelayUnavailable { error } => NodeEvent::RelayUnavailable { error },
+        Event::RelayAvailable => NodeEvent::RelayAvailable,
         Event::PathChanged { peer, path, .. } => NodeEvent::PathChanged { peer, path },
         // Without the stream layer, a frame is not the application's: only
         // the connection it may confirm is.
@@ -997,7 +1058,7 @@ fn event_of(event: Event<'_>) -> Option<NodeEvent> {
     })
 }
 
-struct Task<E> {
+struct Task<E, C: Profile> {
     endpoint: Endpoint<Server>,
     context: Vec<u8>,
     policy: Policy,
@@ -1033,12 +1094,15 @@ struct Task<E> {
     held: VecDeque<(Option<Held>, NodeEvent)>,
     /// The message channels, and the frame they write.
     #[cfg(feature = "stream")]
-    channels: Box<Channels<StreamServer>>,
+    channels: Box<Channels<C>>,
     #[cfg(feature = "stream")]
     frame: Vec<u8>,
     /// Messages waiting for room in their channel, in order.
     #[cfg(feature = "stream")]
     parked: Vec<Parked>,
+    /// The stream configuration, without the stream layer: none.
+    #[cfg(not(feature = "stream"))]
+    stream: std::marker::PhantomData<C>,
 }
 
 /// A message for a peer, with its address when known and the sender's reply.
@@ -1075,7 +1139,7 @@ enum Kind {
     ReopenFailed,
     NotAtRelay,
     Observed(Link),
-    RelayUnavailable,
+    Relay,
     PathChanged,
     #[cfg(feature = "stream")]
     ChannelReset,
@@ -1089,7 +1153,8 @@ fn held_key(event: &NodeEvent) -> Option<Held> {
         NodeEvent::ReopenFailed { peer, .. } => Held(Some(peer), Kind::ReopenFailed),
         NodeEvent::PeerNotAtRelay { peer } => Held(Some(peer), Kind::NotAtRelay),
         NodeEvent::ObservedAddress { link, .. } => Held(None, Kind::Observed(link)),
-        NodeEvent::RelayUnavailable { .. } => Held(None, Kind::RelayUnavailable),
+        // The relay's state: whether it is available, the latest only.
+        NodeEvent::RelayUnavailable { .. } | NodeEvent::RelayAvailable => Held(None, Kind::Relay),
         NodeEvent::PathChanged { peer, .. } => Held(Some(peer), Kind::PathChanged),
         #[cfg(feature = "stream")]
         NodeEvent::ChannelReset { peer, .. } => Held(Some(peer), Kind::ChannelReset),
@@ -1099,7 +1164,7 @@ fn held_key(event: &NodeEvent) -> Option<Held> {
     })
 }
 
-impl<E: SystemEntropy> Task<E> {
+impl<E: SystemEntropy, C: Profile> Task<E, C> {
     fn now(&self) -> Instant {
         Instant::from_millis(u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
@@ -1391,6 +1456,8 @@ impl<E: SystemEntropy> Task<E> {
             }
             #[cfg(feature = "stream")]
             Command::SendMessage(parked) => {
+                // A sender that went away no longer waits.
+                self.parked.retain(|(.., reply)| !reply.is_closed());
                 // Behind those already waiting for the same peer: in order.
                 if self.parked.iter().any(|(p, ..)| *p == parked.0) {
                     self.parked.push(parked);
