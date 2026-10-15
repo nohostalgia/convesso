@@ -94,6 +94,7 @@ fn node_with(
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
+            credit: false,
         },
         datagrams,
         net.stream(ips[0]),
@@ -208,6 +209,44 @@ async fn a_slow_reader_loses_no_event() {
     .await;
 }
 
+/// Scenario: a full event buffer stops only the reading. B reads no event
+/// for 65 s while A sends it datagrams: B's relay keep-alives go on, its
+/// sends complete, and afterwards every datagram is there, in order.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_event_buffer_stops_only_the_reading() {
+    local(async {
+        let (net, relay) = world();
+        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 2048 + 400);
+        b.set_reachable(true).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let keepalives = b.stats().await.keepalives_sent;
+        let (a_address, b_address) = (a.address().await, b.address().await);
+        let b_hint = SocketAddr::new(ip("10.0.1.1"), 7500);
+        let a_hint = SocketAddr::new(ip("10.0.0.1"), 7500);
+        a.set_hint(b_address.peer_id(), b_hint).await.unwrap();
+        b.set_hint(a_address.peer_id(), a_hint).await.unwrap();
+        for i in 0u8..30 {
+            a.send(&b_address, &[i; 100]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        assert!(net.waiting(b_hint) > 0, "B stopped reading its socket");
+        assert!(
+            b.stats().await.keepalives_sent > keepalives,
+            "the keep-alives go on"
+        );
+        b.send(&a_address, b"meanwhile").await.unwrap();
+        let (data, _) = datagram(&mut a_events, 5).await;
+        assert_eq!(data, b"meanwhile", "a send completes");
+        for i in 0u8..30 {
+            let (data, _) = datagram(&mut b_events, 5).await;
+            assert_eq!(data, vec![i; 100], "datagram {i}");
+        }
+    })
+    .await;
+}
+
 /// Scenarios: a generator failure stops the start, and a chip without a
 /// generator does not start: no packet leaves.
 #[tokio::test(flavor = "current_thread")]
@@ -228,6 +267,7 @@ async fn generator_failure() {
                 primary: relay.udp[0],
                 other: None,
             }),
+            credit: false,
         },
         datagrams,
         net.stream(ip("10.0.0.1")),

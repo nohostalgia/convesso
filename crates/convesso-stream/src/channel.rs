@@ -40,6 +40,10 @@ pub const RESET_ANSWER_EVERY: Duration = Duration::from_secs(1);
 pub const KEYS_RETRY: Duration = Duration::from_millis(50);
 /// The longest wait between two tries of a refused frame.
 pub const KEYS_RETRY_MAX: Duration = Duration::from_secs(1);
+/// What an element held by the reader costs beyond its bytes, in delivery
+/// credit: a message costs its length plus this. A budget in bytes then
+/// bounds the number of elements too, however small they are.
+pub const ELEMENT_COST: usize = 64;
 /// The initial congestion window, in fragments (RFC 6928).
 pub const INITIAL_WINDOW: usize = 10;
 /// The receive window assumed before the peer's first acknowledgement: the
@@ -160,6 +164,8 @@ pub struct ChannelState {
     pub ready: Option<usize>,
     /// Waiting for the session's keys.
     pub waiting_keys: bool,
+    /// The delivery credit left, in bytes; `None` with credit off.
+    pub credit: Option<usize>,
 }
 
 /// What a channel just put in the output buffer.
@@ -247,6 +253,9 @@ pub(crate) struct Channel<C: StreamConfig> {
     early_len: usize,
     ready: Option<usize>,
     delivered: bool,
+    /// The bytes the reader still takes, with delivery credit on; `None`
+    /// with it off, when every message may be handed out.
+    credit: Option<usize>,
     unacked: usize,
     ack_now: bool,
     ack_deadline: Option<Instant>,
@@ -256,12 +265,17 @@ pub(crate) struct Channel<C: StreamConfig> {
     retired: [Option<Incarnation>; RETIRED],
     reset_answer: Option<Incarnation>,
     answered: [Option<(Incarnation, Instant)>; 2],
+    /// The peer's incarnation this side reset on its own: its frames are
+    /// answered with RESET, in case the first answer was lost.
+    given_up: Option<Incarnation>,
     event: Option<Reason>,
     ever_reset: bool,
 }
 
 impl<C: StreamConfig> Channel<C> {
-    pub(crate) fn new() -> Self {
+    /// A channel; with `credit`, it hands out nothing until credit is
+    /// granted.
+    pub(crate) fn new(credit: bool) -> Self {
         Self {
             address: None,
             send_incarnation: None,
@@ -305,6 +319,7 @@ impl<C: StreamConfig> Channel<C> {
             early_len: 0,
             ready: None,
             delivered: false,
+            credit: credit.then_some(0),
             unacked: 0,
             ack_now: false,
             ack_deadline: None,
@@ -312,6 +327,7 @@ impl<C: StreamConfig> Channel<C> {
             retired: [None; RETIRED],
             reset_answer: None,
             answered: [None; 2],
+            given_up: None,
             event: None,
             ever_reset: false,
         }
@@ -322,7 +338,8 @@ impl<C: StreamConfig> Channel<C> {
     }
 
     /// Whether this channel holds nothing but the memory of a reset: its slot
-    /// can go to another session.
+    /// can go to another session. Credit granted again after the reset is
+    /// the reader's, and keeps the slot.
     pub(crate) fn is_spent(&self) -> bool {
         self.ever_reset
             && self.send_incarnation.is_none()
@@ -330,6 +347,14 @@ impl<C: StreamConfig> Channel<C> {
             && self.event.is_none()
             && self.reset_answer.is_none()
             && !self.writable
+            && self.credit.unwrap_or(0) == 0
+    }
+
+    /// Adds `bytes` to the delivery credit; nothing with credit off.
+    pub(crate) fn grant(&mut self, bytes: usize) {
+        if let Some(credit) = self.credit.as_mut() {
+            *credit = credit.saturating_add(bytes);
+        }
     }
 
     // --- sending ------------------------------------------------------------------------
@@ -672,6 +697,13 @@ impl<C: StreamConfig> Channel<C> {
             .max(self.latest_rtt.unwrap_or(Duration::ZERO));
         let threshold = (rtt * 9 / 8).max(Duration::from_millis(1));
         let mut later = 0;
+        // The latest a later fragment acknowledged in ranges was sent. Only a
+        // fragment sent no earlier than this one says it was lost (RFC 8985):
+        // a retransmission is never lost on the evidence of fragments sent
+        // before it, and only the timeout, with its backoff, sends it again.
+        // Without this, a receiver that holds an in-order fragment while its
+        // reader takes nothing had it sent again every round trip.
+        let mut newest_sacked: Option<Instant> = None;
         let mut newly_lost = false;
         let mut deadline: Option<Instant> = None;
         for i in (0..self.in_flight.len()).rev() {
@@ -680,7 +712,8 @@ impl<C: StreamConfig> Channel<C> {
             };
             if sent.sacked {
                 later += 1;
-            } else if !sent.lost && later > 0 {
+                newest_sacked = newest_sacked.max(Some(sent.sent_at));
+            } else if !sent.lost && newest_sacked.is_some_and(|at| at >= sent.sent_at) {
                 let due = sent.sent_at.saturating_add(threshold);
                 if later >= DUP_THRESHOLD || now >= due {
                     sent.lost = true;
@@ -702,6 +735,11 @@ impl<C: StreamConfig> Channel<C> {
 
     pub(crate) fn handle_data(&mut self, data: &Data<'_>, now: Instant) {
         self.settle();
+        if self.given_up == Some(data.incarnation) {
+            // The peer goes on, so the RESET it was sent was lost.
+            self.answer_reset(data.incarnation, now);
+            return;
+        }
         if self.retired.contains(&Some(data.incarnation)) {
             return;
         }
@@ -1049,6 +1087,11 @@ impl<C: StreamConfig> Channel<C> {
         self.early_len = 0;
         self.ready = None;
         self.delivered = false;
+        // The reader's room is the reader's to give again, once it has seen
+        // the reset.
+        if self.credit.is_some() {
+            self.credit = Some(0);
+        }
         self.unacked = 0;
         self.ack_now = false;
         self.ack_deadline = None;
@@ -1057,6 +1100,22 @@ impl<C: StreamConfig> Channel<C> {
         self.ever_reset = true;
         if self.event.is_none() && had {
             self.event = Some(reason);
+        }
+    }
+
+    /// Resets the channel on this side, as a reader that gives it up: no
+    /// event here, and the peer is told with an acknowledgement carrying
+    /// RESET for its incarnation, if it has sent on the channel.
+    pub(crate) fn reset_here(&mut self, now: Instant) {
+        self.settle();
+        let peer = self.receive_incarnation;
+        // A reset already waiting to be reported is still reported.
+        let pending = self.event.take();
+        self.reset(Reason::ResetByPeer);
+        self.event = pending;
+        if let Some(incarnation) = peer {
+            self.given_up = Some(incarnation);
+            self.answer_reset(incarnation, now);
         }
     }
 
@@ -1152,7 +1211,13 @@ impl<C: StreamConfig> Channel<C> {
         if let Some(reason) = self.event.take() {
             return Output::Reset(reason);
         }
-        if let Some(length) = self.ready.filter(|_| deliver && !self.delivered) {
+        if let Some(length) = self
+            .ready
+            .filter(|&length| deliver && !self.delivered && self.affords(length))
+        {
+            if let Some(credit) = self.credit.as_mut() {
+                *credit = credit.saturating_sub(length + ELEMENT_COST);
+            }
             self.delivered = true;
             return Output::Message(length);
         }
@@ -1210,6 +1275,12 @@ impl<C: StreamConfig> Channel<C> {
         Output::Nothing
     }
 
+    /// Whether the credit covers a message of `length` bytes, whole.
+    fn affords(&self, length: usize) -> bool {
+        self.credit
+            .is_none_or(|credit| credit >= length + ELEMENT_COST)
+    }
+
     /// The bytes of a message handed out by [`Channel::output`].
     pub(crate) fn message(&self, length: usize) -> &[u8] {
         self.arena.get(length).unwrap_or_default()
@@ -1251,6 +1322,7 @@ impl<C: StreamConfig> Channel<C> {
             early_first: self.early.get(0).map(|s| s.seq),
             ready: self.ready,
             waiting_keys: self.keys_retry.is_some(),
+            credit: self.credit,
         }
     }
 

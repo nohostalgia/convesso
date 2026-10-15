@@ -31,6 +31,12 @@
 //!   `Endpoint::connect`;
 //! - the core's `Closed` and `ReopenFailed` to [`Channels::session_closed`] and
 //!   [`Channels::reopen_failed`].
+//!
+//! A reader that takes different peers' messages at different speeds makes
+//! its `Channels` [`Channels::with_credit`] and grants each channel the bytes
+//! it can take with [`Channels::grant`] (`DESIGN.md §8`). A channel short of
+//! credit keeps its message and its window closes, so only its own sender
+//! waits.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -49,9 +55,9 @@ use convesso_core::storage::Table;
 use convesso_core::time::Instant;
 
 pub use channel::{
-    ACK_DELAY, ChannelState, INITIAL_PEER_WINDOW, INITIAL_RTO, INITIAL_WINDOW, KEYS_RETRY,
-    KEYS_RETRY_MAX, MAX_RTO, MIN_RTO, NO_PROGRESS, RESET_ANSWER_EVERY, Reason, SendError, Sent,
-    Stored,
+    ACK_DELAY, ChannelState, ELEMENT_COST, INITIAL_PEER_WINDOW, INITIAL_RTO, INITIAL_WINDOW,
+    KEYS_RETRY, KEYS_RETRY_MAX, MAX_RTO, MIN_RTO, NO_PROGRESS, RESET_ANSWER_EVERY, Reason,
+    SendError, Sent, Stored,
 };
 use channel::{Channel, Emitted, Output};
 use config::{Key, StreamConfig};
@@ -124,6 +130,8 @@ pub struct Channels<C: StreamConfig> {
     emitted: Option<(Key, Emitted)>,
     /// Where the last poll stopped, so that every channel gets its turn.
     cursor: Option<Key>,
+    /// Whether delivery credit is on.
+    credit: bool,
 }
 
 impl<C: StreamConfig> Default for Channels<C> {
@@ -133,13 +141,27 @@ impl<C: StreamConfig> Default for Channels<C> {
 }
 
 impl<C: StreamConfig> Channels<C> {
-    /// No channel yet.
+    /// No channel yet; every message is handed out as soon as the driver can
+    /// deliver it.
     #[must_use]
     pub fn new() -> Self {
         Self {
             table: <C::Channels<Channel<C>> as Default>::default(),
             emitted: None,
             cursor: None,
+            credit: false,
+        }
+    }
+
+    /// No channel yet, with delivery credit on: a channel hands out a message
+    /// only when its credit covers the message's length plus
+    /// [`ELEMENT_COST`], and spends that. A channel starts with no credit,
+    /// and returns to none when it is reset or its session closes.
+    #[must_use]
+    pub fn with_credit() -> Self {
+        Self {
+            credit: true,
+            ..Self::new()
         }
     }
 
@@ -156,7 +178,7 @@ impl<C: StreamConfig> Channels<C> {
     /// the slot of a channel that holds nothing but a past reset.
     fn channel(&mut self, key: Key) -> Result<&mut Channel<C>, SendError> {
         if self.table.get(&key).is_none()
-            && let Err(full) = self.table.insert(key, Channel::new())
+            && let Err(full) = self.table.insert(key, Channel::new(self.credit))
         {
             let mut spent = None;
             self.table.for_each(|k, channel| {
@@ -206,6 +228,23 @@ impl<C: StreamConfig> Channels<C> {
             channel.set_address(*address);
         }
         channel.send(message, now, entropy)
+    }
+
+    /// Adds `bytes` to the delivery credit of `peer`'s channel in `context`,
+    /// making the channel if there is none. Nothing with credit off.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::TableFull`] when no channel slot is free, and
+    /// [`SendError::ContextTooLong`], as for [`Channels::send_message`].
+    pub fn grant(&mut self, peer: PeerId, context: &[u8], bytes: usize) -> Result<(), SendError> {
+        self.confirm();
+        let context = Context::new(context).map_err(|_| SendError::ContextTooLong)?;
+        if !self.credit {
+            return Ok(());
+        }
+        self.channel((peer, context))?.grant(bytes);
+        Ok(())
     }
 
     /// Takes a stream frame the core handed up. A malformed frame is ignored
@@ -274,6 +313,19 @@ impl<C: StreamConfig> Channels<C> {
         self.confirm();
         if let Some(channel) = self.table.get_mut(&(peer, context)) {
             channel.reset(Reason::SessionClosed { code });
+        }
+    }
+
+    /// Resets `peer`'s channel in `context` on this side, as a reader that
+    /// gives it up does: everything it holds is dropped, both ways, its
+    /// credit returns to none, and no event is raised here. The peer, if it
+    /// has sent on the channel, is told with an acknowledgement carrying
+    /// RESET, sent again at most once a second while it goes on sending on
+    /// that incarnation. Nothing if there is no channel.
+    pub fn reset_here(&mut self, peer: PeerId, context: Context, now: Instant) {
+        self.confirm();
+        if let Some(channel) = self.table.get_mut(&(peer, context)) {
+            channel.reset_here(now);
         }
     }
 

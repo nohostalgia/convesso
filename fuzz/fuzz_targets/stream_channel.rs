@@ -1,9 +1,12 @@
 //! A channel on the `Mcu` configuration never panics on any sequence of
-//! frames, sends, times and refusals, and never holds more than its
-//! configuration's buffers (`PROTOCOL.md §8`).
+//! frames, sends, times, refusals, grants of credit and resets asked by the
+//! reader, never holds more than
+//! its configuration's buffers, and with delivery credit on never hands out a
+//! message its credit does not cover (`PROTOCOL.md §8`).
 //!
-//! The input is a list of operations; frames are built from fuzzed fields,
-//! so that most of them decode, or taken raw.
+//! The input's first byte turns credit on or off; the rest is a list of
+//! operations. Frames are built from fuzzed fields, so that most of them
+//! decode, or taken raw.
 
 #![no_main]
 
@@ -13,7 +16,7 @@ use convesso_core::identity::{Address, PeerId};
 use convesso_core::time::Instant;
 use convesso_stream::config::Mcu;
 use convesso_stream::frame::{Ack, Data, MAX_DATA_LEN, Range};
-use convesso_stream::{Channels, Poll};
+use convesso_stream::{Channels, ELEMENT_COST, Event, Poll};
 use libfuzzer_sys::fuzz_target;
 
 /// The receive buffer and the send buffer of an `Mcu` channel.
@@ -65,7 +68,12 @@ fn peer() -> PeerId {
 
 fuzz_target!(|data: &[u8]| {
     let mut input = Input(data);
-    let mut channels: Channels<Mcu> = Channels::new();
+    let credit = input.byte().unwrap_or(0) % 2 == 1;
+    let mut channels: Channels<Mcu> = if credit {
+        Channels::with_credit()
+    } else {
+        Channels::new()
+    };
     let mut entropy = Counter(1);
     let peer = peer();
     let context = Context::new(b"ctx").expect("short");
@@ -75,7 +83,7 @@ fuzz_target!(|data: &[u8]| {
     let mut frame = [0u8; MAX_DATA_LEN];
     while let Some(op) = input.byte() {
         let t = Instant::from_millis(now);
-        match op % 11 {
+        match op % 13 {
             0 => {
                 let len = usize::from(input.u16().unwrap_or(0)) % 3000;
                 let message = vec![op; len];
@@ -123,10 +131,17 @@ fuzz_target!(|data: &[u8]| {
             }
             3 => now += u64::from(input.u16().unwrap_or(0)),
             4 | 5 => {
-                let deliver = op % 11 == 4;
+                let deliver = op % 13 == 4;
                 for _ in 0..64 {
+                    let before = channels.inspect(peer, context).and_then(|s| s.credit);
                     match channels.poll(t, deliver, &mut out) {
                         Poll::SendFrame { len, .. } => assert!(len <= MAX_DATA_LEN),
+                        Poll::Event(Event::Message { data, .. }) => {
+                            assert_eq!(before.is_some(), credit);
+                            if let Some(before) = before {
+                                assert!(before >= data.len() + ELEMENT_COST, "beyond the credit");
+                            }
+                        }
                         Poll::Wait(at) => {
                             assert!(at.as_millis() >= now, "a deadline in the past");
                             break;
@@ -144,6 +159,11 @@ fuzz_target!(|data: &[u8]| {
                 let raw = input.take(n).to_vec();
                 channels.handle_frame(peer, context, FrameKind::Data, &raw, t);
             }
+            10 => {
+                let bytes = input.u32().unwrap_or(0) as usize;
+                let _ = channels.grant(peer, b"ctx", bytes);
+            }
+            11 => channels.reset_here(peer, context, t),
             _ => {
                 let n = usize::from(input.byte().unwrap_or(0)) % 64;
                 let raw = input.take(n).to_vec();

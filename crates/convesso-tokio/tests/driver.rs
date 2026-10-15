@@ -225,8 +225,8 @@ async fn a_send_error_reaches_the_application() {
 }
 
 /// Scenario: a slow reader loses no event: while the application does not
-/// read, the node stops (it answers nothing, so it reads no socket either),
-/// and every datagram is there once it reads again.
+/// read, the node stops reading its socket, but nothing else (it answers its
+/// commands), and every datagram is there once it reads again.
 #[tokio::test]
 async fn a_slow_reader_loses_no_event() {
     let (a, _a_events) = node(8, None, 64).await;
@@ -243,11 +243,16 @@ async fn a_slow_reader_loses_no_event() {
         a.send(b.address(), vec![i; 8]).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // B is blocked on its full event channel: it does not even answer.
+    // B's event channel is full: it reads no more from its socket, and still
+    // answers.
+    let stats = timeout(Duration::from_millis(200), b.stats())
+        .await
+        .expect("B answers while its events wait")
+        .unwrap();
     assert!(
-        timeout(Duration::from_millis(200), b.stats())
-            .await
-            .is_err()
+        stats.udp_received < 10,
+        "B stopped reading: {} datagrams read",
+        stats.udp_received
     );
     let mut got = Vec::new();
     while got.len() < 20 {

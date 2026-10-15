@@ -15,10 +15,15 @@
 //! The task decides nothing. It hands the core every packet with where it came
 //! from, sends what the core outputs on the path it names, opens and closes the
 //! relay link when told, reports what happened to it, and calls the core again
-//! at each deadline. While the application does not read events, the task waits
-//! on the event channel and reads no socket: nothing is dropped inside the
-//! driver.
+//! at each deadline. It never waits on the application (`DESIGN.md §5`): while
+//! the event channel is full, it stops reading the socket and the relay link,
+//! and keeps its timers, acknowledgements, keep-alives and commands going.
+//! Events its timers produce meanwhile wait aside, one per peer and kind, the
+//! latest replacing the earlier, so an application that reads late sees the
+//! latest state. In the per-peer delivery mode, datagrams and messages go to a
+//! [`Receiver`] per peer instead, and the socket is always read.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -40,10 +45,12 @@ use convesso_core::storage::Server;
 use convesso_core::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::address;
 use crate::entropy::{EntropyError, OsEntropy, SystemEntropy};
+use crate::receiver::{ELEMENT_COST, Receiver, SessionClosed, Shared};
 
 #[cfg(feature = "stream")]
 use convesso_core::endpoint::FrameKind;
@@ -102,6 +109,31 @@ pub struct Config {
     pub admission: Option<Box<dyn Admission + Send>>,
     /// Given every socket the node opens, before it is used.
     pub socket_hook: Option<SocketHook>,
+    /// Where peers' messages and datagrams go: the event stream, or a
+    /// [`Receiver`] per peer.
+    pub delivery: Delivery,
+}
+
+/// Where peers' messages and datagrams go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// To the event stream, with every other event.
+    #[default]
+    Events,
+    /// To a [`Receiver`] per peer, opened with [`Node::receiver`], each
+    /// holding at most `messages` bytes of messages and `datagrams` bytes of
+    /// datagrams, every element costing its length plus
+    /// [`crate::ELEMENT_COST`]. A peer's channel is granted only the free room
+    /// of its receiver, so a receiver that is not read holds back its own
+    /// sender alone (`DESIGN.md §8`). A datagram that does not fit, or for a
+    /// peer with no receiver open, is dropped and counted in
+    /// [`Stats::datagrams_dropped`].
+    PerPeer {
+        /// The message budget, at least the largest message's cost.
+        messages: usize,
+        /// The datagram budget.
+        datagrams: usize,
+    },
 }
 
 impl Default for Config {
@@ -113,6 +145,7 @@ impl Default for Config {
             events: 256,
             admission: None,
             socket_hook: None,
+            delivery: Delivery::Events,
         }
     }
 }
@@ -130,6 +163,14 @@ pub enum StartError {
     Resolve(std::io::Error),
     /// The core refused the configuration.
     Core(ResponderError),
+    /// The per-peer message budget is below the cost of the largest message,
+    /// which could then never be delivered.
+    Budget {
+        /// The budget given.
+        budget: usize,
+        /// The cost of the largest message.
+        needed: usize,
+    },
 }
 
 impl std::fmt::Display for StartError {
@@ -140,6 +181,10 @@ impl std::fmt::Display for StartError {
             Self::Hook(error) => write!(f, "the socket hook: {error}"),
             Self::Resolve(error) => write!(f, "resolving the relay: {error}"),
             Self::Core(error) => write!(f, "the core: {error}"),
+            Self::Budget { budget, needed } => write!(
+                f,
+                "a message budget of {budget} bytes is below the {needed} a largest message costs"
+            ),
         }
     }
 }
@@ -157,6 +202,10 @@ pub enum NodeError {
     Exclude(ExcludeError),
     /// The node's task has ended.
     Stopped,
+    /// A receiver asked for while the node delivers to its event stream.
+    NotPerPeer,
+    /// A receiver asked for a peer that already has one open.
+    ReceiverOpen,
     /// The stream layer refused a message, with its named error.
     #[cfg(feature = "stream")]
     Message(convesso_stream::SendError),
@@ -169,6 +218,8 @@ impl std::fmt::Display for NodeError {
             Self::Hint(error) => error.fmt(f),
             Self::Exclude(error) => error.fmt(f),
             Self::Stopped => f.write_str("the node has stopped"),
+            Self::NotPerPeer => f.write_str("the node delivers to its event stream, not per peer"),
+            Self::ReceiverOpen => f.write_str("the peer already has a receiver open"),
             #[cfg(feature = "stream")]
             Self::Message(error) => write!(f, "the message was refused: {error:?}"),
         }
@@ -288,6 +339,9 @@ pub struct Stats {
     /// `stream`).
     #[cfg(feature = "stream")]
     pub stream_frames_sent: u64,
+    /// Datagrams dropped in the per-peer mode: for a peer with no receiver
+    /// open, or beyond its receiver's budget.
+    pub datagrams_dropped: u64,
 }
 
 enum Command {
@@ -308,6 +362,7 @@ enum Command {
     ),
     Binding(PeerId, oneshot::Sender<Option<ChannelBinding>>),
     RelayUdpProven(oneshot::Sender<bool>),
+    Receiver(PeerId, oneshot::Sender<Result<Receiver, NodeError>>),
     #[cfg(feature = "stream")]
     SendMessage(Parked),
 }
@@ -533,6 +588,22 @@ impl Node {
             .await
     }
 
+    /// Opens the receiver of `peer`'s messages and datagrams, in the per-peer
+    /// delivery mode; before its session exists, too. Open it when the peer
+    /// connects: until then its messages wait in its channel, and its
+    /// datagrams are dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NotPerPeer`] in the event-stream mode,
+    /// [`NodeError::ReceiverOpen`] while the peer has one open, or
+    /// [`NodeError::Stopped`].
+    pub async fn receiver(&self, peer: PeerId) -> Result<Receiver, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::Receiver(peer, reply)).await?;
+        answer.await.map_err(|_| NodeError::Stopped)?
+    }
+
     /// What the node's sockets have carried so far.
     ///
     /// # Errors
@@ -565,6 +636,17 @@ pub async fn start_with<E: SystemEntropy>(
     mut entropy: E,
 ) -> Result<(Node, Events), StartError> {
     entropy.check().map_err(StartError::Entropy)?;
+    #[cfg(feature = "stream")]
+    if let Delivery::PerPeer { messages, .. } = config.delivery {
+        use convesso_stream::config::StreamConfig;
+        let needed = StreamServer::MAX_MESSAGE + ELEMENT_COST;
+        if messages < needed {
+            return Err(StartError::Budget {
+                budget: messages,
+                needed,
+            });
+        }
+    }
     let address = *identity.address();
     let mut endpoint = Endpoint::<Server>::new(identity, &[config.context.as_slice()])
         .map_err(StartError::Core)?;
@@ -616,8 +698,15 @@ pub async fn start_with<E: SystemEntropy>(
         link_rx: vec![0; 4096],
         waiting_room: false,
         hook,
+        delivery: config.delivery,
+        receivers: HashMap::new(),
+        receivers_wake: Arc::new(Notify::new()),
+        held: VecDeque::new(),
         #[cfg(feature = "stream")]
-        channels: Box::default(),
+        channels: Box::new(match config.delivery {
+            Delivery::Events => Channels::new(),
+            Delivery::PerPeer { .. } => Channels::with_credit(),
+        }),
         #[cfg(feature = "stream")]
         frame: vec![0; convesso_stream::frame::MAX_DATA_LEN],
         #[cfg(feature = "stream")]
@@ -802,6 +891,14 @@ enum Owned {
         len: usize,
     },
     Event(NodeEvent),
+    /// A datagram, with whether it also confirmed a first session: in the
+    /// per-peer mode, the connection is told on the event stream apart.
+    Datagram {
+        peer: PeerId,
+        data: Vec<u8>,
+        relayed: bool,
+        connected: bool,
+    },
     /// A stream frame, for the channels.
     #[cfg(feature = "stream")]
     Frame {
@@ -832,8 +929,28 @@ fn own(output: Output<'_>) -> Owned {
             data: data.to_vec(),
             connected,
         },
-        Output::Event(event) => event_of(event).map_or(Owned::Nothing, Owned::Event),
+        Output::Event(event) => owned_event(event),
         Output::Nothing => Owned::Nothing,
+    }
+}
+
+/// A core event the task keeps: a datagram with its connection flag, any
+/// other as the application's event.
+fn owned_event(event: Event<'_>) -> Owned {
+    match event {
+        Event::Datagram {
+            peer,
+            data,
+            relayed,
+            connected,
+            ..
+        } => Owned::Datagram {
+            peer,
+            data: data.to_vec(),
+            relayed,
+            connected,
+        },
+        event => event_of(event).map_or(Owned::Nothing, Owned::Event),
     }
 }
 
@@ -906,6 +1023,14 @@ struct Task<E> {
     waiting_room: bool,
     /// Given every TCP connection to the relay before it connects.
     hook: Option<SocketHook>,
+    delivery: Delivery,
+    /// The open receivers, in the per-peer mode.
+    receivers: HashMap<PeerId, Arc<Shared>>,
+    /// Woken by a receiver that freed room or was dropped.
+    receivers_wake: Arc<Notify>,
+    /// Events waiting for room in the event channel, in order; those of a
+    /// peer and kind coalesced, the latest replacing the earlier.
+    held: VecDeque<(Option<Held>, NodeEvent)>,
     /// The message channels, and the frame they write.
     #[cfg(feature = "stream")]
     channels: Box<Channels<StreamServer>>,
@@ -932,8 +1057,46 @@ enum Wake {
     Connected(std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)>),
     Command(Option<Command>),
     Deadline,
-    /// The application read: room for a message that waited.
+    /// The application read: room for an event that waited.
     Room,
+    /// A receiver freed room, or was dropped.
+    Receivers,
+}
+
+/// What a waiting event is coalesced by: its peer, or none for the relay's
+/// reports, and its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held(Option<PeerId>, Kind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Connected,
+    Closed,
+    ReopenFailed,
+    NotAtRelay,
+    Observed(Link),
+    RelayUnavailable,
+    PathChanged,
+    #[cfg(feature = "stream")]
+    ChannelReset,
+}
+
+/// The key an event is coalesced by; `None` for one that carries data.
+fn held_key(event: &NodeEvent) -> Option<Held> {
+    Some(match *event {
+        NodeEvent::Connected { peer } => Held(Some(peer), Kind::Connected),
+        NodeEvent::Closed { peer, .. } => Held(Some(peer), Kind::Closed),
+        NodeEvent::ReopenFailed { peer, .. } => Held(Some(peer), Kind::ReopenFailed),
+        NodeEvent::PeerNotAtRelay { peer } => Held(Some(peer), Kind::NotAtRelay),
+        NodeEvent::ObservedAddress { link, .. } => Held(None, Kind::Observed(link)),
+        NodeEvent::RelayUnavailable { .. } => Held(None, Kind::RelayUnavailable),
+        NodeEvent::PathChanged { peer, .. } => Held(Some(peer), Kind::PathChanged),
+        #[cfg(feature = "stream")]
+        NodeEvent::ChannelReset { peer, .. } => Held(Some(peer), Kind::ChannelReset),
+        NodeEvent::Datagram { .. } => return None,
+        #[cfg(feature = "stream")]
+        NodeEvent::Message { .. } => return None,
+    })
 }
 
 impl<E: SystemEntropy> Task<E> {
@@ -956,13 +1119,16 @@ impl<E: SystemEntropy> Task<E> {
                 }
                 armed = deadline;
             }
+            let reading = self.reading();
+            let waiting = self.waiting_room || !self.held.is_empty();
             let wake = tokio::select! {
-                r = self.udp.recv_from(&mut self.rx) => Wake::Udp(r),
-                r = read_link(&mut self.link, &mut self.link_rx), if self.link.is_some() => Wake::Link(r),
+                r = self.udp.recv_from(&mut self.rx), if reading => Wake::Udp(r),
+                r = read_link(&mut self.link, &mut self.link_rx), if reading && self.link.is_some() => Wake::Link(r),
                 r = poll_connecting(&mut self.connecting), if self.connecting.is_some() => Wake::Connected(r),
                 c = self.commands.recv() => Wake::Command(c),
                 () = &mut sleep, if armed.is_some() => Wake::Deadline,
-                () = room(&self.events, self.waiting_room) => Wake::Room,
+                () = room(&self.events, waiting) => Wake::Room,
+                () = self.receivers_wake.notified() => Wake::Receivers,
             };
             match wake {
                 Wake::Udp(Ok((len, from))) => self.udp_packet(len, from).await,
@@ -978,7 +1144,8 @@ impl<E: SystemEntropy> Task<E> {
                 Wake::Command(Some(command)) => self.command(command).await,
                 // An elapsed timer is ready at every poll: armed again below.
                 Wake::Deadline => armed = None,
-                Wake::Room => {}
+                Wake::Room => self.flush(),
+                Wake::Receivers => self.settle_receivers(),
             }
             self.take_ready().await;
             deadline = self.drain().await;
@@ -998,7 +1165,9 @@ impl<E: SystemEntropy> Task<E> {
                 self.command(command).await;
                 took = true;
             }
-            if let Ok((len, from)) = self.udp.try_recv_from(&mut self.rx) {
+            if self.reading()
+                && let Ok((len, from)) = self.udp.try_recv_from(&mut self.rx)
+            {
                 self.udp_packet(len, from).await;
                 took = true;
             }
@@ -1164,11 +1333,25 @@ impl<E: SystemEntropy> Task<E> {
                 self.execute(output, None).await;
                 #[cfg(feature = "stream")]
                 self.close_channel(peer, code);
+                self.close_receiver(
+                    peer,
+                    SessionClosed {
+                        code,
+                        by_peer: false,
+                    },
+                );
             }
             Command::ClosePeer(peer, code) => {
                 self.endpoint.close_peer(peer, code);
                 #[cfg(feature = "stream")]
                 self.close_channel(peer, code);
+                self.close_receiver(
+                    peer,
+                    SessionClosed {
+                        code,
+                        by_peer: false,
+                    },
+                );
             }
             Command::NetworkChanged => {
                 self.report_interfaces();
@@ -1203,6 +1386,9 @@ impl<E: SystemEntropy> Task<E> {
             Command::RelayUdpProven(reply) => {
                 let _ = reply.send(self.endpoint.relay_udp_proven(now));
             }
+            Command::Receiver(peer, reply) => {
+                let _ = reply.send(self.open_receiver(peer, now));
+            }
             #[cfg(feature = "stream")]
             Command::SendMessage(parked) => {
                 // Behind those already waiting for the same peer: in order.
@@ -1223,6 +1409,177 @@ impl<E: SystemEntropy> Task<E> {
         if let Ok(context) = Context::new(&self.context) {
             self.channels.session_closed(peer, context, code);
         }
+    }
+
+    /// Whether to read the socket and the relay link: in the event-stream
+    /// mode, only while the event channel has room and nothing waits aside,
+    /// since datagrams cannot be coalesced; always in the per-peer mode,
+    /// whose event stream carries none.
+    fn reading(&self) -> bool {
+        match self.delivery {
+            Delivery::Events => self.held.is_empty() && self.events.capacity() > 0,
+            Delivery::PerPeer { .. } => true,
+        }
+    }
+
+    /// Hands an event to the application without ever waiting for it: into
+    /// the event channel, or aside while it is full (`DESIGN.md §5`).
+    fn emit(&mut self, event: NodeEvent) {
+        let event = if self.held.is_empty() {
+            match self.events.try_send(event) {
+                Ok(()) | Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(event)) => event,
+            }
+        } else {
+            event
+        };
+        let key = held_key(&event);
+        if key.is_some() {
+            self.held.retain(|(k, _)| *k != key);
+        }
+        self.held.push_back((key, event));
+    }
+
+    /// Moves what waits aside into the event channel, in order, as far as
+    /// there is room.
+    fn flush(&mut self) {
+        while let Some((key, event)) = self.held.pop_front() {
+            match self.events.try_send(event) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(event)) => {
+                    self.held.push_front((key, event));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Opens `peer`'s receiver, granting its channel the message budget. A
+    /// receiver dropped and not yet settled is settled first.
+    fn open_receiver(&mut self, peer: PeerId, now: Instant) -> Result<Receiver, NodeError> {
+        let Delivery::PerPeer { messages, .. } = self.delivery else {
+            return Err(NodeError::NotPerPeer);
+        };
+        if let Some(shared) = self.receivers.get(&peer) {
+            if !shared.lock().dropped {
+                return Err(NodeError::ReceiverOpen);
+            }
+            self.settle_receivers_at(now);
+        }
+        let shared = Shared::new(self.receivers_wake.clone());
+        #[cfg(feature = "stream")]
+        self.channels
+            .grant(peer, &self.context, messages)
+            .map_err(NodeError::Message)?;
+        #[cfg(not(feature = "stream"))]
+        let _ = messages;
+        self.receivers.insert(peer, shared.clone());
+        Ok(Receiver::new(peer, shared))
+    }
+
+    fn settle_receivers(&mut self) {
+        let now = self.now();
+        self.settle_receivers_at(now);
+    }
+
+    /// Grants each channel the room its receiver freed; resets the channel of
+    /// a receiver the application dropped, which tells the peer.
+    fn settle_receivers_at(&mut self, now: Instant) {
+        let mut dropped = Vec::new();
+        for (&peer, shared) in &self.receivers {
+            #[cfg_attr(not(feature = "stream"), allow(unused_mut))]
+            let mut state = shared.lock();
+            if state.dropped {
+                dropped.push(peer);
+                continue;
+            }
+            #[cfg(feature = "stream")]
+            {
+                let freed = std::mem::take(&mut state.freed);
+                drop(state);
+                if freed > 0 {
+                    let _ = self.channels.grant(peer, &self.context, freed);
+                }
+            }
+        }
+        for peer in dropped {
+            self.receivers.remove(&peer);
+            #[cfg(feature = "stream")]
+            if let Ok(context) = Context::new(&self.context) {
+                self.channels.reset_here(peer, context, now);
+            }
+        }
+        #[cfg(not(feature = "stream"))]
+        let _ = now;
+    }
+
+    /// The session with `peer` ended: its receiver says so once it has been
+    /// read up to here, and stays closed.
+    fn close_receiver(&mut self, peer: PeerId, closed: SessionClosed) {
+        if let Some(shared) = self.receivers.remove(&peer) {
+            shared.lock().closed.get_or_insert(closed);
+            shared.closed();
+        }
+    }
+
+    /// A datagram, in the per-peer mode: to its receiver, or dropped.
+    fn receive_datagram(&mut self, peer: PeerId, data: Vec<u8>, relayed: bool) {
+        let Delivery::PerPeer { datagrams, .. } = self.delivery else {
+            return;
+        };
+        if let Some(shared) = self.receivers.get(&peer) {
+            let mut state = shared.lock();
+            let cost = data.len() + ELEMENT_COST;
+            if !state.dropped && state.datagram_bytes + cost <= datagrams {
+                state.datagram_bytes += cost;
+                state.datagrams.push_back((data, relayed));
+                drop(state);
+                shared.datagrams_ready();
+                return;
+            }
+        }
+        self.stats.datagrams_dropped += 1;
+    }
+
+    /// A message, in the per-peer mode: to its receiver, whose room the
+    /// channel's credit reserved.
+    #[cfg(feature = "stream")]
+    fn receive_message(&mut self, peer: PeerId, data: Vec<u8>) {
+        // Credit is granted only for an open receiver, and goes with it: a
+        // message for none was meant for one just dropped, whose channel is
+        // about to be reset.
+        if let Some(shared) = self.receivers.get(&peer) {
+            let mut state = shared.lock();
+            if !state.dropped {
+                state.held += data.len() + ELEMENT_COST;
+                state.items.push_back(crate::receiver::Item::Message(data));
+                drop(state);
+                shared.messages_ready();
+            }
+        }
+    }
+
+    /// A channel reset, in the per-peer mode: to its receiver after the
+    /// messages before it, and the channel granted the receiver's free room
+    /// again, since the reset left it no credit.
+    #[cfg(feature = "stream")]
+    fn receive_reset(&mut self, peer: PeerId, reason: convesso_stream::Reason) {
+        let Delivery::PerPeer { messages, .. } = self.delivery else {
+            return;
+        };
+        let Some(shared) = self.receivers.get(&peer) else {
+            return;
+        };
+        let mut state = shared.lock();
+        if state.dropped {
+            return;
+        }
+        state.items.push_back(crate::receiver::Item::Reset(reason));
+        state.freed = 0;
+        let room = messages.saturating_sub(state.held);
+        drop(state);
+        shared.messages_ready();
+        let _ = self.channels.grant(peer, &self.context, room);
     }
 
     /// Offers a message to its channel: accepted or refused, the sender is
@@ -1311,7 +1668,10 @@ impl<E: SystemEntropy> Task<E> {
             let now = self.now();
             // A message is handed out only when the application can take it:
             // otherwise the channel keeps it and its window closes.
-            let deliver = self.events.capacity() > 0;
+            let deliver = match self.delivery {
+                Delivery::Events => self.held.is_empty() && self.events.capacity() > 0,
+                Delivery::PerPeer { .. } => true,
+            };
             self.waiting_room = !deliver;
             let output = match self.channels.poll(now, deliver, &mut self.frame) {
                 StreamPoll::SendFrame {
@@ -1353,13 +1713,21 @@ impl<E: SystemEntropy> Task<E> {
                     )
                     .map_or(Owned::Nothing, own),
                 StreamPoll::Event(StreamEvent::Message { peer, data, .. }) => {
-                    Owned::Event(NodeEvent::Message {
-                        peer,
-                        data: data.to_vec(),
-                    })
+                    let data = data.to_vec();
+                    if matches!(self.delivery, Delivery::PerPeer { .. }) {
+                        self.receive_message(peer, data);
+                        Owned::Nothing
+                    } else {
+                        Owned::Event(NodeEvent::Message { peer, data })
+                    }
                 }
                 StreamPoll::Event(StreamEvent::Reset { peer, reason, .. }) => {
-                    Owned::Event(NodeEvent::ChannelReset { peer, reason })
+                    if matches!(self.delivery, Delivery::PerPeer { .. }) {
+                        self.receive_reset(peer, reason);
+                        Owned::Nothing
+                    } else {
+                        Owned::Event(NodeEvent::ChannelReset { peer, reason })
+                    }
                 }
                 StreamPoll::Event(StreamEvent::Writable { peer, .. }) => {
                     self.retry_parked(peer, now);
@@ -1383,8 +1751,9 @@ impl<E: SystemEntropy> Task<E> {
             match poll {
                 Poll::Transmit { to, len } => self.execute(Owned::Transmit { to, len }, None).await,
                 Poll::Event(event) => {
-                    if let Some(event) = event_of(event) {
-                        self.execute(Owned::Event(event), None).await;
+                    let owned = owned_event(event);
+                    if !matches!(owned, Owned::Nothing) {
+                        self.execute(owned, None).await;
                     }
                 }
                 Poll::OpenRelayLink => self.open_link(),
@@ -1445,6 +1814,27 @@ impl<E: SystemEntropy> Task<E> {
                     let _ = self.events.send(NodeEvent::Connected { peer }).await;
                 }
             }
+            Owned::Datagram {
+                peer,
+                data,
+                relayed,
+                connected,
+            } => {
+                if matches!(self.delivery, Delivery::PerPeer { .. }) {
+                    if connected {
+                        self.emit(NodeEvent::Connected { peer });
+                    }
+                    self.receive_datagram(peer, data, relayed);
+                } else {
+                    // The application learns of the connection with the
+                    // datagram itself.
+                    self.emit(NodeEvent::Datagram {
+                        peer,
+                        data,
+                        relayed,
+                    });
+                }
+            }
             Owned::Event(event) => {
                 #[cfg(feature = "stream")]
                 if let Ok(context) = Context::new(&self.context) {
@@ -1458,8 +1848,16 @@ impl<E: SystemEntropy> Task<E> {
                         _ => {}
                     }
                 }
-                // Waits while the application does not read: backpressure.
-                let _ = self.events.send(event).await;
+                if matches!(self.delivery, Delivery::PerPeer { .. })
+                    && let NodeEvent::Closed {
+                        peer,
+                        code,
+                        by_peer,
+                    } = event
+                {
+                    self.close_receiver(peer, SessionClosed { code, by_peer });
+                }
+                self.emit(event);
             }
             Owned::Transmit { to, len } => {
                 let Some(packet) = self.out.get(..len) else {

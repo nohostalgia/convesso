@@ -118,6 +118,13 @@ alike, and leaves a new driver less room for protocol mistakes.
 A driver uses **one UDP socket** for the relay and for peers alike, so that the address the relay
 sees is the address peers will reach.
 
+A driver **never waits on the application**. When the application does not read its events, the
+driver stops reading its socket and the relay link, so that what is lost is lost on the network,
+where the protocol expects it. Its timers, acknowledgements, keep-alives and commands go on. Events
+its timers produce meanwhile wait aside, one per peer and kind, the latest replacing the earlier:
+an application that reads late sees the latest state of each peer and of the relay, not every
+step.
+
 An embedded device is given its identity when it is made, as a 64-byte record, and takes its
 randomness from the chip's hardware generator. If the generator does not work, the driver does not
 start.
@@ -166,6 +173,11 @@ a device that does not need it does not carry it.
   (RFC 5681, RFC 6582), selective acknowledgements (RFC 6675). Only the frame format is new.
 - **One ordered channel per session.** A message arrives whole, once and in order, or the channel
   is reset, with one event on each side.
+- **The reader decides how much each peer may hand it.** With delivery credit, a channel hands out
+  only as many bytes as its reader granted, so a reader that stops taking one peer's messages holds
+  back that peer's sender alone, through the channel's own window. A reader that gives a channel up
+  resets it on its side, and the sender is told. The tokio driver builds a receiver per peer on
+  this.
 - **Datagrams do not wait for messages.**
 - **Quiet at rest:** with everything acknowledged, the channel sets no timer.
 

@@ -14,17 +14,17 @@ flash = 113088
 ram = 0
 
 ["reference-embassy/thumbv7em-none-eabihf"]
-flash = 114816
-ram = 56632
+flash = 115552
+ram = 58336
 
 ["reference-embassy/riscv32imc-unknown-none-elf"]
-flash = 148724
-ram = 56620
+flash = 149380
+ram = 58324
 
 ["reference-stream/thumbv7em-none-eabihf"]
-flash = 134992
-ram = 81200
+flash = 135680
+ram = 83072
 
 ["reference-stream/riscv32imc-unknown-none-elf"]
-flash = 174384
-ram = 81188
+flash = 175756
+ram = 83060

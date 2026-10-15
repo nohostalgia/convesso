@@ -91,6 +91,7 @@ fn delta(after: Stats, before: Stats) -> Stats {
         core_link_outputs: after.core_link_outputs - before.core_link_outputs,
         #[cfg(feature = "stream")]
         stream_frames_sent: after.stream_frames_sent - before.stream_frames_sent,
+        datagrams_dropped: after.datagrams_dropped - before.datagrams_dropped,
     }
 }
 
@@ -145,6 +146,116 @@ async fn an_idle_hour_without_a_link() {
     let hour = delta(sender.stats().await.unwrap(), before);
     std::println!("idle hour without a link: {hour:?}");
     assert_eq!(hour, Stats::default());
+}
+
+/// Scenario: an idle hour after an exchange of messages, in the per-peer
+/// mode, counts what it counts in the event-stream mode: two pairs side by
+/// side, one per mode, exchange 100 messages, wait for their sessions to go
+/// dormant, and are counted for an hour.
+#[cfg(feature = "stream")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "an hour of real time"]
+async fn an_idle_hour_after_messages_in_both_modes() {
+    use convesso_tokio::{Delivery, Received};
+
+    let relay = relay(Limits::default()).await;
+    let start = |seed: u8, delivery: Delivery| {
+        let relay = relay.clone();
+        async move {
+            convesso_tokio::start(
+                Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
+                Config {
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    relay: Some(relay),
+                    events: 65_536,
+                    delivery,
+                    ..Config::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let per_peer = Delivery::PerPeer {
+        messages: 1 << 20,
+        datagrams: 1 << 18,
+    };
+    let mut pairs = Vec::new();
+    for (seed, delivery) in [(20, Delivery::Events), (22, per_peer)] {
+        let (sender, sender_events) = start(seed, Delivery::Events).await;
+        let (receiver, mut receiver_events) = start(seed + 1, delivery).await;
+        receiver.set_reachable(true).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let opened = match delivery {
+            Delivery::PerPeer { .. } => {
+                Some(receiver.receiver(sender.address().peer_id()).await.unwrap())
+            }
+            Delivery::Events => None,
+        };
+        for i in 0..100u8 {
+            sender
+                .send_message(receiver.address(), vec![i; 1000])
+                .await
+                .unwrap();
+        }
+        let mut got = 0;
+        while got < 100 {
+            match &opened {
+                Some(open) => {
+                    if let Ok(Received::Message(_)) =
+                        timeout(Duration::from_secs(10), open.recv()).await
+                    {
+                        got += 1;
+                    }
+                }
+                None => {
+                    if let Ok(Some(NodeEvent::Message { .. })) =
+                        timeout(Duration::from_secs(10), receiver_events.next()).await
+                    {
+                        got += 1;
+                    }
+                }
+            }
+        }
+        pairs.push((sender, sender_events, receiver, receiver_events, opened));
+    }
+    // The keys expire after 180 s; then the sessions are dormant.
+    tokio::time::sleep(Duration::from_secs(190)).await;
+    let mut before = Vec::new();
+    for (sender, _, receiver, _, _) in &pairs {
+        before.push((
+            sender.stats().await.unwrap(),
+            receiver.stats().await.unwrap(),
+        ));
+    }
+    tokio::time::sleep(HOUR).await;
+    let mut hours = Vec::new();
+    for ((sender, _, receiver, _, _), (s, r)) in pairs.iter().zip(before) {
+        hours.push((
+            delta(sender.stats().await.unwrap(), s),
+            delta(receiver.stats().await.unwrap(), r),
+        ));
+    }
+    std::println!("an idle hour after messages, events: {:?}", hours[0]);
+    std::println!("an idle hour after messages, per peer: {:?}", hours[1]);
+    for (sender, receiver) in &hours {
+        assert_eq!(*sender, Stats::default(), "the sender sends nothing");
+        assert!(
+            (59..=61).contains(&receiver.keepalives_sent),
+            "{receiver:?}"
+        );
+        assert_eq!(
+            (
+                receiver.udp_sent,
+                receiver.frames_sent,
+                receiver.stream_frames_sent
+            ),
+            (0, 0, 0),
+            "only keep-alives"
+        );
+    }
+    let (events, per_peer) = (hours[0].1, hours[1].1);
+    assert!(events.keepalives_sent.abs_diff(per_peer.keepalives_sent) <= 1);
 }
 
 /// The first datagram's time: through a local relay, and over a hint.

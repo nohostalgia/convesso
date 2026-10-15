@@ -16,12 +16,14 @@ pub mod address;
 pub mod entropy;
 pub mod identity;
 mod node;
+mod receiver;
 pub mod relay_server;
 
 #[cfg(feature = "relay-bin")]
 pub mod relay_config;
 
 pub use node::{
-    Config, DIRECT_PATH_MAX, Events, Node, NodeError, NodeEvent, RelayLocation, SocketHandle,
-    SocketHook, StartError, Stats, start, start_with,
+    Config, DIRECT_PATH_MAX, Delivery, Events, Node, NodeError, NodeEvent, RelayLocation,
+    SocketHandle, SocketHook, StartError, Stats, start, start_with,
 };
+pub use receiver::{ELEMENT_COST, Received, Receiver, SessionClosed};

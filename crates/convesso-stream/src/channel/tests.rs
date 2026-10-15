@@ -887,3 +887,469 @@ fn reset_answers_are_limited_to_one_a_second() {
     assert_eq!(resets(&pair), 2, "again after it");
     assert!(pair.b.messages().is_empty() && pair.b.resets().is_empty());
 }
+
+// --- delivery credit ---------------------------------------------------------------------
+
+/// A pair whose B side has delivery credit on.
+fn credited_pair(seed: u64) -> Pair<Mcu, Mcu> {
+    let mut pair = mcu_pair(seed);
+    pair.b.channels = Channels::with_credit();
+    pair
+}
+
+fn b_grants(pair: &mut Pair<Mcu, Mcu>, bytes: usize) {
+    let a = pair.a.peer;
+    pair.b.channels.grant(a, b"ctx", bytes).unwrap();
+}
+
+fn b_credit(pair: &Pair<Mcu, Mcu>) -> Option<usize> {
+    pair.b.channels.inspect(pair.a.peer, ctx()).unwrap().credit
+}
+
+/// Scenario: a message is not handed out on credit that covers only its
+/// length, nor any part of it; it is once the credit covers its cost.
+#[test]
+fn a_message_needs_credit_for_its_length_and_the_element_cost() {
+    let mut pair = credited_pair(23);
+    b_grants(&mut pair, 1000);
+    pair.a_sends(&message(1, 1000)).unwrap();
+    pair.run_for(1000);
+    assert!(pair.b.messages().is_empty());
+    assert_eq!(b_credit(&pair), Some(1000));
+    b_grants(&mut pair, crate::ELEMENT_COST - 1);
+    pair.run_for(1000);
+    assert!(pair.b.messages().is_empty(), "one byte short");
+    b_grants(&mut pair, 1);
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![message(1, 1000)]);
+    assert_eq!(b_credit(&pair), Some(0));
+    assert!(pair.b.resets().is_empty() && pair.a.resets().is_empty());
+}
+
+/// Scenario: a reset leaves the channel with no credit, and the new
+/// incarnation's message waits for a grant.
+#[test]
+fn a_reset_leaves_the_channel_with_no_credit() {
+    let mut pair = credited_pair(24);
+    b_grants(&mut pair, 100_000);
+    pair.a_sends(b"before").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"before".to_vec()]);
+    // A restarts: its next message opens a new incarnation.
+    pair.a = Side::new(0, 99);
+    pair.a_sends(b"after").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.resets(), vec![Reason::PeerRestarted]);
+    assert_eq!(pair.b.messages(), vec![b"before".to_vec()]);
+    assert_eq!(b_credit(&pair), Some(0));
+    b_grants(&mut pair, 5 + crate::ELEMENT_COST);
+    pair.run_for(1000);
+    assert_eq!(
+        pair.b.messages(),
+        vec![b"before".to_vec(), b"after".to_vec()]
+    );
+    assert_eq!(pair.b.resets(), vec![Reason::PeerRestarted], "one reset");
+}
+
+/// The session's close, too, leaves the channel with no credit.
+#[test]
+fn a_closed_session_leaves_the_channel_with_no_credit() {
+    let mut pair = credited_pair(25);
+    b_grants(&mut pair, 100_000);
+    pair.a_sends(b"before").unwrap();
+    pair.run_for(1000);
+    let a = pair.a.peer;
+    pair.b.channels.session_closed(a, ctx(), 3);
+    assert_eq!(b_credit(&pair), Some(0));
+}
+
+/// Scenario: a grant with no free channel slot is refused, and makes no
+/// channel.
+#[test]
+fn a_grant_with_no_free_slot_is_refused() {
+    let mut channels: Channels<Mcu> = Channels::with_credit();
+    for i in 0..4 {
+        channels.grant(address(i).peer_id(), b"ctx", 100).unwrap();
+    }
+    let fifth = address(4).peer_id();
+    assert_eq!(
+        channels.grant(fifth, b"ctx", 100),
+        Err(SendError::TableFull)
+    );
+    assert!(channels.inspect(fifth, ctx()).is_none());
+    for i in 0..4 {
+        let state = channels.inspect(address(i).peer_id(), ctx()).unwrap();
+        assert_eq!(state.credit, Some(100));
+    }
+}
+
+/// With credit off, a grant does nothing and every message is handed out.
+#[test]
+fn with_credit_off_a_grant_changes_nothing() {
+    let mut pair = mcu_pair(26);
+    b_grants(&mut pair, 0);
+    pair.a_sends(b"hello").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"hello".to_vec()]);
+    assert_eq!(b_credit(&pair), None);
+}
+
+/// One reader with credit on and two senders, each on its own link, on one
+/// virtual clock. The reader grants each message's cost back as it takes
+/// it, for the senders in `granting`.
+struct Trio {
+    reader: Channels<Mcu>,
+    senders: [Channels<Mcu>; 2],
+    peers: [PeerId; 3],
+    entropy: Counter,
+    granting: [bool; 2],
+    /// Messages taken by the reader, by sender.
+    taken: [usize; 2],
+    /// Sends refused "full", by sender.
+    full: [usize; 2],
+    resets: usize,
+    now: u64,
+    wire: Vec<(u64, usize, usize, FrameKind, Vec<u8>)>,
+}
+
+impl Trio {
+    const LEN: usize = 1000;
+
+    fn new() -> Self {
+        let mut trio = Self {
+            reader: Channels::with_credit(),
+            senders: [Channels::new(), Channels::new()],
+            peers: [
+                address(0).peer_id(),
+                address(1).peer_id(),
+                address(2).peer_id(),
+            ],
+            entropy: Counter(5),
+            granting: [true, true],
+            taken: [0, 0],
+            full: [0, 0],
+            resets: 0,
+            now: 1000,
+            wire: Vec::new(),
+        };
+        for i in 0..2 {
+            let peer = trio.peers[i + 1];
+            trio.reader
+                .grant(peer, b"ctx", 2 * (Self::LEN + crate::ELEMENT_COST))
+                .unwrap();
+        }
+        trio
+    }
+
+    /// Each sender offers messages until its buffer is full.
+    fn offer(&mut self) {
+        let now = Instant::from_millis(self.now);
+        for i in 0..2 {
+            let reader = self.peers[0];
+            loop {
+                match self.senders[i].send_message(
+                    reader,
+                    None,
+                    b"ctx",
+                    &[i as u8; Self::LEN],
+                    now,
+                    &mut self.entropy,
+                ) {
+                    Ok(()) => {}
+                    Err(SendError::Full) => {
+                        self.full[i] += 1;
+                        break;
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+        }
+    }
+
+    /// Polls node `n` (0 the reader, 1 and 2 the senders) until it waits.
+    fn poll(&mut self, n: usize) -> Option<u64> {
+        let now = Instant::from_millis(self.now);
+        let mut out = [0u8; MAX_DATA_LEN];
+        let mut grants = Vec::new();
+        let deadline = loop {
+            let channels = if n == 0 {
+                &mut self.reader
+            } else {
+                &mut self.senders[n - 1]
+            };
+            match channels.poll(now, true, &mut out) {
+                Poll::SendFrame {
+                    peer, kind, len, ..
+                } => {
+                    let to = self.peers.iter().position(|p| *p == peer).unwrap();
+                    self.wire
+                        .push((self.now + 20, n, to, kind, out[..len].to_vec()));
+                }
+                Poll::Event(Event::Message { peer, data, .. }) => {
+                    let i = self.peers.iter().position(|p| *p == peer).unwrap() - 1;
+                    self.taken[i] += 1;
+                    if self.granting[i] {
+                        grants.push((peer, data.len() + crate::ELEMENT_COST));
+                    }
+                }
+                Poll::Event(Event::Reset { .. }) => self.resets += 1,
+                Poll::Event(Event::Writable { .. }) | Poll::Dial { .. } => {}
+                Poll::Wait(at) => break Some(at.as_millis()),
+                Poll::Idle => break None,
+            }
+        };
+        for (peer, bytes) in grants {
+            self.reader.grant(peer, b"ctx", bytes).unwrap();
+        }
+        deadline
+    }
+
+    fn run_for(&mut self, ms: u64) {
+        let until = self.now + ms;
+        loop {
+            let now = self.now;
+            let mut due = Vec::new();
+            self.wire.retain(|f| {
+                if f.0 <= now {
+                    due.push(f.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let t = Instant::from_millis(now);
+            for (_, from, to, kind, bytes) in due {
+                let peer = self.peers[from];
+                let channels = if to == 0 {
+                    &mut self.reader
+                } else {
+                    &mut self.senders[to - 1]
+                };
+                channels.handle_frame(peer, ctx(), kind, &bytes, t);
+            }
+            self.offer();
+            let deadlines: Vec<_> = (0..3).filter_map(|n| self.poll(n)).collect();
+            let next = deadlines
+                .into_iter()
+                .chain(self.wire.iter().map(|f| f.0))
+                .filter(|&t| t > self.now)
+                .min();
+            match next {
+                Some(t) if t <= until => self.now = t,
+                _ => {
+                    self.now = until;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: a reader that stops granting holds back only that sender. The
+/// other sender's rate stays within 10%, the stopped one's sends return
+/// "full", and the reader holds no more for it than its receive buffer.
+#[test]
+fn a_reader_that_stops_granting_holds_back_only_that_sender() {
+    let mut trio = Trio::new();
+    trio.run_for(2_000);
+    let before = trio.taken;
+    trio.run_for(10_000);
+    let both = [trio.taken[0] - before[0], trio.taken[1] - before[1]];
+    assert!(both[0] > 50 && both[1] > 50, "both flow: {both:?}");
+
+    trio.granting[0] = false;
+    trio.run_for(2_000);
+    let (stopped, full) = (trio.taken, trio.full);
+    trio.run_for(10_000);
+    let other = trio.taken[1] - stopped[1];
+    let ratio = other as f64 / both[1] as f64;
+    assert!((0.9..=1.1).contains(&ratio), "{other} against {}", both[1]);
+    assert_eq!(
+        trio.taken[0], stopped[0],
+        "nothing more from the stopped sender"
+    );
+    assert!(trio.full[0] > full[0], "its sends return full");
+    let s1 = trio.peers[1];
+    assert!(trio.reader.memory(s1, ctx()).unwrap() <= 2048);
+    assert_eq!(trio.resets, 0);
+}
+
+/// Scenario: a reader that grants nothing for ten minutes resets nothing.
+/// The waiting sender probes at most once every 15 s once its backoff has
+/// grown, and every message arrives in order after the grant.
+#[test]
+fn a_reader_that_grants_nothing_for_ten_minutes_resets_nothing() {
+    let mut pair = credited_pair(27);
+    let sent: Vec<_> = (0..6).map(|i| message(i, 600)).collect();
+    let mut accepted = Vec::new();
+    for m in &sent {
+        if pair.a_sends(m).is_ok() {
+            accepted.push(m.clone());
+        }
+    }
+    pair.run_for(600_000);
+    assert!(pair.b.messages().is_empty());
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+    let late = pair
+        .a
+        .sent
+        .iter()
+        .filter(|(at, kind, _)| *kind == FrameKind::Data && *at >= 1000 + 60_000)
+        .count();
+    assert!(
+        late <= 540 / 15 + 1,
+        "{late} probes in the last nine minutes"
+    );
+
+    b_grants(&mut pair, 100_000);
+    pair.run_for(10_000);
+    let more: Vec<_> = sent[accepted.len()..].to_vec();
+    for m in &more {
+        pair.a_sends(m).unwrap();
+        pair.run_for(2_000);
+    }
+    assert_eq!(pair.b.messages(), sent);
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+}
+
+/// A paused reader, with credit off, is probed at most every 15 s once the
+/// backoff has grown: a retransmission is never taken for lost on the
+/// evidence of fragments sent before it, so the receiver's held in-order
+/// fragment is not sent again every round trip.
+#[test]
+fn a_paused_reader_is_probed_at_most_every_15_s() {
+    let mut pair = mcu_pair(28);
+    pair.b.deliver = false;
+    let mut accepted = Vec::new();
+    for i in 0..6 {
+        if pair.a_sends(&message(i, 600)).is_ok() {
+            accepted.push(message(i, 600));
+        }
+    }
+    pair.run_for(600_000);
+    let data = |pair: &Pair<Mcu, Mcu>, from: u64| {
+        pair.a
+            .sent
+            .iter()
+            .filter(|(at, kind, _)| *kind == FrameKind::Data && *at >= from)
+            .count()
+    };
+    assert!(data(&pair, 1000 + 60_000) <= 540 / 15 + 1);
+    assert!(
+        data(&pair, 0) < 60,
+        "{} data frames in ten minutes",
+        data(&pair, 0)
+    );
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+    pair.b.deliver = true;
+    pair.run_for(20_000);
+    assert_eq!(pair.b.messages(), accepted);
+}
+
+// --- the reset a reader asks for -----------------------------------------------------------
+
+fn b_resets_here(pair: &mut Pair<Mcu, Mcu>) {
+    let (a, t) = (pair.a.peer, pair.t());
+    pair.b.channels.reset_here(a, ctx(), t);
+}
+
+fn resets_sent_by_b(pair: &Pair<Mcu, Mcu>) -> Vec<u64> {
+    pair.b
+        .sent
+        .iter()
+        .filter(|(_, k, f)| *k == FrameKind::Ack && Ack::decode(f).is_ok_and(|a| a.reset))
+        .map(|(at, _, _)| *at)
+        .collect()
+}
+
+/// Scenario: a reader that gives a channel up tells the sender at once: no
+/// event on its side, one "reset by peer" on the sender's within a round
+/// trip, and the sender's next message opens a new incarnation.
+#[test]
+fn a_reader_that_gives_a_channel_up_tells_the_sender_at_once() {
+    let mut pair = mcu_pair(29);
+    pair.a_sends(&message(1, 1500)).unwrap();
+    pair.a_sends(b"second").unwrap();
+    pair.run_for(25);
+    b_resets_here(&mut pair);
+    pair.run_for(50);
+    assert_eq!(pair.a.resets(), vec![Reason::ResetByPeer]);
+    assert!(
+        pair.b.resets().is_empty(),
+        "no event on the side that asked"
+    );
+    pair.a_sends(b"after").unwrap();
+    pair.run_for(1000);
+    assert!(pair.b.messages().ends_with(&[b"after".to_vec()]));
+    assert_eq!(pair.a.resets(), vec![Reason::ResetByPeer], "one reset");
+    assert!(pair.b.resets().is_empty());
+}
+
+/// Scenario: a lost RESET is sent again, at most once a second, while the
+/// peer goes on sending on the incarnation reset; nothing of it is
+/// delivered, and the peer resets once.
+#[test]
+fn a_lost_reset_is_sent_again() {
+    let mut pair = mcu_pair(30);
+    pair.a_sends(&message(2, 1500)).unwrap();
+    // Its acknowledgements never reach A, which goes on sending.
+    pair.cut_to_a = true;
+    pair.run_for(30);
+    b_resets_here(&mut pair);
+    let delivered = pair.b.messages();
+    pair.run_for(5_000);
+    let sent = resets_sent_by_b(&pair);
+    assert!(sent.len() >= 2, "sent again: {sent:?}");
+    assert!(sent.windows(2).all(|w| w[1] - w[0] >= 1000), "{sent:?}");
+    assert!(pair.a.resets().is_empty());
+    pair.cut_to_a = false;
+    pair.run_for(20_000);
+    assert_eq!(pair.a.resets(), vec![Reason::ResetByPeer]);
+    assert_eq!(pair.b.messages(), delivered, "nothing after the reset");
+    assert!(pair.b.resets().is_empty());
+}
+
+/// Scenario: after a reset asked by a reader with credit on, the peer's new
+/// message waits for credit.
+#[test]
+fn after_a_reset_here_a_new_message_waits_for_credit() {
+    let mut pair = credited_pair(31);
+    b_grants(&mut pair, 100_000);
+    pair.a_sends(b"before").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"before".to_vec()]);
+    b_resets_here(&mut pair);
+    pair.run_for(1000);
+    assert_eq!(b_credit(&pair), Some(0));
+    pair.a_sends(b"new").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"before".to_vec()]);
+    b_grants(&mut pair, 3 + crate::ELEMENT_COST);
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"before".to_vec(), b"new".to_vec()]);
+}
+
+/// With credit on, channels are at rest after an exchange, as they are
+/// without it: the reader granting each message's cost back as it takes it
+/// leaves no deadline and sends nothing for a virtual month.
+#[test]
+fn channels_with_credit_are_at_rest_after_an_exchange() {
+    let mut pair = credited_pair(32);
+    b_grants(&mut pair, 2 * (2048 + crate::ELEMENT_COST));
+    for i in 0..100 {
+        pair.a_sends(&message(i, 500)).unwrap();
+        pair.run_for(300);
+        b_grants(&mut pair, 500 + crate::ELEMENT_COST);
+    }
+    pair.run_for(5000);
+    assert_eq!(pair.b.messages().len(), 100);
+    assert!(pair.at_rest());
+    let sent = (pair.a.sent.len(), pair.b.sent.len());
+    pair.run_for(30 * 24 * 3600 * 1000);
+    assert_eq!(
+        (pair.a.sent.len(), pair.b.sent.len()),
+        sent,
+        "nothing in a month"
+    );
+    assert!(pair.at_rest());
+}

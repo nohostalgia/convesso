@@ -46,7 +46,7 @@ pub const DIRECT_PATH_MAX: usize = 1452;
 pub(crate) const OUT_LEN: usize = 2048;
 
 /// The default size of the event buffer given to [`start`]: one event of the
-/// largest size and a thousand bytes of others. With less than [`OUT_LEN`]
+/// largest size and a thousand bytes of others. With less than `OUT_LEN`
 /// the runner would never read the datagram socket.
 pub const EVENTS_LEN: usize = OUT_LEN + 1024;
 
@@ -74,6 +74,11 @@ pub struct Config<'c> {
     pub context: &'c [u8],
     /// The relay to pin, if any.
     pub relay: Option<RelayLocation>,
+    /// With the `stream` feature, delivery credit: a peer's messages are
+    /// handed out only as far as [`Node::grant`] allows, so that a peer the
+    /// application takes slowly holds back only its own sender
+    /// (`DESIGN.md §8`). Without the feature, it changes nothing.
+    pub credit: bool,
 }
 
 /// Why the driver did not start.
@@ -303,7 +308,11 @@ where
             report_interfaces: false,
             stats: Stats::default(),
             #[cfg(feature = "stream")]
-            channels: convesso_stream::Channels::new(),
+            channels: if config.credit {
+                convesso_stream::Channels::with_credit()
+            } else {
+                convesso_stream::Channels::new()
+            },
             #[cfg(feature = "stream")]
             frame: [0; convesso_stream::frame::MAX_DATA_LEN],
         }),
@@ -432,7 +441,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
             }
             Output::Event(event) => {
                 if let Some(event) = from_core(event) {
-                    inner.events.push(event);
+                    inner.events.push_or_hold(event);
                     self.shared.events_ready.signal(());
                 }
             }
@@ -630,6 +639,31 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         self.offer(peer, None, data).await
     }
 
+    /// Lets `peer`'s channel hand out `bytes` more of its messages (feature
+    /// `stream`, with [`Config::credit`]): each message spends its length
+    /// plus [`convesso_stream::ELEMENT_COST`]. A channel starts with none,
+    /// and returns to none at its reset and at the session's close, so the
+    /// application grants again after those events. Nothing with credit off.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Message`] with the table-full error when no channel slot
+    /// is free.
+    #[cfg(feature = "stream")]
+    pub async fn grant(&self, peer: PeerId, bytes: usize) -> Result<(), NodeError> {
+        let mut guard = self.shared.inner.lock().await;
+        let inner = &mut *guard;
+        let context = inner.context;
+        let result = inner
+            .channels
+            .grant(peer, context.as_bytes(), bytes)
+            .map_err(NodeError::Message);
+        drop(guard);
+        // A message held for want of credit may go now.
+        self.shared.wake.signal(());
+        result
+    }
+
     #[cfg(feature = "stream")]
     async fn offer(
         &self,
@@ -749,7 +783,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
 
     /// Waits for the next thing to do.
     async fn wait(&mut self, deadline: Option<Instant>) -> Woken {
-        let room = self.shared.inner.lock().await.events.has_room(OUT_LEN);
+        let room = self.shared.inner.lock().await.events.readable(OUT_LEN);
         let link_idle = self.link_pending.0 >= self.link_pending.1;
         let relay = self.shared.inner.lock().await.relay;
         let Self {
@@ -867,7 +901,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     .channels
                     .handle_frame(peer, context, kind, data, now());
                 if connected {
-                    inner.events.push(NodeEvent::Connected { peer });
+                    inner.events.push_or_hold(NodeEvent::Connected { peer });
                     shared.events_ready.signal(());
                 }
             }
@@ -875,8 +909,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                 if let Some(event) = from_core(event) {
                     #[cfg(feature = "stream")]
                     tell_channels(inner, &event);
-                    // Room for one event was checked before reading.
-                    inner.events.push(event);
+                    // Room for a packet's events was checked before reading.
+                    inner.events.push_or_hold(event);
                     shared.events_ready.signal(());
                 }
             }
@@ -956,7 +990,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             // channel keeps it, and its window closes.
             let deliver = inner
                 .events
-                .has_room(<StreamConfig as convesso_stream::config::StreamConfig>::MAX_MESSAGE);
+                .deliverable(<StreamConfig as convesso_stream::config::StreamConfig>::MAX_MESSAGE);
             let output = match inner.channels.poll(now(), deliver, &mut inner.frame) {
                 StreamPoll::SendFrame {
                     peer,
@@ -999,13 +1033,10 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     None
                 }
                 StreamPoll::Event(StreamEvent::Reset { peer, reason, .. }) => {
-                    let event = NodeEvent::ChannelReset { peer, reason };
-                    let mut guard = guard;
-                    while !guard.events.push(event) {
-                        drop(guard);
-                        self.shared.events_room.wait().await;
-                        guard = self.shared.inner.lock().await;
-                    }
+                    inner
+                        .events
+                        .push_or_hold(NodeEvent::ChannelReset { peer, reason });
+                    drop(guard);
                     self.shared.events_ready.signal(());
                     worked = true;
                     continue;
@@ -1059,12 +1090,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     if let Some(event) = from_core(event) {
                         #[cfg(feature = "stream")]
                         tell_channels(inner, &event);
-                        let mut guard = guard;
-                        while !guard.events.push(event) {
-                            drop(guard);
-                            self.shared.events_room.wait().await;
-                            guard = self.shared.inner.lock().await;
-                        }
+                        inner.events.push_or_hold(event);
+                        drop(guard);
                         self.shared.events_ready.signal(());
                     }
                 }
@@ -1109,9 +1136,13 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             .relay_link_closed(now());
     }
 
-    /// Gives the core the link's packets read so far, while their events fit.
+    /// Gives the core the link's packets read so far, while their events fit;
+    /// the rest waits in the read buffer until the application reads.
     async fn deframe(&mut self) {
         while self.link_pending.0 < self.link_pending.1 {
+            if !self.shared.inner.lock().await.events.readable(OUT_LEN) {
+                break;
+            }
             let (start, end) = self.link_pending;
             let (used, result) = self
                 .deframer
@@ -1136,31 +1167,24 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     if let Some(rx) = self.rx.get_mut(..len) {
                         rx.copy_from_slice(packet);
                     }
-                    loop {
-                        let mut guard = self.shared.inner.lock().await;
-                        if guard.events.has_room(len) {
-                            let inner = &mut *guard;
-                            let output = inner.endpoint.handle_relay_packet(
-                                self.rx.get_mut(..len).unwrap_or_default(),
-                                Link::Tcp,
-                                now(),
-                                &mut inner.policy,
-                                &mut inner.entropy,
-                                &mut inner.out,
-                            );
-                            Self::execute(
-                                self.shared,
-                                &mut self.link,
-                                &mut self.link_state,
-                                inner,
-                                output,
-                            )
-                            .await;
-                            break;
-                        }
-                        drop(guard);
-                        self.shared.events_room.wait().await;
-                    }
+                    let mut guard = self.shared.inner.lock().await;
+                    let inner = &mut *guard;
+                    let output = inner.endpoint.handle_relay_packet(
+                        self.rx.get_mut(..len).unwrap_or_default(),
+                        Link::Tcp,
+                        now(),
+                        &mut inner.policy,
+                        &mut inner.entropy,
+                        &mut inner.out,
+                    );
+                    Self::execute(
+                        self.shared,
+                        &mut self.link,
+                        &mut self.link_state,
+                        inner,
+                        output,
+                    )
+                    .await;
                 }
             }
         }

@@ -54,6 +54,17 @@ fn node(
     relay: &RelayHost,
     events: usize,
 ) -> (TestNode, TestEvents) {
+    node_with(net, key, ip_text, relay, events, false)
+}
+
+fn node_with(
+    net: &Net,
+    key: usize,
+    ip_text: &str,
+    relay: &RelayHost,
+    events: usize,
+    credit: bool,
+) -> (TestNode, TestEvents) {
     let ips = [ip(ip_text)];
     let datagrams: &'static MemDatagrams = leak(net.bind(&ips, 7500));
     let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
@@ -66,6 +77,7 @@ fn node(
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
+            credit,
         },
         datagrams,
         net.stream(ips[0]),
@@ -241,6 +253,79 @@ async fn a_slow_reader_holds_the_sender_back() {
         assert!(!sender.is_finished(), "the sender waits for the reader");
         assert_eq!(messages(&mut b_events, 20, 30).await, sent);
         sender.await.unwrap();
+    })
+    .await;
+}
+
+/// Scenario: on the embedded driver, a peer without credit waits alone. The
+/// application takes a firmware's pieces one at a time, granting one piece's
+/// cost after writing each slowly; another peer's alarm, with credit, is
+/// handed out at once, and no piece is lost.
+#[tokio::test(flavor = "current_thread")]
+async fn a_peer_without_credit_waits_alone() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    local(async {
+        let (net, relay) = world();
+        let (r, mut r_events) = node_with(&net, 1, "10.0.0.1", &relay, 8192, true);
+        let (a, _a_events) = node(&net, 2, "10.0.1.1", &relay, 8192);
+        let (c, _c_events) = node(&net, 3, "10.0.2.1", &relay, 8192);
+        let r_address = r.address().await;
+        let r_hint = SocketAddr::new(ip("10.0.0.1"), 7500);
+        a.set_hint(r_address.peer_id(), r_hint).await.unwrap();
+        c.set_hint(r_address.peer_id(), r_hint).await.unwrap();
+        let (a_id, c_id) = (a.address().await.peer_id(), c.address().await.peer_id());
+        let cost = 1500 + convesso_stream::ELEMENT_COST;
+        r.grant(a_id, cost).await.unwrap();
+        r.grant(c_id, 2 * (2048 + convesso_stream::ELEMENT_COST))
+            .await
+            .unwrap();
+
+        let pieces: Vec<_> = (0..8).map(|i| vec![i as u8; 1500]).collect();
+        let to_r = pieces.clone();
+        tokio::task::spawn_local(async move {
+            for piece in &to_r {
+                a.send_message(&r_address, piece).await.unwrap();
+            }
+        });
+        let alarm_sent: Rc<Cell<Option<Instant>>> = Rc::default();
+        let sent = alarm_sent.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            sent.set(Some(Instant::now()));
+            c.send_message(&r_address, b"alarm").await.unwrap();
+        });
+
+        let mut got = Vec::new();
+        let mut alarm_after = None;
+        let mut buf = [0u8; 2048];
+        timeout(Duration::from_secs(20), async {
+            while got.len() < pieces.len() || alarm_after.is_none() {
+                match r_events.next(&mut buf).await {
+                    NodeEvent::Message { peer, data } if peer == a_id => {
+                        got.push(data.to_vec());
+                        // Writing the piece to flash, slowly.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        r.grant(a_id, cost).await.unwrap();
+                    }
+                    NodeEvent::Message { peer, .. } if peer == c_id => {
+                        alarm_after = alarm_sent.get().map(|at| at.elapsed());
+                    }
+                    NodeEvent::ChannelReset { reason, .. } => panic!("a reset: {reason:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("every piece and the alarm");
+        assert_eq!(got, pieces, "no piece lost");
+        let alarm_after = alarm_after.unwrap();
+        assert!(
+            alarm_after < Duration::from_millis(700),
+            "the alarm waited {alarm_after:?}"
+        );
     })
     .await;
 }

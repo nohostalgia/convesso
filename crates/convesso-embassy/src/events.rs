@@ -7,10 +7,13 @@
 //! bytes     the datagrams' data, in the same order, in the integrator's buffer
 //! ```
 //!
-//! The driver reads from the network only while there is room for one more
-//! event of the largest size ([`EventQueue::has_room`]): what a slow reader
-//! costs is left on the network, where the protocol expects losses, never
-//! dropped here.
+//! The driver reads from the network only while there is room for the events
+//! of one more packet ([`EventQueue::readable`]): what a slow reader costs is
+//! left on the network, where the protocol expects losses, never dropped here.
+//! It never waits for room (`DESIGN.md §5`). An event its timers produce
+//! while the queue is full waits aside, in a fixed table of [`HELD`] entries,
+//! one per peer and kind, the latest replacing the earlier; reading an event
+//! moves what waits aside into the queue, in order.
 
 use core::net::SocketAddr;
 
@@ -22,6 +25,13 @@ use convesso_core::relay::Link;
 
 /// How many events can wait at once, datagrams included.
 pub const ENTRIES: usize = 16;
+
+/// How many events can wait aside while the queue is full: one per peer and
+/// kind for the four kinds timers produce (a close, a failed reopening, a
+/// change of path, a channel reset), for every peer the microcontroller
+/// tables name at once (4 sessions and 2 dials), and one for the relay's
+/// availability.
+pub const HELD: usize = (4 + 2) * 4 + 1;
 
 /// Something the application should know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +168,9 @@ pub(crate) struct EventQueue<'d> {
     bytes: &'d mut [u8],
     start: usize,
     used: usize,
+    /// Events waiting aside, oldest first.
+    held: [Option<NodeEvent<'static>>; HELD],
+    held_count: usize,
 }
 
 impl<'d> EventQueue<'d> {
@@ -169,12 +182,80 @@ impl<'d> EventQueue<'d> {
             bytes,
             start: 0,
             used: 0,
+            held: [None; HELD],
+            held_count: 0,
         }
     }
 
     /// Whether an event with up to `data` bytes of data fits.
     pub(crate) fn has_room(&self, data: usize) -> bool {
         self.count < ENTRIES && self.bytes.len() - self.used >= data
+    }
+
+    /// Whether to read one more packet: nothing waits aside, and the queue
+    /// has room for its events, one with up to `data` bytes and one more.
+    pub(crate) fn readable(&self, data: usize) -> bool {
+        self.held_count == 0 && self.count + 2 <= ENTRIES && self.bytes.len() - self.used >= data
+    }
+
+    /// Whether a message of up to `data` bytes may be taken from the stream
+    /// layer: after what waits aside, and with room.
+    #[cfg(feature = "stream")]
+    pub(crate) fn deliverable(&self, data: usize) -> bool {
+        self.held_count == 0 && self.has_room(data)
+    }
+
+    /// Adds an event, or holds it aside when the queue is full or something
+    /// already waits there. An event with data is never held: the driver
+    /// reads only with room for it ([`Self::readable`]).
+    pub(crate) fn push_or_hold(&mut self, event: NodeEvent<'_>) {
+        let data = matches!(event, NodeEvent::Datagram { .. });
+        #[cfg(feature = "stream")]
+        let data = data || matches!(event, NodeEvent::Message { .. });
+        if data {
+            let _ = self.push(event);
+        } else if self.held_count > 0 || !self.push(event) {
+            self.hold(owned(event));
+        }
+    }
+
+    fn hold(&mut self, event: NodeEvent<'static>) {
+        let wanted = key(&event);
+        let same = (0..self.held_count)
+            .find(|&i| self.held.get(i).copied().flatten().map(|e| key(&e)) == Some(wanted));
+        // The table holds every peer and kind the tables can name; were it
+        // full all the same, the oldest change of state goes before a close.
+        let evicted = same.or_else(|| {
+            (self.held_count >= HELD).then(|| {
+                (0..self.held_count)
+                    .find(|&i| {
+                        !matches!(
+                            self.held.get(i).copied().flatten(),
+                            Some(NodeEvent::Closed { .. })
+                        )
+                    })
+                    .unwrap_or(0)
+            })
+        });
+        if let Some(i) = evicted {
+            self.held.copy_within(i + 1..self.held_count, i);
+            self.held_count -= 1;
+        }
+        if let Some(slot) = self.held.get_mut(self.held_count) {
+            *slot = Some(event);
+            self.held_count += 1;
+        }
+    }
+
+    /// Moves what waits aside into the queue, in order, as far as it fits.
+    fn flush(&mut self) {
+        while self.held_count > 0 && self.count < ENTRIES {
+            if let Some(event) = self.held.first().copied().flatten() {
+                self.push_entry(Entry::Other(event));
+            }
+            self.held.copy_within(1..self.held_count, 0);
+            self.held_count -= 1;
+        }
     }
 
     /// Whether nothing waits.
@@ -263,6 +344,7 @@ impl<'d> EventQueue<'d> {
         let entry = self.entries.get_mut(self.first).and_then(Option::take)?;
         self.first = (self.first + 1) % ENTRIES;
         self.count -= 1;
+        self.flush();
         Some(match entry {
             Entry::Other(event) => event,
             Entry::Datagram { peer, relayed, len } => {
@@ -310,6 +392,25 @@ impl<'d> EventQueue<'d> {
         self.start = (self.start + len) % capacity.max(1);
         self.used -= len;
         kept
+    }
+}
+
+/// What an event waiting aside is coalesced by: its peer, if any, and its
+/// kind.
+fn key(event: &NodeEvent<'static>) -> (Option<PeerId>, u8) {
+    match *event {
+        NodeEvent::Connected { peer } => (Some(peer), 0),
+        NodeEvent::Closed { peer, .. } => (Some(peer), 1),
+        NodeEvent::ReopenFailed { peer, .. } => (Some(peer), 2),
+        NodeEvent::PeerNotAtRelay { peer } => (Some(peer), 3),
+        NodeEvent::ObservedAddress { link, .. } => (None, 4 + u8::from(link == Link::Tcp)),
+        NodeEvent::RelayUnavailable { .. } => (None, 6),
+        NodeEvent::PathChanged { peer, .. } => (Some(peer), 7),
+        NodeEvent::Datagram { peer, .. } => (Some(peer), 8),
+        #[cfg(feature = "stream")]
+        NodeEvent::Message { peer, .. } => (Some(peer), 9),
+        #[cfg(feature = "stream")]
+        NodeEvent::ChannelReset { peer, .. } => (Some(peer), 10),
     }
 }
 
@@ -466,5 +567,108 @@ mod tests {
         }
         assert!(!queue.push(NodeEvent::PeerNotAtRelay { peer: peer(1) }));
         assert!(!queue.has_room(0));
+    }
+
+    fn full(queue: &mut EventQueue<'_>) {
+        for _ in 0..ENTRIES {
+            assert!(queue.push(NodeEvent::PeerNotAtRelay { peer: peer(1) }));
+        }
+    }
+
+    /// While the queue is full, events wait aside, one per peer and kind, the
+    /// latest replacing the earlier and taking its place at the back; reading
+    /// moves them in, in that order.
+    #[test]
+    fn events_wait_aside_coalesced_and_come_after_the_queue() {
+        let mut bytes = [0u8; 4];
+        let mut queue = EventQueue::new(&mut bytes);
+        full(&mut queue);
+        let relayed = NodeEvent::PathChanged {
+            peer: peer(2),
+            path: PathKind::Relayed,
+        };
+        let direct = NodeEvent::PathChanged {
+            peer: peer(2),
+            path: PathKind::Direct("192.0.2.1:7500".parse().unwrap()),
+        };
+        let closed = NodeEvent::Closed {
+            peer: peer(3),
+            code: 4,
+            by_peer: true,
+        };
+        queue.push_or_hold(direct);
+        queue.push_or_hold(closed);
+        queue.push_or_hold(relayed);
+        assert!(
+            !queue.readable(0),
+            "nothing is read while events wait aside"
+        );
+        let mut buf = [0u8; 4];
+        for _ in 0..ENTRIES {
+            assert_eq!(
+                queue.pop(&mut buf),
+                Some(NodeEvent::PeerNotAtRelay { peer: peer(1) })
+            );
+        }
+        assert_eq!(queue.pop(&mut buf), Some(closed));
+        assert_eq!(queue.pop(&mut buf), Some(relayed), "the latest path");
+        assert_eq!(queue.pop(&mut buf), None);
+        assert!(queue.readable(0));
+    }
+
+    /// An event that arrives while others wait aside goes behind them, even
+    /// when the queue has room again.
+    #[test]
+    fn a_new_event_never_overtakes_one_waiting_aside() {
+        let mut bytes = [0u8; 4];
+        let mut queue = EventQueue::new(&mut bytes);
+        full(&mut queue);
+        let first = NodeEvent::Connected { peer: peer(2) };
+        queue.push_or_hold(first);
+        let mut buf = [0u8; 4];
+        // One place frees, and the waiting event takes it.
+        let _ = queue.pop(&mut buf);
+        let second = NodeEvent::Connected { peer: peer(3) };
+        queue.push_or_hold(second);
+        let mut out = std::vec::Vec::new();
+        while let Some(event) = queue.pop(&mut buf) {
+            out.push(owned(event));
+        }
+        assert_eq!(&out[out.len() - 2..], &[first, second]);
+    }
+
+    /// The table holds every peer and kind the microcontroller tables name;
+    /// beyond, the oldest change of state goes before a close.
+    #[test]
+    fn a_full_table_keeps_its_closes() {
+        let mut bytes = [0u8; 4];
+        let mut queue = EventQueue::new(&mut bytes);
+        full(&mut queue);
+        let closed = NodeEvent::Closed {
+            peer: peer(1),
+            code: 4,
+            by_peer: false,
+        };
+        queue.push_or_hold(closed);
+        for i in 0..HELD {
+            queue.push_or_hold(NodeEvent::PathChanged {
+                peer: peer(i % 4 + 1),
+                path: PathKind::Direct(std::net::SocketAddr::from((
+                    [192, 0, 2, 1],
+                    7000 + i as u16,
+                ))),
+            });
+            queue.push_or_hold(NodeEvent::ReopenFailed {
+                peer: peer(i % 4 + 1),
+                error: DialError::NoResponse,
+            });
+        }
+        let mut buf = [0u8; 4];
+        let mut out = std::vec::Vec::new();
+        while let Some(event) = queue.pop(&mut buf) {
+            out.push(owned(event));
+        }
+        assert!(out.contains(&closed), "the close is kept");
+        assert!(out.len() <= ENTRIES + HELD);
     }
 }
