@@ -152,6 +152,79 @@ async fn a_slow_reader_holds_the_sender_back() {
     assert_eq!(got.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), sent);
 }
 
+/// The session closed by this side, by `close` or, with `revoke`, by
+/// `close_peer`: the channel is reset on both sides, once, and the next
+/// message opens a new channel and arrives.
+async fn a_message_after_closing_arrives(seeds: (u8, u8), revoke: bool) {
+    let (a, mut a_events) = node(seeds.0, None, 64).await;
+    let (b, mut b_events) = node(seeds.1, None, 64).await;
+    let b_peer = b.address().peer_id();
+    a.set_hint(b_peer, b.local_addr()).await.unwrap();
+    b.set_hint(a.address().peer_id(), a.local_addr())
+        .await
+        .unwrap();
+    a.send_message(b.address(), b"before".to_vec())
+        .await
+        .unwrap();
+    let _ = messages(&mut b_events, 1, Duration::from_secs(5)).await;
+
+    if revoke {
+        a.close_peer(b_peer, 7).await.unwrap();
+    } else {
+        a.close(b_peer, 7).await.unwrap();
+    }
+    let closed = convesso_stream::Reason::SessionClosed { code: 7 };
+    let reset = timeout(Duration::from_secs(5), async {
+        loop {
+            match a_events.next().await {
+                Some(NodeEvent::ChannelReset { reason, .. }) => return reason,
+                Some(_) => {}
+                None => panic!("stopped"),
+            }
+        }
+    })
+    .await
+    .expect("a reset on the closing side at once");
+    assert_eq!(reset, closed);
+
+    a.send_message(b.address(), b"after".to_vec())
+        .await
+        .unwrap();
+    let got = timeout(Duration::from_secs(5), async {
+        loop {
+            match b_events.next().await {
+                Some(NodeEvent::Message { data, .. }) => return data,
+                Some(NodeEvent::ChannelReset { reason, .. }) => assert_eq!(reason, closed),
+                Some(_) => {}
+                None => panic!("stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the message after the close");
+    assert_eq!(got, b"after");
+    // No second reset on the closing side.
+    let more = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(NodeEvent::ChannelReset { reason, .. }) = a_events.next().await {
+                return reason;
+            }
+        }
+    })
+    .await;
+    assert!(more.is_err(), "a second reset: {more:?}");
+}
+
+#[tokio::test]
+async fn a_message_after_close_arrives() {
+    a_message_after_closing_arrives((12, 13), false).await;
+}
+
+#[tokio::test]
+async fn a_message_after_close_peer_arrives() {
+    a_message_after_closing_arrives((14, 15), true).await;
+}
+
 /// Scenario: a peer switched off in mid-transfer: the sender's channel is
 /// reset within 30 s.
 #[tokio::test]

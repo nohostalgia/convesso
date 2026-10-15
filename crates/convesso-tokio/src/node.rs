@@ -1162,8 +1162,14 @@ impl<E: SystemEntropy> Task<E> {
                         .endpoint
                         .close(peer, &self.context, code, now, &mut self.out));
                 self.execute(output, None).await;
+                #[cfg(feature = "stream")]
+                self.close_channel(peer, code);
             }
-            Command::ClosePeer(peer, code) => self.endpoint.close_peer(peer, code),
+            Command::ClosePeer(peer, code) => {
+                self.endpoint.close_peer(peer, code);
+                #[cfg(feature = "stream")]
+                self.close_channel(peer, code);
+            }
             Command::NetworkChanged => {
                 self.report_interfaces();
                 self.endpoint.network_changed(now);
@@ -1206,6 +1212,16 @@ impl<E: SystemEntropy> Task<E> {
                     self.offer(parked, now);
                 }
             }
+        }
+    }
+
+    /// This side closed the session with `peer`. The core raises no event for
+    /// it: the channel is reset here, as the peer's is on the close
+    /// (DESIGN.md §8).
+    #[cfg(feature = "stream")]
+    fn close_channel(&mut self, peer: PeerId, code: u16) {
+        if let Ok(context) = Context::new(&self.context) {
+            self.channels.session_closed(peer, context, code);
         }
     }
 

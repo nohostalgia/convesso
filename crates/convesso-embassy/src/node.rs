@@ -506,6 +506,10 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
                 Plan::KeepAlive | Plan::Nothing => {}
             }
         }
+        // The core raises no event for a close of this side's: the channel is
+        // reset here, as the peer's is on the close (DESIGN.md §8).
+        #[cfg(feature = "stream")]
+        inner.channels.session_closed(peer, context, code);
         drop(guard);
         drop(link_out);
         self.shared.wake.signal(());
@@ -513,12 +517,13 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
 
     /// Revokes `peer`: closes every session with it.
     pub async fn close_peer(&self, peer: PeerId, code: u16) {
-        self.shared
-            .inner
-            .lock()
-            .await
-            .endpoint
-            .close_peer(peer, code);
+        let mut guard = self.shared.inner.lock().await;
+        let inner = &mut *guard;
+        inner.endpoint.close_peer(peer, code);
+        // As in `close`.
+        #[cfg(feature = "stream")]
+        inner.channels.session_closed(peer, inner.context, code);
+        drop(guard);
         self.shared.wake.signal(());
     }
 
