@@ -26,6 +26,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read the code, nothing more; the job that lists a pull request's files also
+# reads the pull request.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,6 +39,9 @@ jobs:
   # schedule.
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       full: ${{ steps.mode.outputs.full }}
       deps: ${{ steps.filter.outputs.deps == 'true' }}
