@@ -1,6 +1,6 @@
 #!/bin/sh
-# Runs the CI of .github/workflows/ci.yml locally, in a Linux container, until
-# the repository has a remote where GitHub can run it:
+# Runs the CI of .github/workflows/ci.yml locally, in a Linux container: to
+# reproduce a failure of GitHub's run, or to check before a pull request:
 #
 #   sh scripts/ci-local.sh
 #

@@ -40,7 +40,7 @@ mod relayed;
 pub use direct::ExcludeError;
 pub use relayed::{
     ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintTooLong, KeepAliveTooShort, LINK_ANSWER_WITHIN,
-    MIN_KEEPALIVE, RelayError, RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
+    LinkFailure, MIN_KEEPALIVE, RelayError, RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
 };
 use relayed::{Answer, RelayClient};
 
@@ -192,12 +192,16 @@ pub enum Event<'a> {
         /// The new path, and with a direct one its family.
         path: PathKind,
     },
-    /// The session with the pinned relay could not be opened, or ended; what
-    /// it had queued is discarded.
+    /// The session with the pinned relay could not be opened, or ended, or
+    /// the link to it failed; what the relay session had queued is
+    /// discarded.
     RelayUnavailable {
         /// Why.
         error: RelayError,
     },
+    /// The endpoint is registered with its pinned relay on a link: peers can
+    /// reach it through the relay. Raised again after each new registration.
+    RelayAvailable,
     /// A dial to reopen a session failed; the datagrams queued are discarded.
     ReopenFailed {
         /// The peer.
@@ -614,6 +618,13 @@ impl<C: Config> Endpoint<C> {
 
     fn dial_failed(&mut self, key: Key, error: DialError) -> Event<'static> {
         self.remove_dial(key);
+        // The relay session refused or unanswered on the link: that attempt is
+        // over, and the next one waits for the backoff.
+        if let Some(relay) = self.relay.as_mut()
+            && relay.is(&key)
+        {
+            relay.session_failed();
+        }
         if let Some(session) = self.sessions.get_mut(&key) {
             session.queue.clear();
         }

@@ -146,6 +146,13 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
   separate address probes are needed.
 - **The relay does not wait on a slow recipient.** Each client has limits; a packet beyond them,
   or for a recipient whose queue is full, is dropped.
+- **A client backs off until it is registered.** A link attempt that ends before the client is
+  registered on it waits for a backoff of 1 to 60 seconds, with jitter. That covers a link not
+  opened, an opening that hangs, a link that dies, and a relay session the relay refuses or does
+  not answer. A relay shedding load is thus asked at most once a minute, never hammered. Only a
+  link the client was registered on is replaced at once.
+- **The application knows whether its relay is available.** It is told when the client is
+  registered, and each time an attempt ends or a registered link is lost, with the reason.
 
 ## 7. Paths
 
@@ -193,3 +200,7 @@ a device that does not need it does not carry it.
   every change, and compared with `footprint-budget.toml`. A change that grows either raises the
   budget in the same diff, where a reviewer can see it.
 - **A check that the core needs no allocator** runs on every change.
+- **Every change reaches `main` through a pull request,** checked as merged with `main`. Each
+  check runs when the files it covers change: the host checks always, the embedded ones for what
+  the firmware links, the fuzz targets of the crates that changed. Everything runs every week and
+  before a release.
