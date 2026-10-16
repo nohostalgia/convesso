@@ -72,6 +72,7 @@ async fn relay_with<P: Policy + Send + 'static>(policy: P) -> RelayLocation {
     RelayLocation {
         address,
         host: format!("127.0.0.1:{port}"),
+        tls: false,
     }
 }
 

@@ -109,7 +109,7 @@ fn no_path_is_an_error() {
         Err(SendError::NoPath)
     );
     // A hint is a path.
-    endpoint.set_hint(peer.peer_id(), &[2], now).unwrap();
+    endpoint.set_hints(peer.peer_id(), &[&[2]], now).unwrap();
     assert!(
         endpoint
             .connect(
@@ -132,11 +132,11 @@ fn hints_are_bounded() {
     let t = convesso_core::time::Instant::from_millis;
     for i in 1..=4u8 {
         let peer = identity(usize::from(i)).peer_id();
-        endpoint.set_hint(peer, &[i], t(u64::from(i))).unwrap();
+        endpoint.set_hints(peer, &[&[i]], t(u64::from(i))).unwrap();
     }
     // A fifth hint: the one set at t(1), for identity 1, goes.
     endpoint
-        .set_hint(identity(0).peer_id(), &[0], t(5))
+        .set_hints(identity(0).peer_id(), &[&[0]], t(5))
         .unwrap();
     let mut out = [0u8; 2048];
     let one = *identity(1).address();
@@ -166,7 +166,7 @@ fn hints_are_bounded() {
     );
     assert!(
         endpoint
-            .set_hint(identity(1).peer_id(), &[0; 33], t(9))
+            .set_hints(identity(1).peer_id(), &[&[0; 33]], t(9))
             .is_err()
     );
 }

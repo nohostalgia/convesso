@@ -6,6 +6,8 @@
 # explicitly, so a minimum survives even if an advisory were withdrawn.
 #
 # Licences are not checked yet: the project's own licence is still to be chosen.
+# When they are, the feature `tls` of convesso-tokio needs ISC beside MIT and
+# Apache-2.0: ring is Apache-2.0 AND ISC, rustls-webpki and untrusted are ISC.
 
 [graph]
 targets = [

@@ -36,7 +36,7 @@ use std::time::Instant as Clock;
 
 use convesso_core::dos::Source;
 use convesso_core::endpoint::{
-    Endpoint, Event, ExcludeError, HintTooLong, Output, Poll, RelayError, RelayPath, SendError,
+    Endpoint, Event, ExcludeError, HintError, Output, Poll, RelayError, RelayPath, SendError,
     Target, To,
 };
 use convesso_core::handshake::{self, ChannelBinding, Context as Name};
@@ -47,7 +47,7 @@ use convesso_core::relay::Link;
 use convesso_core::relay::framing::{self, Deframed, Deframer, KEEPALIVE, PREAMBLE};
 use convesso_core::storage::Server;
 use convesso_core::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -100,6 +100,18 @@ pub struct RelayLocation {
     pub address: Address,
     /// `host:port`, for UDP and TCP alike.
     pub host: String,
+    /// Whether the TCP link is wrapped in TLS 1.3, which authenticates
+    /// nothing: the certificate is not checked, and the relay's key alone is
+    /// trusted (`PROTOCOL.md §6`). The host is named in the handshake when it
+    /// is a name. Only with the feature `tls`; refused without it.
+    pub tls: bool,
+}
+
+impl RelayLocation {
+    /// Whether this build can open the link this location asks for.
+    fn supported(&self) -> bool {
+        !self.tls || cfg!(feature = "tls")
+    }
 }
 
 /// The operating system's handle of a socket: a file descriptor on Unix and
@@ -228,6 +240,8 @@ pub enum StartError {
     Hook(std::io::Error),
     /// The relay's host could not be resolved.
     Resolve(std::io::Error),
+    /// The relay asks for TLS, and this build has no feature `tls`.
+    NoTls,
     /// The core refused the configuration.
     Core(ResponderError),
 }
@@ -239,6 +253,9 @@ impl std::fmt::Display for StartError {
             Self::Bind(error) => write!(f, "binding the UDP socket: {error}"),
             Self::Hook(error) => write!(f, "the socket hook: {error}"),
             Self::Resolve(error) => write!(f, "resolving the relay: {error}"),
+            Self::NoTls => {
+                f.write_str("the relay asks for TLS, and this build has no feature `tls`")
+            }
             Self::Core(error) => write!(f, "the core: {error}"),
         }
     }
@@ -251,8 +268,14 @@ impl std::error::Error for StartError {}
 pub enum NodeError {
     /// The core refused it, with its named error.
     Send(SendError),
-    /// The hint is not a usable address.
-    Hint(HintTooLong),
+    /// The hints were refused, with the core's named error.
+    Hint(HintError),
+    /// The relay could not be pinned, with the core's named error.
+    Relay(ResponderError),
+    /// The new relay's host could not be resolved.
+    Resolve(std::io::ErrorKind),
+    /// The new relay asks for TLS, and this build has no feature `tls`.
+    NoTls,
     /// The prefix could not be excluded, with the core's named error.
     Exclude(ExcludeError),
     /// The context could not be opened, or its access changed, with the
@@ -286,6 +309,11 @@ impl std::fmt::Display for NodeError {
         match self {
             Self::Send(error) => error.fmt(f),
             Self::Hint(error) => error.fmt(f),
+            Self::Relay(error) => write!(f, "the relay: {error}"),
+            Self::Resolve(kind) => write!(f, "resolving the relay's host: {kind}"),
+            Self::NoTls => {
+                f.write_str("the relay asks for TLS, and this build has no feature `tls`")
+            }
             Self::Exclude(error) => error.fmt(f),
             Self::Context(error) => write!(f, "the context: {error}"),
             Self::ContextClosed => f.write_str("the context was closed"),
@@ -457,7 +485,12 @@ enum Command {
         Vec<u8>,
         oneshot::Sender<Result<(), NodeError>>,
     ),
-    Hint(PeerId, SocketAddr, oneshot::Sender<Result<(), NodeError>>),
+    Hint(
+        PeerId,
+        Vec<SocketAddr>,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
+    Relay(Option<Resolved>, oneshot::Sender<Result<(), NodeError>>),
     Reachable(bool),
     Close(Name, PeerId, u16),
     ClosePeer(PeerId, u16),
@@ -476,6 +509,10 @@ enum Command {
     #[cfg(feature = "stream")]
     SendMessage(Parked),
 }
+
+/// A relay and the UDP addresses its host resolved to: the one the node uses,
+/// and one in the other family.
+type Resolved = (RelayLocation, SocketAddr, Option<SocketAddr>);
 
 /// Wakes the task when the application reads an event stream while something
 /// waits for room in one.
@@ -656,13 +693,55 @@ impl Node {
         answer(&self.commands, make).await
     }
 
-    /// Gives the core a direct address for `peer`, in every context.
+    /// Gives the core a direct address for `peer`, in every context: as
+    /// [`Self::set_hints`] with one address.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Stopped`]; an address is always short enough.
+    /// As [`Self::set_hints`].
     pub async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
+        self.set_hints(peer, vec![at]).await
+    }
+
+    /// Gives the core up to [`MAX_HINTS`] direct addresses for `peer`, in
+    /// every context, replacing those it had; none forgets them. A dial's
+    /// first attempt goes to every one at once (`PROTOCOL.md §6`).
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Hint`] with the core's error for more than [`MAX_HINTS`]
+    /// or more than the hint table holds, which leaves the old hints; or
+    /// [`NodeError::Stopped`].
+    ///
+    /// [`MAX_HINTS`]: convesso_core::endpoint::MAX_HINTS
+    pub async fn set_hints(&self, peer: PeerId, at: Vec<SocketAddr>) -> Result<(), NodeError> {
         self.answer(|reply| Command::Hint(peer, at, reply)).await
+    }
+
+    /// Replaces the pinned relay with `relay`, or, with `None`, removes it,
+    /// without restarting the node (`PROTOCOL.md §6`). The new host is
+    /// resolved here, in the caller's task. Sessions with peers and contexts
+    /// stay; the old relay's link is closed, and a reachable node registers on
+    /// the new relay at once. The relay already pinned changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NoTls`] for TLS asked for without the feature,
+    /// [`NodeError::Resolve`] for a host that does not resolve,
+    /// [`NodeError::Relay`] with the core's error, or [`NodeError::Stopped`];
+    /// the old relay then stays.
+    pub async fn set_relay(&self, relay: Option<RelayLocation>) -> Result<(), NodeError> {
+        let resolved = match relay {
+            Some(relay) if !relay.supported() => return Err(NodeError::NoTls),
+            Some(relay) => {
+                let (at, other) = resolve(&relay.host, self.dual_stack)
+                    .await
+                    .map_err(|error| NodeError::Resolve(error.kind()))?;
+                Some((relay, at, other))
+            }
+            None => None,
+        };
+        self.answer(|reply| Command::Relay(resolved, reply)).await
     }
 
     /// Asks to stay reachable through the relay, keeping a link to it, or not.
@@ -992,6 +1071,7 @@ async fn build<E: SystemEntropy, C: Profile>(
         })?;
     let local = udp.local_addr().map_err(StartError::Bind)?;
     let relay_udp = match &config.relay {
+        Some(relay) if !relay.supported() => return Err(StartError::NoTls),
         Some(relay) => {
             endpoint
                 .pin_relay(relay.address, Instant::from_millis(0))
@@ -1292,13 +1372,20 @@ impl Open {
 }
 
 struct LinkIo {
-    stream: TcpStream,
+    stream: Box<dyn LinkStream>,
     deframer: Box<Deframer>,
 }
 
-type Connecting = Pin<
-    Box<dyn Future<Output = std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)>> + Send>,
->;
+/// A relay link's stream: TCP, or TLS over TCP.
+trait LinkStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> LinkStream for S {}
+
+/// A link connected: its stream, the relay's address it reached, and the
+/// relay's address in the other family.
+type Linked = (Box<dyn LinkStream>, SocketAddr, Option<SocketAddr>);
+
+type Connecting = Pin<Box<dyn Future<Output = std::io::Result<Linked>> + Send>>;
 
 /// An output of the core, owning nothing, so that the task is free again.
 enum Owned {
@@ -1483,7 +1570,7 @@ struct Parked {
 enum Wake {
     Udp(std::io::Result<(usize, SocketAddr)>),
     Link(std::io::Result<usize>),
-    Connected(std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)>),
+    Connected(std::io::Result<Linked>),
     Command(Option<Command>),
     /// A context's handle was dropped, or closed.
     CloseContext(Option<(Name, u16)>),
@@ -1725,15 +1812,11 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         }
     }
 
-    async fn connected(
-        &mut self,
-        result: std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)>,
-    ) {
+    async fn connected(&mut self, result: std::io::Result<Linked>) {
         self.connecting = None;
         let now = self.now();
         let opened = match result {
             Ok((mut stream, at, other)) => {
-                let _ = stream.set_nodelay(true);
                 if stream.write_all(&PREAMBLE).await.is_ok() {
                     self.relay_udp = Some(canonical(at));
                     self.relay_other = other;
@@ -1806,12 +1889,19 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 self.sent(result, reply).await;
             }
             Command::Hint(peer, at, reply) => {
-                let (bytes, len) = address::encode(at);
+                let encoded: Vec<_> = at.into_iter().map(address::encode).collect();
+                let hints: Vec<&[u8]> = encoded
+                    .iter()
+                    .map(|(bytes, len)| bytes.get(..*len).unwrap_or_default())
+                    .collect();
                 let result = self
                     .endpoint
-                    .set_hint(peer, bytes.get(..len).unwrap_or_default(), now)
+                    .set_hints(peer, &hints, now)
                     .map_err(NodeError::Hint);
                 let _ = reply.send(result);
+            }
+            Command::Relay(relay, reply) => {
+                let _ = reply.send(self.set_relay(relay, now));
             }
             Command::Reachable(on) => self.endpoint.set_reachable(on, now),
             Command::Close(context, peer, code) => {
@@ -2453,6 +2543,39 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         }
     }
 
+    /// Pins `relay`, or none, in the core and here. Moving to another relay
+    /// drops the old one's link or connection at once, so that nothing of it
+    /// is taken for the new relay's; the core's close that follows finds
+    /// nothing.
+    fn set_relay(&mut self, relay: Option<Resolved>, now: Instant) -> Result<(), NodeError> {
+        let address = relay.as_ref().map(|(location, ..)| location.address);
+        let moved = self.relay.as_ref().map(|location| location.address) != address;
+        self.endpoint
+            .set_relay(address, now)
+            .map_err(NodeError::Relay)?;
+        if moved {
+            self.connecting = None;
+            self.link = None;
+        }
+        match relay {
+            Some((location, at, other)) => {
+                if moved {
+                    self.relay_udp = Some(at);
+                    self.relay_other = other;
+                    self.endpoint
+                        .set_relay_families(at.is_ipv6(), other.is_some());
+                }
+                self.relay = Some(location);
+            }
+            None => {
+                self.relay = None;
+                self.relay_udp = None;
+                self.relay_other = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Reports the interfaces' addresses to the core.
     fn report_interfaces(&mut self) {
         if let Ok(local) = self.udp.local_addr() {
@@ -2476,7 +2599,8 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             };
             hand(hook.as_ref(), handle_of(&socket))?;
             let stream = socket.connect(at).await?;
-            Ok((stream, at, other))
+            let _ = stream.set_nodelay(true);
+            Ok((wrap(stream, &relay).await?, at, other))
         }));
     }
 
@@ -2647,9 +2771,25 @@ async fn read_link(link: &mut Option<LinkIo>, buf: &mut [u8]) -> std::io::Result
     }
 }
 
-async fn poll_connecting(
-    connecting: &mut Option<Connecting>,
-) -> std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)> {
+/// The link's stream for `relay`: the connection itself, or, when the relay
+/// asks for it, TLS over it, with any certificate accepted.
+#[allow(
+    clippy::unused_async,
+    reason = "awaits the TLS handshake with the feature"
+)]
+async fn wrap(stream: TcpStream, relay: &RelayLocation) -> std::io::Result<Box<dyn LinkStream>> {
+    #[cfg(feature = "tls")]
+    if relay.tls {
+        let wrapped = crate::tls::connector()
+            .connect(crate::tls::server_name(&relay.host), stream)
+            .await?;
+        return Ok(Box::new(wrapped));
+    }
+    let _ = relay;
+    Ok(Box::new(stream))
+}
+
+async fn poll_connecting(connecting: &mut Option<Connecting>) -> std::io::Result<Linked> {
     match connecting {
         Some(future) => future.await,
         None => std::future::pending().await,

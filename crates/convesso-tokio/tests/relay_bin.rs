@@ -66,6 +66,7 @@ async fn relay_from(extra: &str, name: &str) -> (RelayLocation, std::path::PathB
             let location = RelayLocation {
                 address: started.address,
                 host: format!("127.0.0.1:{port}"),
+                tls: false,
             };
             tokio::spawn(started.serve());
             return (location, identity);
@@ -265,4 +266,19 @@ async fn an_allowlist_refuses_everyone_else() {
         "the member is served"
     );
     std::fs::remove_file(&identity).unwrap();
+}
+
+/// Without the feature `tls`, a `[tls]` table is refused at start, naming the
+/// feature.
+#[cfg(not(feature = "tls"))]
+#[tokio::test]
+async fn tls_without_the_feature_is_refused() {
+    let identity = scratch("no-tls");
+    let text = format!(
+        "udp = \"127.0.0.1:0\"\ntcp = \"127.0.0.1:0\"\nidentity = \"{}\"\n\n[tls]\ncertificate = \"relay.crt\"\nkey = \"relay.pem\"\n",
+        toml_path(&identity)
+    );
+    let error = start(&parse(&text).unwrap()).await.err().expect("refused");
+    assert!(error.to_string().contains("feature `tls`"), "{error}");
+    assert!(!identity.exists(), "nothing created");
 }

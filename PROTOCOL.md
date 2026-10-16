@@ -255,6 +255,16 @@ followed by its bytes. A length of 0 is the keep-alive. A wrong preamble, or a l
 closes the link. The preamble's first byte is never `0x16`, the first byte of a TLS record, so a
 relay can serve plain and TLS-wrapped links on one port.
 
+**A TLS-wrapped link** (optional, for networks that let out only TLS) begins with the client's TLS
+1.3 handshake (RFC 8446); the preamble and the packets then travel as TLS application data, exactly
+as on a plain link. A relay tells the two apart by the first byte: `0x63` is a preamble, `0x16` a
+TLS handshake, and anything else, or a TLS handshake that fails, closes the link with nothing sent.
+**TLS authenticates nothing.** The client accepts any certificate, self-signed, for another name,
+or presented by a proxy that inspects TLS; the relay is authenticated by its pinned key alone, in
+the relay session. The client names the relay's host in the handshake (SNI) when it is a name, and
+none when it is an IP address. A handshake that fails is a link that did not open, with its backoff.
+Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
+
 **Rules:**
 - **The relay names the sender itself.** A deliver carries the peer id that the sender's session
   authenticated, and the packet unchanged. The relay does not read or answer a carried packet.
@@ -278,14 +288,21 @@ relay can serve plain and TLS-wrapped links on one port.
   for a minute; the relay answers each. An answer missing for 20 seconds means the link is dead.
   A failed link is retried after 1 second, doubling up to 60, each wait lengthened at random by up
   to half.
+- **One relay at a time.** A client may replace its relay, or remove it, while it runs. Everything
+  of the old relay goes: its session, its link (closed without an unavailability event), and the
+  public candidates it reported; the relay context is served to the new relay alone. Sessions with
+  peers are untouched: one last heard through the relay goes on through the new one. Peers on
+  different relays reach each other only directly; the new relay answers "not connected" for a
+  peer still on the old one.
 
 **Which path a packet takes** is decided by the client's core, in this order:
 1. the session's direct path, when it is proven and fresh (§7);
 2. the relay, with one probe on the direct path, when that path is proven but not fresh;
 3. where the peer's newest packet came from, directly or through the relay: a packet that
    arrives after a newer one, late or reordered, does not move the session;
-4. with nothing heard yet: a dial's first attempt goes to the address hint the application gave,
-   if any; everything else goes through the relay;
+4. with nothing heard yet: a dial's first attempt goes at once to every address hint the
+   application gave (up to 8 per peer), and its later attempts to the relay; with no relay, every
+   attempt goes to every hint; everything else goes through the relay;
 5. with neither a hint nor a relay, the send fails with a "no path" error.
 
 An answer goes back the way the packet came.

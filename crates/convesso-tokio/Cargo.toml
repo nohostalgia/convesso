@@ -13,6 +13,10 @@ relay-bin = ["dep:serde", "dep:toml"]
 # Reliable messages (convesso-stream), beside the datagrams: off by default, the
 # application's choice.
 stream = ["dep:convesso-stream"]
+# TLS 1.3 around the relay link, the node's and the relay server's, as
+# camouflage on networks that let out only TLS: rustls, with ring. It decides
+# no trust (PROTOCOL.md §6). Off by default.
+tls = ["dep:rustls", "dep:tokio-rustls"]
 
 [dependencies]
 getrandom = "0.4.3"
@@ -20,13 +24,17 @@ if-addrs = "0.15.0"
 convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc", "ed25519-seed"] }
 convesso-relay = { path = "../convesso-relay", version = "0.0.0" }
 convesso-stream = { path = "../convesso-stream", version = "0.0.0", features = ["alloc"], optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"], optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 socket2 = "0.6.5"
 tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
 toml = { version = "1.1.8", optional = true }
 
 [dev-dependencies]
 # The provision example: the scalar of a key file's seed, and the record's layout.
+# The TLS tests: an Ed25519 certificate made at each run, so that no key is
+# committed and nothing of TLS is built without the feature.
 ed25519-dalek.workspace = true
 convesso-embassy = { path = "../convesso-embassy", version = "0.0.0" }
 tokio = { version = "1.53.2", features = ["io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }

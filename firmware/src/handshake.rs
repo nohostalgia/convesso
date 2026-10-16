@@ -205,7 +205,7 @@ pub fn endpoints() -> bool {
     let a_source = Source::Direct(black_box(&[10, 0, 0, 1, 0, 1]));
     let b_source = Source::Direct(black_box(&[10, 0, 0, 2, 0, 2]));
     // No relay: each is given where the other is.
-    if a.set_hint(b_address.peer_id(), &[10, 0, 0, 2, 0, 2], now)
+    if a.set_hints(b_address.peer_id(), &[&[10, 0, 0, 2, 0, 2]], now)
         .is_err()
     {
         return false;

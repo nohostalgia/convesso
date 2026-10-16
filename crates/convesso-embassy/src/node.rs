@@ -22,7 +22,9 @@ use core::cell::RefCell;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use convesso_core::dos::{Source, decode_ip, encode_ip};
-use convesso_core::endpoint::{Endpoint, Output, Poll, RelayPath, Target, To};
+use convesso_core::endpoint::{
+    Endpoint, HintError, MAX_HINTS, Output, Poll, RelayPath, Target, To,
+};
 use convesso_core::handshake::Context as Name;
 use convesso_core::handshake::{self, Admission, ChannelBinding, Decision, Psk, ResponderError};
 use convesso_core::identity::{Address, Identity, PeerId};
@@ -655,19 +657,71 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         ))
     }
 
-    /// Gives the core a direct address for `peer`, in every context: the
-    /// first attempt of a dial goes there.
+    /// Gives the core a direct address for `peer`, in every context: as
+    /// [`Self::set_hints`] with one address.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Hint`].
+    /// As [`Self::set_hints`].
     pub async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
-        let (bytes, len) = encode_ip(at);
+        self.set_hints(peer, &[at]).await
+    }
+
+    /// Gives the core up to [`MAX_HINTS`] direct addresses for `peer`, in
+    /// every context, replacing those it had; none forgets them. A dial's
+    /// first attempt goes to every one at once.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Hint`] with the core's error for more than [`MAX_HINTS`]
+    /// or more than the storage profile's hint table holds, which leaves the
+    /// old hints.
+    pub async fn set_hints(&self, peer: PeerId, at: &[SocketAddr]) -> Result<(), NodeError> {
+        if at.len() > MAX_HINTS {
+            return Err(NodeError::Hint(HintError::TooMany {
+                hints: at.len(),
+                max: MAX_HINTS,
+            }));
+        }
+        let encoded: [_; MAX_HINTS] = core::array::from_fn(|i| at.get(i).map(|a| encode_ip(*a)));
+        let mut hints: [&[u8]; MAX_HINTS] = [&[]; MAX_HINTS];
+        for (hint, (bytes, len)) in hints.iter_mut().zip(encoded.iter().flatten()) {
+            *hint = bytes.get(..*len).unwrap_or_default();
+        }
         let mut inner = self.shared.inner.lock().await;
+        let result = inner
+            .endpoint
+            .set_hints(peer, hints.get(..at.len()).unwrap_or_default(), now())
+            .map_err(NodeError::Hint);
+        drop(inner);
+        self.shared.wake.signal(());
+        result
+    }
+
+    /// Replaces the pinned relay with `relay`, or, with `None`, removes it,
+    /// without restarting the node. Sessions with peers and contexts stay; the
+    /// old relay's link is closed, and a reachable node opens the new relay's
+    /// at once. The relay already pinned changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Relay`] with the core's error; the old relay then stays.
+    pub async fn set_relay(&self, relay: Option<RelayLocation>) -> Result<(), NodeError> {
+        let mut inner = self.shared.inner.lock().await;
+        let address = relay.map(|location| location.address);
         inner
             .endpoint
-            .set_hint(peer, bytes.get(..len).unwrap_or_default(), now())
-            .map_err(|_| NodeError::Hint)
+            .set_relay(address, now())
+            .map_err(NodeError::Relay)?;
+        if let Some(location) = relay {
+            inner
+                .endpoint
+                .set_relay_families(location.primary.is_ipv6(), location.other.is_some());
+        }
+        inner.relay = relay;
+        drop(inner);
+        self.shared.wake.signal(());
+        Ok(())
     }
 
     /// Asks to be reachable through the relay, keeping a link to it, or not.

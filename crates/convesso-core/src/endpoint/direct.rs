@@ -471,6 +471,14 @@ impl<C: Config> Endpoint<C> {
         self.refresh_candidates();
     }
 
+    /// The relay that reported this endpoint's public addresses is gone: they
+    /// are candidates no more, until the next relay reports them.
+    pub(super) fn forget_public(&mut self) {
+        self.own.public_v4 = None;
+        self.own.public_v6 = None;
+        self.refresh_candidates();
+    }
+
     /// A peer saw this endpoint at `seen`: a candidate when its IP address is
     /// one no other candidate has. Another port at the public address only
     /// says the NAT is symmetric, and is no candidate for anyone else.

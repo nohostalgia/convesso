@@ -374,8 +374,11 @@ enum Msg {
         client: usize,
         packet: Vec<u8>,
     },
+    /// Bytes the relay wrote on a link, for the client at its end: lost when
+    /// that link is no longer the client's, as a closed socket's would be.
     ClientLink {
         client: usize,
+        link: LinkId,
         bytes: Vec<u8>,
     },
     /// A packet on a direct path between two clients.
@@ -602,6 +605,33 @@ impl<P: Policy> World<P> {
         client.nat = SocketAddr::new(client.nat.ip(), client.nat.port() + 1);
     }
 
+    /// Another relay, with key `key` of the vectors, takes the place of the
+    /// world's relay, at the same address: what the old one knew is gone, and
+    /// every link to it closes, as at a restart of its host.
+    pub(crate) fn replace_relay(&mut self, relay: Relay<P, TestEntropy>) {
+        self.relay = relay;
+        self.relay_deadline = None;
+        let now = self.instant();
+        for client in &mut self.clients {
+            if client.link.take().is_some() {
+                client.deframer = Deframer::default();
+                client.endpoint.relay_link_closed(now);
+            }
+        }
+        self.settle();
+    }
+
+    /// Client `i` moves to the world's relay as it is now.
+    pub(crate) fn move_to_relay(&mut self, i: usize) {
+        let relay = self.relay.address();
+        let now = self.instant();
+        self.clients[i]
+            .endpoint
+            .set_relay(Some(relay), now)
+            .unwrap();
+        self.settle();
+    }
+
     /// Client `i` asks to be reachable; returns the link its core opened.
     pub(crate) fn open_link(&mut self, i: usize) -> LinkId {
         let now = self.instant();
@@ -662,7 +692,7 @@ impl<P: Policy> World<P> {
         let peer = self.clients[j].peer_id();
         self.clients[i]
             .endpoint
-            .set_hint(peer, &[u8::try_from(j).unwrap()], now)
+            .set_hints(peer, &[&[u8::try_from(j).unwrap()]], now)
             .unwrap();
     }
 
@@ -1190,7 +1220,14 @@ impl<P: Policy> World<P> {
                         self.relay_link_types.entry(id).or_default().push(bytes[3]);
                     }
                     if let Some(i) = self.clients.iter().position(|c| c.link == Some(id)) {
-                        self.put(self.delay, Msg::ClientLink { client: i, bytes });
+                        self.put(
+                            self.delay,
+                            Msg::ClientLink {
+                                client: i,
+                                link: id,
+                                bytes,
+                            },
+                        );
                     }
                 }
                 Action::Close { id } => {
@@ -1279,7 +1316,17 @@ impl<P: Policy> World<P> {
                     self.client_output(to, output, &mut out);
                 }
             }
-            Msg::ClientLink { client, bytes } => {
+            Msg::ClientLink {
+                client,
+                link,
+                bytes,
+            } => {
+                // Bytes of a link this client no longer has: its socket is
+                // closed, and they reach nothing.
+                if self.clients[client].link != Some(link) {
+                    self.relay_actions();
+                    return;
+                }
                 let mut packets = Vec::new();
                 let mut answers = 0;
                 {

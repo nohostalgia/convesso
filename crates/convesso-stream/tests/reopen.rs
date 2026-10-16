@@ -138,11 +138,11 @@ impl Net {
         let (sa, sb) = (net.a.source, net.b.source);
         net.a
             .endpoint
-            .set_hint(b, &sb, Instant::from_millis(0))
+            .set_hints(b, &[&sb], Instant::from_millis(0))
             .unwrap();
         net.b
             .endpoint
-            .set_hint(a, &sa, Instant::from_millis(0))
+            .set_hints(a, &[&sa], Instant::from_millis(0))
             .unwrap();
         net
     }

@@ -80,7 +80,7 @@ fn another_key_cannot_pose_as_the_relay() {
     let a = world.clients[0].address();
     let now = world.instant();
     let mut out = [0u8; 2048];
-    imposter.set_hint(a.peer_id(), &[0], now).unwrap();
+    imposter.set_hints(a.peer_id(), &[&[0]], now).unwrap();
     let Ok(Output::Transmit { len, .. }) =
         imposter.connect(&a, CONTEXT, now, &mut AcceptAll, &mut entropy, &mut out)
     else {
@@ -88,7 +88,7 @@ fn another_key_cannot_pose_as_the_relay() {
     };
     let plain = out[..len].to_vec();
     let mut imposter: Endpoint<Mcu> = Endpoint::new(identity(4), &[SESSION]).unwrap();
-    imposter.set_hint(a.peer_id(), &[0], now).unwrap();
+    imposter.set_hints(a.peer_id(), &[&[0]], now).unwrap();
     let Ok(Output::Transmit { len, .. }) = imposter.send(
         Target::Address(&a),
         CONTEXT,

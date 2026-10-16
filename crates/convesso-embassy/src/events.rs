@@ -17,7 +17,7 @@
 
 use core::net::SocketAddr;
 
-use convesso_core::endpoint::{RelayError, SendError};
+use convesso_core::endpoint::{HintError, RelayError, SendError};
 use convesso_core::handshake::{DialError, ResponderError};
 use convesso_core::identity::PeerId;
 use convesso_core::paths::PathKind;
@@ -137,8 +137,10 @@ pub enum NodeError {
     Send(SendError),
     /// The socket could not send it.
     Socket(crate::socket::SocketError),
-    /// A hint that is not an address the core can use.
-    Hint,
+    /// The hints were refused, with the core's named error.
+    Hint(HintError),
+    /// The relay could not be pinned, with the core's named error.
+    Relay(ResponderError),
     /// The prefix could not be excluded, with the core's named error.
     Exclude(convesso_core::endpoint::ExcludeError),
     /// The context could not be opened, or its access changed, with the
@@ -158,7 +160,8 @@ impl core::fmt::Display for NodeError {
         match self {
             Self::Send(error) => error.fmt(f),
             Self::Socket(error) => error.fmt(f),
-            Self::Hint => f.write_str("the hint is not a usable address"),
+            Self::Hint(error) => error.fmt(f),
+            Self::Relay(error) => write!(f, "the relay: {error}"),
             Self::Exclude(error) => error.fmt(f),
             Self::Context(error) => write!(f, "the context: {error}"),
             Self::ContextClosed => f.write_str("the context was closed"),

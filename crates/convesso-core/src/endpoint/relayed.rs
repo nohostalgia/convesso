@@ -42,7 +42,7 @@ use super::{
     Output, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
-use crate::handshake::{Access, Decision, Psk, ResponderError};
+use crate::handshake::{Access, Decision, FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
 use crate::storage::{Config, Table};
@@ -222,6 +222,50 @@ pub(crate) struct RelayClient {
 }
 
 impl RelayClient {
+    /// A client of `address`, not yet reachable.
+    fn new(address: Address, context: Context, now: Instant) -> Self {
+        Self {
+            address,
+            context,
+            reachable: false,
+            link: LinkState::None,
+            failures: 0,
+            registered: false,
+            pending: None,
+            close_due: false,
+            udp_proven: None,
+            last_probe: None,
+            last_tcp_sent: now,
+            keepalive: MIN_KEEPALIVE,
+            keepalive_now: false,
+            register_due: false,
+            families: None,
+            reported_v4: false,
+            reported_v6: false,
+            ask: None,
+            ask_other_now: false,
+        }
+    }
+
+    /// Becomes a client of `address`, keeping what the application asked
+    /// (reachable, the keep-alive interval) and nothing it learned: the old
+    /// relay's link, if any, is asked closed without an event, and a reachable
+    /// client asks for the new one at once.
+    fn replace(&mut self, address: Address, now: Instant) {
+        let link_up = matches!(self.link, LinkState::Opening(_) | LinkState::Open { .. });
+        *self = Self {
+            reachable: self.reachable,
+            keepalive: self.keepalive,
+            close_due: link_up,
+            link: if self.reachable {
+                LinkState::Waiting(Some(now))
+            } else {
+                LinkState::None
+            },
+            ..Self::new(address, self.context, now)
+        };
+    }
+
     /// Whether `key` is the relay session's.
     pub(super) fn is(&self, key: &Key) -> bool {
         key.0 == self.address.peer_id() && key.1 == self.context
@@ -372,12 +416,54 @@ pub(crate) struct Hint {
     used: Instant,
 }
 
+/// A peer's hints, in order: at most [`MAX_HINTS`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Hints([Option<SourceKey>; MAX_HINTS], usize);
+
+impl Hints {
+    /// The hints, in order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = SourceKey> + '_ {
+        self.0.iter().take(self.1).flatten().copied()
+    }
+}
+
+/// The most direct address hints one peer has.
+pub const MAX_HINTS: usize = 8;
+
 /// A hint longer than a direct source may be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HintTooLong {
     /// Its length.
     pub len: usize,
 }
+
+/// Why a peer's hints were refused; its hints are then as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintError {
+    /// A hint longer than a direct source may be.
+    TooLong(HintTooLong),
+    /// More hints than one peer may have ([`MAX_HINTS`]), or than the storage
+    /// profile's hint table holds.
+    TooMany {
+        /// How many were given.
+        hints: usize,
+        /// The most that fit.
+        max: usize,
+    },
+}
+
+impl core::fmt::Display for HintError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooLong(error) => error.fmt(f),
+            Self::TooMany { hints, max } => {
+                write!(f, "{hints} hints, where at most {max} fit")
+            }
+        }
+    }
+}
+
+impl core::error::Error for HintError {}
 
 impl core::fmt::Display for HintTooLong {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -391,9 +477,23 @@ impl core::fmt::Display for HintTooLong {
 
 impl core::error::Error for HintTooLong {}
 
-/// The path the rule chose.
+/// A first contact still owed to the hints after the first: sent to the next
+/// one at each poll, before anything else (`PROTOCOL.md §6`).
+pub(crate) struct Fan {
+    peer: PeerId,
+    bytes: [u8; FIRST_CONTACT_LEN],
+    len: usize,
+    /// The hint it goes to next.
+    next: usize,
+}
+
+/// The path the rule chose. It lives on the stack for one routing step, and
+/// there is no allocator to box the hints in.
+#[allow(clippy::large_enum_variant)]
 enum Path {
     Direct(SourceKey),
+    /// Every hint of the peer at once: the first now, the others fanned out.
+    Hints(Hints),
     RelaySession,
     Forward,
     None,
@@ -490,42 +590,74 @@ impl<C: Config> Endpoint<C> {
     }
 
     /// Pins `relay`: this endpoint reaches peers it cannot reach directly
-    /// through it, and serves the relay context to it alone. Pinning another
-    /// relay binds the context to that one instead.
+    /// through it, and serves the relay context to it alone. As
+    /// [`Self::set_relay`] with a relay.
     ///
     /// # Errors
     ///
     /// A [`ResponderError`] when the storage profile's contexts table is full.
     pub fn pin_relay(&mut self, relay: Address, now: Instant) -> Result<(), ResponderError> {
+        self.set_relay(Some(relay), now)
+    }
+
+    /// Replaces the pinned relay with `relay`, or, with `None`, removes it,
+    /// while the endpoint runs (`PROTOCOL.md §6`).
+    ///
+    /// Everything of the old relay goes: its relay session, dial and pending
+    /// handshakes, its link (asked closed, with no relay-unavailable event),
+    /// and the public candidates it reported. The relay context is served to
+    /// the new relay alone, or no longer served. A reachable endpoint asks for a
+    /// link to the new relay at once. Sessions with peers are untouched: one
+    /// last heard through the relay goes on through the new one. The relay
+    /// already pinned changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A [`ResponderError`] when the storage profile's contexts table is full;
+    /// nothing is changed then.
+    pub fn set_relay(
+        &mut self,
+        relay: Option<Address>,
+        now: Instant,
+    ) -> Result<(), ResponderError> {
         let context = Context::new(relay::CONTEXT).map_err(ResponderError::ContextTooLong)?;
-        let access = Access::Bound(relay.peer_id());
-        if self.responder.serves(&context) {
-            self.responder.set_access(&context, access)?;
-        } else {
-            self.responder.serve(relay::CONTEXT, access)?;
+        let current = self.relay.as_ref().map(|client| client.address);
+        if current == relay {
+            return Ok(());
         }
-        self.responder.accept_payload(relay::CONTEXT)?;
-        self.relay = Some(RelayClient {
-            address: relay,
-            context,
-            reachable: false,
-            link: LinkState::None,
-            failures: 0,
-            registered: false,
-            pending: None,
-            close_due: false,
-            udp_proven: None,
-            last_probe: None,
-            last_tcp_sent: now,
-            keepalive: MIN_KEEPALIVE,
-            keepalive_now: false,
-            register_due: false,
-            families: None,
-            reported_v4: false,
-            reported_v6: false,
-            ask: None,
-            ask_other_now: false,
-        });
+        // The relay context first: the one step that can be refused.
+        match relay {
+            Some(address) => {
+                let access = Access::Bound(address.peer_id());
+                if self.responder.serves(&context) {
+                    self.responder.set_access(&context, access)?;
+                } else {
+                    self.responder.serve(relay::CONTEXT, access)?;
+                }
+                self.responder.accept_payload(relay::CONTEXT)?;
+            }
+            None => {
+                self.responder.stop_serving(&context);
+            }
+        }
+        if let Some(old) = current {
+            let old_peer = old.peer_id();
+            self.remove_session((old_peer, context));
+            self.responder
+                .retain_pending(|pending| *pending.peer() != old_peer);
+            self.forget_public();
+        }
+        match (relay, self.relay.as_mut()) {
+            (Some(address), Some(client)) => client.replace(address, now),
+            (Some(address), None) => self.relay = Some(RelayClient::new(address, context, now)),
+            (None, Some(client)) => {
+                if matches!(client.link, LinkState::Opening(_) | LinkState::Open { .. }) {
+                    self.link_close_owed = true;
+                }
+                self.relay = None;
+            }
+            (None, None) => {}
+        }
         Ok(())
     }
 
@@ -535,48 +667,77 @@ impl<C: Config> Endpoint<C> {
         self.relay.as_ref().map(|relay| relay.address.peer_id())
     }
 
-    /// Gives the core a direct address for `peer`, in the driver's encoding of
-    /// a direct source: the first attempt of a dial to the peer goes there
-    /// (`PROTOCOL.md §6`). A full table forgets the hint used least recently.
+    /// Gives the core the direct addresses of `peer`, in the driver's encoding
+    /// of a direct source, replacing those it had; none forgets them. A dial's
+    /// first attempt goes to every one of them at once (`PROTOCOL.md §6`).
+    /// Hints that do not fit make room by forgetting every hint of the peer
+    /// whose hints were used least recently.
     ///
     /// # Errors
     ///
-    /// [`HintTooLong`] for an address longer than a direct source may be.
-    pub fn set_hint(
+    /// [`HintError`] for an address longer than a direct source may be, or
+    /// for more than [`MAX_HINTS`] or than the hint table holds; the peer's
+    /// hints are then as they were.
+    pub fn set_hints<A: AsRef<[u8]>>(
         &mut self,
         peer: PeerId,
-        address: &[u8],
+        addresses: &[A],
         now: Instant,
-    ) -> Result<(), HintTooLong> {
-        let too_long = HintTooLong { len: address.len() };
-        let address = Source::Direct(address).key().ok_or(too_long)?;
-        let hint = Hint { address, used: now };
-        if self.hints.get(&peer).is_none()
-            && self
-                .hints
-                .capacity()
-                .is_some_and(|capacity| self.hints.len() >= capacity)
+    ) -> Result<(), HintError> {
+        let max = self
+            .hints
+            .capacity()
+            .map_or(MAX_HINTS, |capacity| capacity.min(MAX_HINTS));
+        if addresses.len() > max {
+            return Err(HintError::TooMany {
+                hints: addresses.len(),
+                max,
+            });
+        }
+        let mut sources = [None; MAX_HINTS];
+        for (slot, address) in sources.iter_mut().zip(addresses) {
+            let address = address.as_ref();
+            let too_long = HintError::TooLong(HintTooLong { len: address.len() });
+            *slot = Some(Source::Direct(address).key().ok_or(too_long)?);
+        }
+        self.hints.retain(|(p, _), _| *p != peer);
+        while let Some(capacity) = self.hints.capacity()
+            && self.hints.len() + addresses.len() > capacity
         {
             let mut oldest: Option<(Instant, PeerId)> = None;
-            self.hints.for_each(|peer, hint| {
+            self.hints.for_each(|(p, _), hint| {
                 if oldest.is_none_or(|(used, _)| hint.used < used) {
-                    oldest = Some((hint.used, *peer));
+                    oldest = Some((hint.used, *p));
                 }
             });
-            if let Some((_, peer)) = oldest {
-                self.hints.remove(&peer);
-            }
+            let Some((_, evicted)) = oldest else {
+                break;
+            };
+            self.hints.retain(|(p, _), _| *p != evicted);
         }
-        self.hints.remove(&peer);
-        let _ = self.hints.insert(peer, hint);
+        for (index, address) in (0u8..).zip(sources.into_iter().flatten()) {
+            let _ = self
+                .hints
+                .insert((peer, index), Hint { address, used: now });
+        }
         Ok(())
     }
 
-    /// The hint for `peer`, marked used at `now`.
-    fn use_hint(&mut self, peer: &PeerId, now: Instant) -> Option<SourceKey> {
-        let hint = self.hints.get_mut(peer)?;
-        hint.used = now;
-        Some(hint.address)
+    /// The hints of `peer`, in the order given, marked used at `now`.
+    pub(super) fn use_hints(&mut self, peer: &PeerId, now: Instant) -> Hints {
+        let mut hints = Hints::default();
+        for index in 0..MAX_HINTS {
+            let key = (*peer, u8::try_from(index).unwrap_or(u8::MAX));
+            let Some(hint) = self.hints.get_mut(&key) else {
+                break;
+            };
+            hint.used = now;
+            if let Some(slot) = hints.0.get_mut(hints.1) {
+                *slot = Some(hint.address);
+                hints.1 += 1;
+            }
+        }
+        hints
     }
 
     /// A session with a peer is opening: this endpoint's public addresses are
@@ -616,7 +777,7 @@ impl<C: Config> Endpoint<C> {
         self.sessions.for_each(|(p, _), session| {
             heard |= *p == *peer && session.last_source.is_some();
         });
-        heard || self.relay.is_some() || self.hints.get(peer).is_some()
+        heard || self.relay.is_some() || self.hints.get(&(*peer, 0)).is_some()
     }
 
     /// Asks the endpoint to stay reachable through its pinned relay, keeping
@@ -1066,6 +1227,7 @@ impl<C: Config> Endpoint<C> {
                 attempt,
             } => match self.path_of(peer, last_source, attempt, now) {
                 Path::Direct(address) => Some((To::Direct(address), len)),
+                Path::Hints(hints) => self.fan_out(peer, &hints, len, out),
                 Path::RelaySession => Some((To::Relay(self.relay_path(now)), len)),
                 Path::Forward => self
                     .forward_in_place(peer, len, now, policy, entropy, out)
@@ -1099,13 +1261,96 @@ impl<C: Config> Endpoint<C> {
                 return Path::Direct(source);
             }
         }
-        let hint = self
-            .use_hint(&peer, now)
-            .filter(|hint| self.may_be_path(Some(*hint)));
-        match (attempt, hint, self.relay.is_some()) {
-            (Some(0), Some(hint), _) | (_, Some(hint), false) => Path::Direct(hint),
+        let hints = self.usable_hints(&peer, now);
+        let hinted = hints.iter().next().is_some();
+        match (attempt, hinted, self.relay.is_some()) {
+            (Some(0), true, _) | (_, true, false) => Path::Hints(hints),
             (_, _, true) => Path::Forward,
-            (_, None, false) => Path::None,
+            (_, false, false) => Path::None,
+        }
+    }
+
+    /// The hints of `peer` a path may use, in order, marked used at `now`.
+    fn usable_hints(&mut self, peer: &PeerId, now: Instant) -> Hints {
+        let all = self.use_hints(peer, now);
+        let mut usable = Hints::default();
+        for hint in all.iter() {
+            if self.may_be_path(Some(hint))
+                && let Some(slot) = usable.0.get_mut(usable.1)
+            {
+                *slot = Some(hint);
+                usable.1 += 1;
+            }
+        }
+        usable
+    }
+
+    /// Sends the packet in `out[..len]` to the first of `hints` now, and keeps
+    /// it for the others, which [`Self::next_fan`] sends one a poll. A packet
+    /// longer than a first contact, or one that finds the table of fan-outs
+    /// full, goes to the first hint only.
+    fn fan_out(
+        &mut self,
+        peer: PeerId,
+        hints: &Hints,
+        len: usize,
+        out: &[u8],
+    ) -> Option<(To, usize)> {
+        let first = hints.iter().next()?;
+        if hints.1 > 1
+            && let Some(packet) = out.get(..len)
+            && len <= FIRST_CONTACT_LEN
+        {
+            let mut bytes = [0u8; FIRST_CONTACT_LEN];
+            if let Some(slot) = bytes.get_mut(..len) {
+                slot.copy_from_slice(packet);
+            }
+            self.fan_seq = self.fan_seq.wrapping_add(1);
+            let fan = Fan {
+                peer,
+                bytes,
+                len,
+                next: 1,
+            };
+            let _ = self.fans.insert(self.fan_seq, fan);
+        }
+        Some((To::Direct(first), len))
+    }
+
+    /// The next first contact owed to a hint, written in `out`: the oldest
+    /// fan-out's, to its next hint. The hints are read again, so that one
+    /// given meanwhile is used, and one forgotten is not.
+    pub(super) fn next_fan(&mut self, now: Instant, out: &mut [u8]) -> Option<(To, usize)> {
+        loop {
+            let mut oldest: Option<u32> = None;
+            self.fans.for_each(|seq, _| {
+                if oldest.is_none_or(|o| seq.wrapping_sub(o) > u32::MAX / 2) {
+                    oldest = Some(*seq);
+                }
+            });
+            let seq = oldest?;
+            let (peer, next) = self.fans.get(&seq).map(|fan| (fan.peer, fan.next))?;
+            let hints = self.usable_hints(&peer, now);
+            let Some(hint) = hints.iter().nth(next) else {
+                self.fans.remove(&seq);
+                continue;
+            };
+            let fan = self.fans.get_mut(&seq)?;
+            fan.next += 1;
+            let len = fan.len;
+            let sent = match (out.get_mut(..len), fan.bytes.get(..len)) {
+                (Some(slot), Some(bytes)) => {
+                    slot.copy_from_slice(bytes);
+                    true
+                }
+                _ => false,
+            };
+            if fan.next >= hints.1 || !sent {
+                self.fans.remove(&seq);
+            }
+            if sent {
+                return Some((To::Direct(hint), len));
+            }
         }
     }
 
@@ -1251,6 +1496,7 @@ impl<C: Config> Endpoint<C> {
                 attempt,
             } => match self.path_of(peer, last_source, attempt, now) {
                 Path::Direct(address) => Some((To::Direct(address), len)),
+                Path::Hints(hints) => self.fan_out(peer, &hints, len, out),
                 Path::RelaySession => Some((To::Relay(self.relay_path(now)), len)),
                 Path::Forward => {
                     let frame_len = self.wrap_forward(peer, len, out).ok()?;
@@ -1335,6 +1581,12 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Poll {
+        // A first contact owed to the next of a peer's hints goes before
+        // anything else, so that every hint has it at once.
+        if let Some((to, len)) = self.next_fan(now, out) {
+            self.note_sent(to, now);
+            return Poll::Transmit { to, len };
+        }
         // Each turn either returns or consumes something queued, so this ends;
         // the bound is a backstop.
         for _ in 0..64 {
@@ -1432,6 +1684,10 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Option<Poll> {
+        if self.link_close_owed {
+            self.link_close_owed = false;
+            return Some(Poll::CloseRelayLink);
+        }
         let relay = self.relay.as_mut()?;
         let key = relay.key();
         if relay.close_due {
