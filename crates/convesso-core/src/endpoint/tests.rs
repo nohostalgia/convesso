@@ -206,11 +206,11 @@ impl Net {
         let (a_source, b_source) = (net.a.source, net.b.source);
         net.a
             .endpoint
-            .set_hint(b, &b_source, Instant::from_millis(0))
+            .set_hints(b, &[&b_source], Instant::from_millis(0))
             .unwrap();
         net.b
             .endpoint
-            .set_hint(a, &a_source, Instant::from_millis(0))
+            .set_hints(a, &[&a_source], Instant::from_millis(0))
             .unwrap();
         net
     }
@@ -1031,7 +1031,7 @@ fn revocation_closes_everything() {
         let b_source = net.b.source;
         probe
             .endpoint
-            .set_hint(address.peer_id(), &b_source, net.t())
+            .set_hints(address.peer_id(), &[&b_source], net.t())
             .unwrap();
         let mut out = [0u8; 2048];
         let Output::Transmit { len, .. } = probe
@@ -2168,7 +2168,7 @@ fn an_endpoint_serving_no_context_answers_no_one() {
     let a = net.a.peer_id();
     net.b
         .endpoint
-        .set_hint(a, &a_source, Instant::from_millis(0))
+        .set_hints(a, &[&a_source], Instant::from_millis(0))
         .unwrap();
 
     net.connect_in(true, b"session");
@@ -2203,7 +2203,7 @@ fn fifty_contexts_on_the_server_profile() {
     let client_source = [10, 0, 0, 1, 0, 1];
     let now = Instant::from_millis(0);
     client
-        .set_hint(identity(0).peer_id(), &server_source, now)
+        .set_hints(identity(0).peer_id(), &[&server_source], now)
         .unwrap();
     let mut policy = Policy {
         decision: Decision::Accept { psk: None },
@@ -2291,7 +2291,7 @@ impl Mesh {
                     let (peer, from) = (nodes[j].peer_id(), nodes[j].source);
                     nodes[i]
                         .endpoint
-                        .set_hint(peer, &from, Instant::from_millis(0))
+                        .set_hints(peer, &[&from], Instant::from_millis(0))
                         .unwrap();
                 }
             }
@@ -2583,4 +2583,464 @@ fn a_change_of_access_discards_pending_handshakes_it_would_not_admit() {
         .set_access(b"session", Some(Access::Policy), 0x0200, &mut net.b.policy)
         .unwrap();
     assert_eq!(net.b.endpoint.responder.pending_count(), 0);
+}
+
+// --- address hints ----------------------------------------------------------------------
+
+/// The hints `endpoint` holds for `peer`, in order, as their first bytes.
+fn hints_of<C: Config>(endpoint: &mut Endpoint<C>, peer: &PeerId) -> Vec<u8> {
+    endpoint
+        .use_hints(peer, Instant::from_millis(0))
+        .iter()
+        .map(|hint| hint.as_direct().unwrap()[0])
+        .collect()
+}
+
+/// Scenario: more than 8 hints are refused, or more than the table holds,
+/// or one that is not a usable direct source; the peer keeps its hints.
+#[test]
+fn more_than_8_hints_are_refused() {
+    use crate::storage::Server;
+
+    let peer = identity(1).peer_id();
+    let mut server: Endpoint<Server> = Endpoint::new(identity(0), &[]).unwrap();
+    server
+        .set_hints(peer, &[[1u8]], Instant::from_millis(0))
+        .unwrap();
+    let nine: Vec<[u8; 1]> = (1..=9).map(|i| [i]).collect();
+    assert_eq!(
+        server.set_hints(peer, &nine, Instant::from_millis(1)),
+        Err(HintError::TooMany { hints: 9, max: 8 })
+    );
+    assert_eq!(
+        server.set_hints(peer, &nine[..8], Instant::from_millis(1)),
+        Ok(())
+    );
+    assert_eq!(hints_of(&mut server, &peer), (1..=8).collect::<Vec<u8>>());
+
+    // The microcontroller's table holds 4 hints, all peers together.
+    let mut mcu: Endpoint<Mcu> = Endpoint::new(identity(0), &[]).unwrap();
+    mcu.set_hints(peer, &[[7u8]], Instant::from_millis(0))
+        .unwrap();
+    assert_eq!(
+        mcu.set_hints(peer, &nine[..5], Instant::from_millis(1)),
+        Err(HintError::TooMany { hints: 5, max: 4 })
+    );
+    let too_long: [&[u8]; 2] = [&[1], &[0; 33]];
+    assert_eq!(
+        mcu.set_hints(peer, &too_long, Instant::from_millis(1)),
+        Err(HintError::TooLong(HintTooLong { len: 33 }))
+    );
+    assert_eq!(hints_of(&mut mcu, &peer), vec![7], "as they were");
+}
+
+/// Hints given replace the peer's; none forgets them.
+#[test]
+fn hints_replace_and_are_forgotten() {
+    let peer = identity(1).peer_id();
+    let mut endpoint: Endpoint<Mcu> = Endpoint::new(identity(0), &[]).unwrap();
+    endpoint
+        .set_hints(peer, &[[1u8], [2]], Instant::from_millis(0))
+        .unwrap();
+    endpoint
+        .set_hints(peer, &[[3u8]], Instant::from_millis(1))
+        .unwrap();
+    assert_eq!(hints_of(&mut endpoint, &peer), vec![3]);
+    endpoint
+        .set_hints::<[u8; 1]>(peer, &[], Instant::from_millis(2))
+        .unwrap();
+    assert!(hints_of(&mut endpoint, &peer).is_empty());
+    assert!(!endpoint.has_path(&peer, Instant::from_millis(2)));
+}
+
+/// Hints that do not fit forget every hint of the peer whose hints were used
+/// least recently, and no other.
+#[test]
+fn hints_that_do_not_fit_forget_the_least_recently_used_peer() {
+    let (one, two, three) = (
+        identity(1).peer_id(),
+        identity(2).peer_id(),
+        identity(3).peer_id(),
+    );
+    let t = Instant::from_millis;
+    let mut endpoint: Endpoint<Mcu> = Endpoint::new(identity(0), &[]).unwrap();
+    endpoint.set_hints(one, &[[1u8], [2]], t(1)).unwrap();
+    endpoint.set_hints(two, &[[3u8], [4]], t(2)).unwrap();
+    // One is used again: two is now the least recent.
+    let _ = endpoint.use_hints(&one, t(3));
+    endpoint.set_hints(three, &[[5u8]], t(4)).unwrap();
+    assert!(
+        hints_of(&mut endpoint, &two).is_empty(),
+        "both of its hints go"
+    );
+    assert_eq!(hints_of(&mut endpoint, &one), vec![1, 2]);
+    assert_eq!(hints_of(&mut endpoint, &three), vec![5]);
+}
+
+// --- a dial fanned out to every hint -----------------------------------------------------
+
+/// An endpoint dialling with the test's policy and entropy.
+struct Dialler {
+    endpoint: Endpoint<Mcu>,
+    policy: Policy,
+    entropy: TestEntropy,
+}
+
+impl Dialler {
+    fn new(key: usize) -> Self {
+        Self {
+            endpoint: Endpoint::new(identity(key), &[b"session"]).unwrap(),
+            policy: Policy {
+                decision: Decision::Accept { psk: None },
+                asked: 0,
+                refuse: Vec::new(),
+            },
+            entropy: TestEntropy(9000 + key as u64),
+        }
+    }
+
+    /// Dials `to` at `now`; returns where the first packet goes, and it.
+    fn connect(&mut self, to: usize, now: u64) -> (To, Vec<u8>) {
+        let mut out = [0u8; 2048];
+        let output = self
+            .endpoint
+            .connect(
+                identity(to).address(),
+                b"session",
+                Instant::from_millis(now),
+                &mut self.policy,
+                &mut self.entropy,
+                &mut out,
+            )
+            .unwrap();
+        let Output::Transmit { to, len } = output else {
+            panic!("a first contact")
+        };
+        (to, out[..len].to_vec())
+    }
+
+    /// Every packet the endpoint sends at `now`, with where it goes.
+    fn drain(&mut self, now: u64) -> Vec<(To, Vec<u8>)> {
+        let mut sent = Vec::new();
+        loop {
+            let mut out = [0u8; 2048];
+            match self.endpoint.poll(
+                Instant::from_millis(now),
+                &mut self.policy,
+                &mut self.entropy,
+                &mut out,
+            ) {
+                Poll::Transmit { to, len } => sent.push((to, out[..len].to_vec())),
+                Poll::Event(_) => {}
+                _ => return sent,
+            }
+        }
+    }
+}
+
+fn direct(source: &[u8]) -> To {
+    To::Direct(Source::Direct(source).key().unwrap())
+}
+
+/// Scenario: every hint is tried at once: the first contact goes to three
+/// hints, the third of which is the peer, which answers; the session's
+/// packets then go there.
+#[test]
+fn every_hint_is_tried_at_once() {
+    let mut a = Dialler::new(1);
+    let b_peer = identity(0).peer_id();
+    let (h1, h2, h3) = (
+        [10, 0, 0, 7, 0, 1],
+        [10, 0, 0, 8, 0, 1],
+        [10, 0, 0, 2, 0, 2],
+    );
+    a.endpoint
+        .set_hints(b_peer, &[h1, h2, h3], Instant::from_millis(0))
+        .unwrap();
+    let (first_to, first) = a.connect(0, 0);
+    assert_eq!(first_to, direct(&h1));
+    let rest = a.drain(0);
+    assert_eq!(
+        rest.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
+        vec![direct(&h2), direct(&h3)]
+    );
+    assert!(
+        rest.iter().all(|(_, bytes)| *bytes == first),
+        "one first contact"
+    );
+
+    // The peer, at the third, answers; the session's packets go there.
+    let mut b = Dialler::new(0);
+    let mut packet = first.clone();
+    let mut out = [0u8; 2048];
+    let Output::Transmit { len, .. } = b.endpoint.handle_packet(
+        &mut packet,
+        Source::Direct(&[10, 0, 0, 1, 0, 1]),
+        Instant::from_millis(10),
+        &mut b.policy,
+        &mut b.entropy,
+        &mut out,
+    ) else {
+        panic!("a response")
+    };
+    let mut response = out[..len].to_vec();
+    let _ = a.endpoint.handle_packet(
+        &mut response,
+        Source::Direct(&h3),
+        Instant::from_millis(20),
+        &mut a.policy,
+        &mut a.entropy,
+        &mut out,
+    );
+    let confirm = a.drain(20);
+    assert!(!confirm.is_empty());
+    assert!(
+        confirm.iter().all(|(to, _)| *to == direct(&h3)),
+        "{confirm:?}"
+    );
+}
+
+/// Scenario: a hint that does not answer falls back to the relay: the first
+/// attempt goes to every hint, the second, one second later, through the
+/// relay.
+#[test]
+fn a_dial_falls_back_from_every_hint_to_the_relay() {
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+    let b_peer = identity(0).peer_id();
+    let (h1, h2) = ([10, 0, 0, 7, 0, 1], [10, 0, 0, 8, 0, 1]);
+    a.endpoint
+        .set_hints(b_peer, &[h1, h2], Instant::from_millis(0))
+        .unwrap();
+    let (first_to, _) = a.connect(0, 0);
+    assert_eq!(first_to, direct(&h1));
+    let at_once = a.drain(0);
+    assert_eq!(
+        at_once.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
+        vec![direct(&h2)]
+    );
+    let later = a.drain(1000);
+    assert!(!later.is_empty());
+    assert!(
+        later.iter().all(|(to, _)| matches!(to, To::Relay(_))),
+        "the second attempt goes through the relay: {later:?}"
+    );
+}
+
+/// Scenario: without a relay every attempt goes to every hint, until the
+/// dial gives up.
+#[test]
+fn without_a_relay_every_attempt_goes_to_every_hint() {
+    let mut a = Dialler::new(1);
+    let b_peer = identity(0).peer_id();
+    let (h1, h2) = ([10, 0, 0, 7, 0, 1], [10, 0, 0, 8, 0, 1]);
+    a.endpoint
+        .set_hints(b_peer, &[h1, h2], Instant::from_millis(0))
+        .unwrap();
+    let (first_to, _) = a.connect(0, 0);
+    let mut sent = vec![first_to];
+    sent.extend(a.drain(0).into_iter().map(|(to, _)| to));
+    for at in [1000, 3000, 7000, 15_000] {
+        sent.extend(a.drain(at).into_iter().map(|(to, _)| to));
+    }
+    let attempts = crate::handshake::ATTEMPT_OFFSETS.len();
+    assert_eq!(sent.len(), 2 * attempts, "{sent:?}");
+    for pair in sent.chunks(2) {
+        assert_eq!(pair, [direct(&h1), direct(&h2)]);
+    }
+}
+
+/// Two dials started together both fan out to every hint.
+#[test]
+fn two_dials_started_together_both_fan_out() {
+    let mut a = Dialler::new(1);
+    let (b, c) = (identity(0).peer_id(), identity(2).peer_id());
+    let (b1, b2) = ([10, 0, 0, 7, 0, 1], [10, 0, 0, 8, 0, 1]);
+    let (c1, c2) = ([10, 0, 1, 7, 0, 1], [10, 0, 1, 8, 0, 1]);
+    a.endpoint
+        .set_hints(b, &[b1, b2], Instant::from_millis(0))
+        .unwrap();
+    a.endpoint
+        .set_hints(c, &[c1, c2], Instant::from_millis(0))
+        .unwrap();
+    let (to_b, _) = a.connect(0, 0);
+    let (to_c, _) = a.connect(2, 0);
+    assert_eq!((to_b, to_c), (direct(&b1), direct(&c1)));
+    let rest: Vec<To> = a.drain(0).into_iter().map(|(to, _)| to).collect();
+    assert_eq!(rest, vec![direct(&b2), direct(&c2)]);
+}
+
+// --- the relay replaced at runtime --------------------------------------------------------
+
+/// What `poll` gives at `now` until it waits: transmits, link requests and
+/// events, by kind.
+fn polled(dialler: &mut Dialler, now: u64) -> Vec<&'static str> {
+    let mut seen = Vec::new();
+    for _ in 0..64 {
+        let mut out = [0u8; 2048];
+        match dialler.endpoint.poll(
+            Instant::from_millis(now),
+            &mut dialler.policy,
+            &mut dialler.entropy,
+            &mut out,
+        ) {
+            Poll::Transmit { .. } => seen.push("transmit"),
+            Poll::OpenRelayLink => seen.push("open"),
+            Poll::CloseRelayLink => seen.push("close"),
+            Poll::Event(Event::RelayUnavailable { .. }) => seen.push("unavailable"),
+            Poll::Event(Event::RelayAvailable) => seen.push("available"),
+            Poll::Event(_) => seen.push("event"),
+            Poll::Wait(_) | Poll::Idle => return seen,
+        }
+    }
+    seen
+}
+
+/// A first contact from `from` to `to` in the relay context.
+fn relay_first_contact(from: usize, to: usize) -> Vec<u8> {
+    let mut dialler = Dialler::new(from);
+    dialler.endpoint = Endpoint::new(identity(from), &[]).unwrap();
+    dialler
+        .endpoint
+        .set_hints(
+            identity(to).peer_id(),
+            &[[10, 0, 0, 9, 0, 9]],
+            Instant::from_millis(0),
+        )
+        .unwrap();
+    let mut out = [0u8; 2048];
+    let Ok(Output::Transmit { len, .. }) = dialler.endpoint.connect(
+        identity(to).address(),
+        crate::relay::CONTEXT,
+        Instant::from_millis(0),
+        &mut dialler.policy,
+        &mut dialler.entropy,
+        &mut out,
+    ) else {
+        panic!("a first contact")
+    };
+    out[..len].to_vec()
+}
+
+/// Whether `dialler` answers `first`, from a direct source.
+fn answers(dialler: &mut Dialler, first: &[u8], now: u64) -> bool {
+    let mut packet = first.to_vec();
+    let mut out = [0u8; 2048];
+    matches!(
+        dialler.endpoint.handle_packet(
+            &mut packet,
+            Source::Direct(&[192, 0, 2, 1, 0, 1]),
+            Instant::from_millis(now),
+            &mut dialler.policy,
+            &mut dialler.entropy,
+            &mut out,
+        ),
+        Output::Transmit { .. }
+    )
+}
+
+/// Scenario: the old relay is not trusted after the swap: its first contact
+/// in the relay context, answered before, meets silence after.
+#[test]
+fn the_old_relay_is_not_trusted_after_the_swap() {
+    let (r1, r2) = (4, 3);
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(r1).address(), Instant::from_millis(0))
+        .unwrap();
+    assert!(answers(&mut a, &relay_first_contact(r1, 1), 0));
+
+    a.endpoint
+        .set_relay(Some(*identity(r2).address()), Instant::from_millis(10))
+        .unwrap();
+    assert_eq!(a.endpoint.relay(), Some(identity(r2).peer_id()));
+    assert!(!answers(&mut a, &relay_first_contact(r1, 1), 20), "silence");
+    assert!(answers(&mut a, &relay_first_contact(r2, 1), 30));
+    // The old relay's session is gone.
+    let old = (
+        identity(r1).peer_id(),
+        Context::new(crate::relay::CONTEXT).unwrap(),
+    );
+    assert!(a.endpoint.sessions.get(&old).is_none());
+}
+
+/// Scenario: a swap is not unavailability: the old link is asked closed and
+/// the new one opened, with no relay-unavailable event.
+#[test]
+fn a_swap_is_not_unavailability() {
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+    a.endpoint.set_reachable(true, Instant::from_millis(0));
+    assert_eq!(polled(&mut a, 0), vec!["open"]);
+    a.endpoint.relay_link_opened(Instant::from_millis(10));
+    let _ = polled(&mut a, 10);
+
+    a.endpoint
+        .set_relay(Some(*identity(3).address()), Instant::from_millis(100))
+        .unwrap();
+    let after = polled(&mut a, 100);
+    assert_eq!(after, vec!["close", "open"], "{after:?}");
+}
+
+/// Scenario: removing the relay leaves direct paths and hints only: its link
+/// is asked closed, a send with neither fails with no path, and the relay
+/// context meets every first contact with silence.
+#[test]
+fn removing_the_relay_leaves_direct_paths_and_hints_only() {
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+    a.endpoint.set_reachable(true, Instant::from_millis(0));
+    assert_eq!(polled(&mut a, 0), vec!["open"]);
+    a.endpoint.relay_link_opened(Instant::from_millis(10));
+    let _ = polled(&mut a, 10);
+
+    a.endpoint
+        .set_relay(None, Instant::from_millis(100))
+        .unwrap();
+    assert_eq!(polled(&mut a, 100), vec!["close"]);
+    assert_eq!(a.endpoint.relay(), None);
+    let mut out = [0u8; 2048];
+    assert_eq!(
+        a.endpoint
+            .connect(
+                identity(0).address(),
+                b"session",
+                Instant::from_millis(110),
+                &mut a.policy,
+                &mut a.entropy,
+                &mut out,
+            )
+            .err(),
+        Some(SendError::NoPath)
+    );
+    assert!(!answers(&mut a, &relay_first_contact(4, 1), 120));
+    assert!(polled(&mut a, 3_600_000).is_empty(), "nothing at rest");
+}
+
+/// Scenario: pinning the same relay again changes nothing.
+#[test]
+fn pinning_the_same_relay_again_changes_nothing() {
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+    a.endpoint.set_reachable(true, Instant::from_millis(0));
+    assert_eq!(polled(&mut a, 0), vec!["open"]);
+    a.endpoint.relay_link_opened(Instant::from_millis(10));
+    let before = polled(&mut a, 10);
+    a.endpoint
+        .set_relay(Some(*identity(4).address()), Instant::from_millis(20))
+        .unwrap();
+    assert!(
+        !polled(&mut a, 20)
+            .iter()
+            .any(|p| *p == "close" || *p == "open"),
+        "the link stays ({before:?})"
+    );
 }

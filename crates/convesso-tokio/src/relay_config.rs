@@ -24,7 +24,14 @@
 //! [allowlist]                     # optional: only these clients
 //! keys = ["d75a9801..."]          # Ed25519 addresses, in hex
 //! refusal_code = 256              # what every other key is refused with
+//!
+//! [tls]                           # optional, feature `tls`: TLS links beside plain ones
+//! certificate = "relay.crt"       # PEM, the relay's certificate first
+//! key = "relay.pem"               # PEM; on Unix readable by its owner alone
 //! ```
+//!
+//! TLS authenticates nothing: clients accept any certificate, and trust the
+//! relay's key alone (`PROTOCOL.md §6`). A self-signed certificate does.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -57,6 +64,18 @@ pub struct FileConfig {
     pub limits: LimitsFile,
     /// Only these clients, if set.
     pub allowlist: Option<AllowlistFile>,
+    /// TLS on the TCP port, beside plain links, if set.
+    pub tls: Option<TlsFile>,
+}
+
+/// The `[tls]` table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsFile {
+    /// The certificate chain, PEM, the relay's own certificate first.
+    pub certificate: PathBuf,
+    /// Its private key, PEM.
+    pub key: PathBuf,
 }
 
 /// The `[limits]` table: each field optional.
@@ -287,6 +306,8 @@ pub enum RelayStartError {
     Identity(IdentityFileError),
     /// Binding a socket.
     Bind(std::io::Error),
+    /// The certificate or the key, naming the file.
+    Tls(String),
 }
 
 impl std::fmt::Display for RelayStartError {
@@ -295,6 +316,7 @@ impl std::fmt::Display for RelayStartError {
             Self::Config(error) => write!(f, "the configuration: {error}"),
             Self::Identity(error) => error.fmt(f),
             Self::Bind(error) => write!(f, "binding: {error}"),
+            Self::Tls(error) => write!(f, "TLS: {error}"),
         }
     }
 }
@@ -312,7 +334,9 @@ pub struct Started {
     pub udp: SocketAddr,
     /// The bound TCP address.
     pub tcp: SocketAddr,
-    serve: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>,
+    /// Whether the TCP port serves TLS links too.
+    pub tls: bool,
+    serve: Serving,
 }
 
 impl Started {
@@ -335,6 +359,9 @@ impl Started {
 pub async fn start(config: &FileConfig) -> Result<Started, RelayStartError> {
     let policy = config.policy().map_err(RelayStartError::Config)?;
     let limits = config.relay_config().map_err(RelayStartError::Config)?;
+    // Before the identity and the sockets: a relay that cannot serve what it
+    // is configured for creates nothing and binds nothing.
+    let tls = config.tls.as_ref().map(load_tls).transpose()?;
     let (identity, created) =
         load_or_create(&config.identity).map_err(RelayStartError::Identity)?;
     let address = *identity.address();
@@ -361,8 +388,88 @@ pub async fn start(config: &FileConfig) -> Result<Started, RelayStartError> {
         created,
         udp: udp_at,
         tcp: tcp_at,
-        serve: Box::pin(crate::relay_server::serve(relay, udp, listener)),
+        tls: tls.is_some(),
+        serve: serve(relay, udp, listener, tls),
     })
+}
+
+/// What serves the relay: with TLS when it has a certificate.
+type Serving = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+
+#[cfg(feature = "tls")]
+type Acceptor = crate::tls::TlsAcceptor;
+#[cfg(not(feature = "tls"))]
+type Acceptor = std::convert::Infallible;
+
+#[cfg(feature = "tls")]
+fn serve(
+    relay: Relay<FilePolicy, OsEntropy>,
+    udp: UdpSocket,
+    listener: TcpListener,
+    tls: Option<Acceptor>,
+) -> Serving {
+    Box::pin(crate::relay_server::serve_with(relay, udp, listener, tls))
+}
+
+#[cfg(not(feature = "tls"))]
+fn serve(
+    relay: Relay<FilePolicy, OsEntropy>,
+    udp: UdpSocket,
+    listener: TcpListener,
+    _tls: Option<Acceptor>,
+) -> Serving {
+    Box::pin(crate::relay_server::serve(relay, udp, listener))
+}
+
+/// The certificate and the key of `[tls]`, read and checked.
+#[cfg(feature = "tls")]
+fn load_tls(file: &TlsFile) -> Result<Acceptor, RelayStartError> {
+    use crate::tls::{TlsAcceptor, TlsError};
+    let read = |path: &std::path::Path| {
+        std::fs::read(path)
+            .map_err(|error| RelayStartError::Tls(format!("{}: {error}", path.display())))
+    };
+    let certificate = read(&file.certificate)?;
+    private(&file.key)?;
+    let key = read(&file.key)?;
+    TlsAcceptor::from_pem(&certificate, &key).map_err(|error| {
+        let at = match error {
+            TlsError::Certificate(_) => &file.certificate,
+            TlsError::Key(_) | TlsError::Mismatch => &file.key,
+        };
+        RelayStartError::Tls(format!("{}: {error}", at.display()))
+    })
+}
+
+#[cfg(not(feature = "tls"))]
+fn load_tls(_file: &TlsFile) -> Result<Acceptor, RelayStartError> {
+    Err(RelayStartError::Config(
+        "tls: this relay was built without the feature `tls`".into(),
+    ))
+}
+
+/// Refuses a key file that its group or others can read, as the identity
+/// file is refused.
+#[cfg(all(unix, feature = "tls"))]
+fn private(path: &std::path::Path) -> Result<(), RelayStartError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|error| RelayStartError::Tls(format!("{}: {error}", path.display())))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(RelayStartError::Tls(format!(
+            "{}: the key can be read by others than its owner; make it mode 0600",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "tls"))]
+#[allow(clippy::unnecessary_wraps, reason = "as on Unix")]
+fn private(_path: &std::path::Path) -> Result<(), RelayStartError> {
+    Ok(())
 }
 
 /// An address in hex, as the configuration and the binary print it.

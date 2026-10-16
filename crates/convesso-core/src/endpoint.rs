@@ -40,8 +40,9 @@ mod relayed;
 
 pub use direct::ExcludeError;
 pub use relayed::{
-    ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintTooLong, KeepAliveTooShort, LINK_ANSWER_WITHIN,
-    LinkFailure, MIN_KEEPALIVE, RelayError, RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
+    ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintError, HintTooLong, KeepAliveTooShort,
+    LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RelayError, RelayPath,
+    UDP_PROBE_EVERY, UDP_PROVEN_FOR,
 };
 use relayed::{Answer, RelayClient};
 
@@ -346,10 +347,17 @@ pub struct Endpoint<C: Config> {
     indices: C::Indices<u32, Owner>,
     /// A response owed to the source of the last packet, sent by the next poll.
     owed: Option<([u8; RESPONSE_LEN], Hop)>,
-    /// Direct address hints for peers, given by the application.
-    hints: C::Hints<PeerId, relayed::Hint>,
+    /// First contacts owed to the hints after the first, one per dial attempt,
+    /// by the order they were made in.
+    fans: C::Dials<u32, relayed::Fan>,
+    fan_seq: u32,
+    /// Direct address hints for peers, given by the application: a peer's
+    /// hints in the order given.
+    hints: C::Hints<(PeerId, u8), relayed::Hint>,
     /// The pinned relay, if any.
     relay: Option<RelayClient>,
+    /// The driver is to be asked to close the link of a relay removed.
+    link_close_owed: bool,
     /// The session whose transport packet opened last, if the last packet was
     /// one, and whether its counter was the newest.
     last_opened: Option<(Key, bool)>,
@@ -377,8 +385,11 @@ impl<C: Config> Endpoint<C> {
             sessions: Default::default(),
             indices: Default::default(),
             owed: None,
+            fans: Default::default(),
+            fan_seq: 0,
             hints: Default::default(),
             relay: None,
+            link_close_owed: false,
             last_opened: None,
             own: direct::Own::new(),
             excluded: Default::default(),

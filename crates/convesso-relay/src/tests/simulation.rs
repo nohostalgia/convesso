@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use convesso_core::relay::framing::KEEPALIVE;
 
 use super::world::*;
-use crate::{Config, Open};
+use crate::{Config, Open, Relay};
 
 // --- lossy links ----------------------------------------------------------------------
 
@@ -311,3 +311,115 @@ fn an_idle_month_without_a_link_costs_nothing() {
 // a packet of one key on another key's link (`relay::a_link_cannot_be_borrowed`);
 // a scanner dialling a client in the relay context
 // (`client::another_key_cannot_pose_as_the_relay`).
+
+// --- a relay replaced while running ---------------------------------------------------
+
+/// A relay with key 4 of the vectors, where the world's has key 0.
+fn second_relay() -> Relay<Open, TestEntropy> {
+    Relay::new(identity(4), Open, TestEntropy(44), Config::default(), t(0)).unwrap()
+}
+
+/// Three clients: 0 talks to 1 through the relay, 1 reachable, and to 2 on a
+/// direct path.
+fn three_clients() -> World<Open> {
+    let mut world = World::new(Open, Config::default(), 3);
+    world.open_link(1);
+    world.run_for(1000);
+    world.send(0, 1, b"through the relay").unwrap();
+    world.run_for(1000);
+    world.hint(0, 2);
+    world.hint(2, 0);
+    world.send(0, 2, b"direct").unwrap();
+    world.run_for(1000);
+    assert!(
+        world.clients[1]
+            .datagrams()
+            .contains(&(b"through the relay".to_vec(), true))
+    );
+    assert!(
+        world.clients[2]
+            .datagrams()
+            .contains(&(b"direct".to_vec(), false))
+    );
+    world
+}
+
+/// Scenario: a replaced relay carries on the relayed sessions: the peer moves
+/// first, then the client; the relayed session goes on through the new
+/// relay, and the direct one keeps its path.
+#[test]
+fn a_replaced_relay_carries_on_the_relayed_sessions() {
+    let mut world = three_clients();
+    world.replace_relay(second_relay());
+    world.move_to_relay(1);
+    world.run_for(5000);
+    assert!(world.clients[1].events.contains(&Ev::RelayAvailable));
+    world.move_to_relay(0);
+    world.run_for(1000);
+    world.send(0, 1, b"after the move").unwrap();
+    world.send(0, 2, b"still direct").unwrap();
+    world.run_for(2000);
+    assert!(
+        world.clients[1]
+            .datagrams()
+            .contains(&(b"after the move".to_vec(), true))
+    );
+    assert!(
+        world.clients[2]
+            .datagrams()
+            .contains(&(b"still direct".to_vec(), false))
+    );
+}
+
+/// Scenario: a peer still on the old relay is unreachable through the new
+/// one: the relay says it is not connected, and the session is not taken for
+/// closed.
+#[test]
+fn a_peer_still_on_the_old_relay_is_unreachable_through_the_new_one() {
+    let mut world = three_clients();
+    world.replace_relay(second_relay());
+    world.move_to_relay(0);
+    world.run_for(5000);
+    let before = world.clients[1].datagrams().len();
+    world.send(0, 1, b"anyone?").unwrap();
+    world.run_for(3000);
+    let peer = world.clients[1].peer_id();
+    assert!(world.clients[0].events.contains(&Ev::NotAtRelay(peer)));
+    assert_eq!(world.clients[1].datagrams().len(), before);
+    assert!(
+        !world.clients[0]
+            .events
+            .iter()
+            .any(|e| matches!(e, Ev::Closed(p, _) if *p == peer))
+    );
+    // Once it moves too, it is reached again.
+    world.move_to_relay(1);
+    world.run_for(5000);
+    world.send(0, 1, b"found you").unwrap();
+    world.run_for(2000);
+    assert!(
+        world.clients[1]
+            .datagrams()
+            .contains(&(b"found you".to_vec(), true))
+    );
+}
+
+/// An idle month after a swap costs what one without: one link's
+/// keep-alives, one a minute, and nothing else.
+#[test]
+fn an_idle_month_after_a_swap_costs_one_links_keepalives() {
+    let mut world = World::new(Open, Config::default(), 1);
+    world.open_link(0);
+    world.run_for(60_000);
+    world.replace_relay(second_relay());
+    world.move_to_relay(0);
+    world.run_for(60_000);
+    assert!(world.clients[0].events.contains(&Ev::RelayAvailable));
+    let start = world.clients[0].sent;
+    let opens = world.clients[0].opens.len();
+    world.run_for(MONTH);
+    let end = world.clients[0].sent;
+    assert_eq!(end.keepalives - start.keepalives, 43_200);
+    assert_eq!((end.udp, end.tcp), (start.udp, start.tcp));
+    assert_eq!(world.clients[0].opens.len(), opens, "no link replaced");
+}

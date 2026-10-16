@@ -107,7 +107,7 @@ fuzz_target!(|data: &[u8]| {
     let mut b = endpoint(B_SCALAR, B_ADDRESS);
     let (mut ea, mut eb) = (Counter(1), Counter(2));
     let b_address = Address::parse(B_ADDRESS).expect("valid");
-    a.set_hint(b_address.peer_id(), &B_SOURCE, now)
+    a.set_hints(b_address.peer_id(), &[&B_SOURCE], now)
         .expect("a direct source");
 
     // A connects; B answers; A confirms with a keepalive.

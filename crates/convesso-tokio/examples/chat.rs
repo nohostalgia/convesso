@@ -70,6 +70,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                 parsed.relay = Some(RelayLocation {
                     address: address(key)?,
                     host: host.to_owned(),
+                    tls: false,
                 });
             }
             "--peer" => parsed.peer = Some(address(value)?),

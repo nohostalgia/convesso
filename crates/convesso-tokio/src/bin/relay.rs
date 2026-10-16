@@ -41,7 +41,11 @@ async fn main() -> ExitCode {
         println!("created a new identity in {}", config.identity.display());
     }
     println!("convesso relay {}", hex(&started.address));
-    println!("listening on udp {} and tcp {}", started.udp, started.tcp);
+    let tls = if started.tls { ", TLS too" } else { "" };
+    println!(
+        "listening on udp {} and tcp {}{tls}",
+        started.udp, started.tcp
+    );
     match started.serve().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

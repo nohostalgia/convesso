@@ -479,7 +479,12 @@ pub struct RelayHost {
 /// Starts a relay host on the current `LocalSet`, with identity 0, on `ips`
 /// at `port` (UDP, and TCP on the first address).
 pub fn spawn_relay(net: &Net, ips: &[IpAddr], port: u16) -> RelayHost {
-    let identity = identity(0);
+    spawn_relay_with(net, 0, ips, port)
+}
+
+/// [`spawn_relay`] with identity `key`.
+pub fn spawn_relay_with(net: &Net, key: usize, ips: &[IpAddr], port: u16) -> RelayHost {
+    let identity = identity(key);
     let address = *identity.address();
     let relay = convesso_relay::Relay::new(
         identity,

@@ -52,6 +52,7 @@ async fn relay(limits: Limits) -> RelayLocation {
     RelayLocation {
         address,
         host: format!("127.0.0.1:{port}"),
+        tls: false,
     }
 }
 

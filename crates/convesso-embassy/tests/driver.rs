@@ -573,3 +573,59 @@ async fn a_device_reset_mid_session_is_reached_again() {
     })
     .await;
 }
+
+// --- the relay changed while running --------------------------------------------------
+
+/// Where `relay` is, as the driver takes it.
+fn location(relay: &RelayHost) -> RelayLocation {
+    RelayLocation {
+        address: relay.address,
+        primary: relay.udp[0],
+        other: relay.udp.get(1).copied(),
+    }
+}
+
+/// Whether a datagram arrives within `ms` milliseconds.
+async fn any_datagram(events: &mut TestEvents, ms: u64) -> bool {
+    timeout(Duration::from_millis(ms), datagram(events, 60))
+        .await
+        .is_ok()
+}
+
+/// Scenario: the embedded driver moves too: its link to the old relay is
+/// closed, it registers on the new one, and its relayed session carries on
+/// through it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_embedded_driver_moves_too() {
+    local(async {
+        let (net, r1) = world();
+        let r2 = support::spawn_relay_with(&net, 4, &[ip("192.0.2.2"), ip("2001:db8::2")], 7400);
+        net.no_direct(true);
+        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &r1, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &r1, 8192).await;
+        b.set_reachable(true).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let b_address = b.address().await;
+        a.send(&b_address, b"through r1").await.unwrap();
+        assert_eq!(
+            datagram(&mut b_events, 5).await,
+            (b"through r1".to_vec(), true)
+        );
+        let connects = net.connects();
+
+        b.node.set_relay(Some(location(&r2))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(net.connects(), connects + 1, "a link to the new relay");
+        // A, still on R1, no longer reaches B there: B left it.
+        a.send(&b_address, b"lost").await.unwrap();
+        assert!(!any_datagram(&mut b_events, 500).await, "B left R1");
+
+        a.node.set_relay(Some(location(&r2))).await.unwrap();
+        a.send(&b_address, b"through r2").await.unwrap();
+        assert_eq!(
+            datagram(&mut b_events, 5).await,
+            (b"through r2".to_vec(), true)
+        );
+    })
+    .await;
+}

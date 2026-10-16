@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use convesso_core::endpoint::SendError;
+use convesso_core::endpoint::{HintError, SendError};
 use convesso_core::handshake::{Admission, Decision, Entropy, RefusalCode, ResponderError};
 use convesso_core::identity::{Identity, PeerId};
 use convesso_core::relay::Link;
@@ -30,7 +30,12 @@ fn identity(seed: u8) -> Identity {
 
 /// A relay on the loopback, UDP and TCP on one port; returns where it is.
 async fn relay() -> RelayLocation {
-    let identity = identity(100);
+    relay_with(100).await
+}
+
+/// A relay with the key of `seed`.
+async fn relay_with(seed: u8) -> RelayLocation {
+    let identity = identity(seed);
     let address = *identity.address();
     // UDP and TCP on one port: a port the system gives for UDP may be one it
     // reserves for TCP (Windows), so try until both bind.
@@ -53,6 +58,7 @@ async fn relay() -> RelayLocation {
     RelayLocation {
         address,
         host: format!("127.0.0.1:{port}"),
+        tls: false,
     }
 }
 
@@ -607,4 +613,171 @@ async fn a_full_event_stream_loses_no_event_without_data() {
             );
         }
     }
+}
+
+// --- the relay and the hints changed while running ------------------------------------
+
+/// The next node event `pick` takes, skipping others, within two seconds;
+/// with every event skipped on the way.
+async fn node_event<T>(
+    events: &mut Events,
+    mut pick: impl FnMut(&NodeEvent) -> Option<T>,
+) -> (T, Vec<NodeEvent>) {
+    let mut skipped = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.next().await.expect("the node stopped");
+            if let Some(found) = pick(&event) {
+                return (found, skipped);
+            }
+            skipped.push(event);
+        }
+    })
+    .await
+    .expect("a node event within two seconds")
+}
+
+/// Scenario: a node moves to another relay without restarting: its socket
+/// and contexts stay, its registration on the old relay ends, it registers on
+/// the new one, and the session carries datagrams through it.
+#[tokio::test]
+async fn a_node_moves_to_another_relay_without_restarting() {
+    let r1 = relay_with(100).await;
+    let r2 = relay_with(101).await;
+    let (a, _a_node, a_app, _a_events) = node(40, Some(&r1), 64).await;
+    let (b, mut b_node, _b_app, mut b_events) = node(41, Some(&r1), 64).await;
+    reachable(&b).await;
+    a_app
+        .send(b.address(), b"through r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        datagram(&mut b_events).await,
+        (b"through r1".to_vec(), true)
+    );
+    let b_local = b.local_addr();
+    // R1's events, read.
+    while let Ok(Some(_)) = timeout(Duration::from_millis(50), b_node.next()).await {}
+
+    b.set_relay(Some(r2.clone())).await.unwrap();
+    let ((), skipped) = node_event(&mut b_node, |event| {
+        matches!(event, NodeEvent::RelayAvailable).then_some(())
+    })
+    .await;
+    assert!(
+        !skipped
+            .iter()
+            .any(|event| matches!(event, NodeEvent::RelayUnavailable { .. })),
+        "a move is not unavailability: {skipped:?}"
+    );
+    assert_eq!(b.local_addr(), b_local, "the same socket");
+    assert_eq!(b.stats().await.unwrap().links_opened, 2);
+
+    // A, still on R1, no longer reaches B there.
+    a_app.send(b.address(), b"lost".to_vec()).await.unwrap();
+    settle(300).await;
+    assert!(
+        !waiting(&mut b_events)
+            .await
+            .iter()
+            .any(|event| matches!(event, ContextEvent::Datagram { .. })),
+        "B left R1"
+    );
+
+    a.set_relay(Some(r2)).await.unwrap();
+    a_app
+        .send(b.address(), b"through r2".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        datagram(&mut b_events).await,
+        (b"through r2".to_vec(), true)
+    );
+}
+
+/// Scenario: several hints reach a peer on a network with no relay: of three
+/// addresses only the last reaches it, and the datagram arrives without
+/// waiting for the first two to fail (the next attempt is a second away).
+#[tokio::test]
+async fn several_hints_reach_a_peer_on_a_network_with_no_relay() {
+    let (a, _a_node, a_app, _a_events) = node(42, None, 64).await;
+    let (b, _b_node, _b_app, mut b_events) = node(43, None, 64).await;
+    // Two sockets that never answer.
+    let silent = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    a.set_hints(
+        b.address().peer_id(),
+        vec![
+            silent[0].local_addr().unwrap(),
+            silent[1].local_addr().unwrap(),
+            b.local_addr(),
+        ],
+    )
+    .await
+    .unwrap();
+    a_app
+        .send(b.address(), b"one of three".to_vec())
+        .await
+        .unwrap();
+    let got = timeout(Duration::from_millis(500), datagram(&mut b_events))
+        .await
+        .expect("before the second attempt");
+    assert_eq!(got, (b"one of three".to_vec(), false));
+}
+
+/// Scenario: hints refused leave the old ones: nine are refused, naming the
+/// limit, and the one given before still reaches the peer.
+#[tokio::test]
+async fn hints_refused_leave_the_old_ones() {
+    let (a, _a_node, a_app, _a_events) = node(44, None, 64).await;
+    let (b, _b_node, _b_app, mut b_events) = node(45, None, 64).await;
+    a.set_hint(b.address().peer_id(), b.local_addr())
+        .await
+        .unwrap();
+    let nine = (0..9u16)
+        .map(|i| SocketAddr::from(([127, 0, 0, 1], 9000 + i)))
+        .collect();
+    assert_eq!(
+        a.set_hints(b.address().peer_id(), nine).await,
+        Err(NodeError::Hint(HintError::TooMany { hints: 9, max: 8 }))
+    );
+    a_app
+        .send(b.address(), b"still hinted".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        datagram(&mut b_events).await,
+        (b"still hinted".to_vec(), false)
+    );
+}
+
+/// Without the feature `tls`, a relay asking for TLS is refused at start and
+/// at a move, naming the feature, and the old relay stays.
+#[cfg(not(feature = "tls"))]
+#[tokio::test]
+async fn tls_without_the_feature_is_refused() {
+    let plain = relay().await;
+    let wrapped = RelayLocation {
+        tls: true,
+        ..plain.clone()
+    };
+    let started = convesso_tokio::start(
+        identity(46),
+        Config {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            relay: Some(wrapped.clone()),
+            ..Config::default()
+        },
+    )
+    .await;
+    assert!(matches!(started, Err(StartError::NoTls)));
+    let (a, mut a_node, _a_app, _a_events) = node(46, Some(&plain), 64).await;
+    assert_eq!(a.set_relay(Some(wrapped)).await, Err(NodeError::NoTls));
+    a.set_reachable(true).await.unwrap();
+    node_event(&mut a_node, |event| {
+        matches!(event, NodeEvent::RelayAvailable).then_some(())
+    })
+    .await;
 }

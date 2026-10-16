@@ -160,11 +160,25 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
   link the client was registered on is replaced at once.
 - **The application knows whether its relay is available.** It is told when the client is
   registered, and each time an attempt ends or a registered link is lost, with the reason.
+- **One relay at a time, changed while running.** An application moving its devices from one relay
+  to another tells each node the new relay; the node forgets the old one and registers on the new
+  one, without restarting and without closing a session. A node does not keep two relays: while
+  some peers have moved and others not, those on different relays reach each other only directly,
+  and the application keeps that window short. A relay that forwards between relays could close it
+  later without a change on the wire.
+- **TLS around the link is camouflage, never trust.** On a network that lets out only TLS, the
+  tokio driver can wrap the TCP link in TLS 1.3 (feature `tls`), and the relay serves both kinds of
+  link on one port. The node accepts any certificate: the relay's pinned key, checked in the relay
+  session inside, is what is trusted, so a proxy that inspects TLS sees only sealed packets. The
+  embedded driver has no TLS: it would cost a microcontroller far more than it hides.
 
 ## 7. Paths
 
 - **The relay first, then a direct path.** A session opens through the relay. The two sides
   exchange the addresses each might be reached at, and probe them at the same moment.
+- **An application that knows where a peer may be says so.** It may give up to 8 address hints per
+  peer, such as one per interface or family; a dial tries them all at once, then the relay, so a
+  wrong hint costs nothing but a packet.
 - **A path is used only once it has been seen to work both ways:** an answer to a probe came back
   from that address.
 - **The best working path is preferred:** an address on the same local network, then IPv6, then
