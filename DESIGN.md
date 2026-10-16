@@ -225,7 +225,8 @@ does not serve meets silence, as a stranger does.
 - **A node serves contexts while it runs.** It starts serving none. The application opens a
   context, gets a handle for it, and closes it by dropping the handle: a library started later, or
   a feature switched on at runtime, takes its protocol without restarting the node, and a library
-  that stops releases it. Closing a context closes its sessions, each with one authenticated close.
+  that stops releases it. Closing a context closes its sessions, each with one authenticated close:
+  with the application's code, or `0x0001`, a close without a code, when the handle is dropped.
 - **Each context has its own access:** a policy that admits peers, one peer it is bound to, or
   none, when the application only dials in it. Changing the access judges again the sessions this
   side accepted in that context, and closes those no longer admitted; sessions this side dialled go
