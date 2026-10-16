@@ -13,17 +13,73 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use convesso_core::endpoint::{ExcludeError, SendError};
+use convesso_core::handshake::ChannelBinding;
+use convesso_core::identity::{Address, PeerId};
 use convesso_core::storage::Mcu;
 use convesso_embassy::rng::{RngFailed, SecureRng};
 use convesso_embassy::{
-    Config, Events, Node, NodeError, NodeEvent, RelayLocation, Shared, StartError,
+    Config, Context, ContextEvent, ContextEvents, ContextOptions, ContextSlot, Node, NodeError,
+    RelayLocation, Shared, StartError, Stats,
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use support::{MemDatagrams, MemInterfaces, Net, RelayHost};
 use tokio::time::timeout;
 
 type TestNode = Node<'static, NoopRawMutex, Mcu, MemDatagrams>;
-type TestEvents = Events<'static, NoopRawMutex, Mcu, MemDatagrams>;
+type TestContext = Context<'static, NoopRawMutex, Mcu, MemDatagrams>;
+type TestEvents = ContextEvents<'static, NoopRawMutex, Mcu, MemDatagrams>;
+
+/// A node and its one context, `app`, with what the tests here use of both.
+struct Peer {
+    node: TestNode,
+    app: TestContext,
+}
+
+impl Peer {
+    async fn address(&self) -> Address {
+        self.node.address().await
+    }
+
+    async fn send(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
+        self.app.send(to, data).await
+    }
+
+    async fn send_to_peer(&self, peer: PeerId, data: &[u8]) -> Result<(), NodeError> {
+        self.app.send_to_peer(peer, data).await
+    }
+
+    async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
+        self.node.set_hint(peer, at).await
+    }
+
+    async fn set_reachable(&self, on: bool) {
+        self.node.set_reachable(on).await;
+    }
+
+    async fn stats(&self) -> Stats {
+        self.node.stats().await
+    }
+
+    async fn relay_udp_proven(&self) -> bool {
+        self.node.relay_udp_proven().await
+    }
+
+    async fn network_changed(&self) {
+        self.node.network_changed().await;
+    }
+
+    async fn exclude_prefix(&self, ip: IpAddr, len: u8) -> Result<(), NodeError> {
+        self.node.exclude_prefix(ip, len).await
+    }
+
+    async fn set_excluded(&self, prefixes: &[(IpAddr, u8)]) -> Result<(), NodeError> {
+        self.node.set_excluded(prefixes).await
+    }
+
+    async fn channel_binding(&self, peer: PeerId) -> Option<ChannelBinding> {
+        self.app.channel_binding(peer).await
+    }
+}
 
 fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
@@ -59,56 +115,73 @@ fn leak<T>(value: T) -> &'static mut T {
 }
 
 /// Starts node `key` of the vectors on `ips` at `port`, pinned to `relay`,
-/// with `events` bytes for its events, its runner spawned on the `LocalSet`.
-fn node(
+/// with the context `app` and `events` bytes for its events, its runner
+/// spawned on the `LocalSet`.
+async fn node(
     net: &Net,
     key: usize,
     ips: &[IpAddr],
     port: u16,
     relay: &RelayHost,
     events: usize,
-) -> (TestNode, TestEvents) {
-    let (node, events, _) = node_with(net, key, port, relay, events, MemInterfaces::new(ips));
+) -> (Peer, TestEvents) {
+    let (node, events, _) = node_with(net, key, port, relay, events, MemInterfaces::new(ips)).await;
     (node, events)
 }
 
 /// [`node`] with the interfaces given, which the test may change, and the
 /// runner's task, which it may abort: a reset.
-fn node_with(
+async fn node_with(
     net: &Net,
     key: usize,
     port: u16,
     relay: &RelayHost,
     events: usize,
     interfaces: MemInterfaces,
-) -> (TestNode, TestEvents, tokio::task::JoinHandle<()>) {
+) -> (Peer, TestEvents, tokio::task::JoinHandle<()>) {
     let ips = interfaces.0.borrow().clone();
     let datagrams: &'static MemDatagrams = leak(net.bind(&ips, port));
     let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
-    let (node, runner, events) = convesso_embassy::start(
+    let (node, runner, _node_events) = convesso_embassy::start(
         support::identity(key),
         Config {
-            context: b"app",
             relay: Some(RelayLocation {
                 address: relay.address,
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
-            credit: false,
         },
         datagrams,
         net.stream(ips[0]),
         interfaces,
         leak(TestRng(key as u64 * 1000 + u64::from(port))),
-        None,
-        leak(vec![0u8; events]).as_mut_slice(),
+        leak(vec![0u8; 64]).as_mut_slice(),
         slot,
     )
     .unwrap_or_else(|_| panic!("node {key} starts"));
     let task = tokio::task::spawn_local(async move {
         let _: () = runner.run().await;
     });
-    (node, events, task)
+    let (app, events) = open(node, b"app", events).await;
+    (Peer { node, app }, events, task)
+}
+
+/// Opens `name` on `node`, with `events` bytes for its events.
+async fn open(node: TestNode, name: &[u8], events: usize) -> (TestContext, TestEvents) {
+    node.context(
+        name,
+        ContextOptions {
+            access: convesso_embassy::Access::Everyone,
+            events: leak(vec![0u8; events]).as_mut_slice(),
+            slot: leak(ContextSlot::new()),
+            #[cfg(feature = "stream")]
+            credit: false,
+            #[cfg(feature = "stream")]
+            max_message: None,
+        },
+    )
+    .await
+    .unwrap()
 }
 
 /// The next datagram event, skipping others, within `secs` seconds.
@@ -116,7 +189,8 @@ async fn datagram(events: &mut TestEvents, secs: u64) -> (Vec<u8>, bool) {
     timeout(Duration::from_secs(secs), async {
         let mut buf = [0u8; 1500];
         loop {
-            if let NodeEvent::Datagram { data, relayed, .. } = events.next(&mut buf).await {
+            if let Some(ContextEvent::Datagram { data, relayed, .. }) = events.next(&mut buf).await
+            {
                 return (data.to_vec(), relayed);
             }
         }
@@ -142,8 +216,8 @@ async fn two_applications_exchange_datagrams_through_a_relay() {
     local(async {
         let (net, relay) = world();
         net.no_direct(true);
-        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192);
+        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192).await;
         b.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         a.send(&b.address().await, b"hello from a").await.unwrap();
@@ -166,7 +240,7 @@ async fn two_applications_exchange_datagrams_through_a_relay() {
 async fn a_sends_error_reaches_the_application() {
     local(async {
         let (net, relay) = world();
-        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
+        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
         let b = support::identity(2);
         let before = net.sent(|from, _| from.ip() == ip("10.0.0.1"));
         let result = a.send(b.address(), &[0u8; 1500]).await;
@@ -179,70 +253,51 @@ async fn a_sends_error_reaches_the_application() {
     .await;
 }
 
-/// Scenario: a slow reader loses no event. While the application reads
-/// nothing, the driver stops reading the socket, and the datagrams wait on the
-/// network; when it reads again, every one arrives, in order.
+/// Scenario: a full buffer holds back no other context. B reads none of one
+/// context's events for 65 s while A sends it datagrams in both, through the
+/// relay: the unread context's datagrams beyond its buffer are dropped and
+/// counted, the other's keep arriving, B's relay keep-alives go on, and its
+/// sends complete.
 #[tokio::test(flavor = "current_thread")]
-async fn a_slow_reader_loses_no_event() {
+async fn a_full_buffer_holds_back_no_other_context() {
     local(async {
         let (net, relay) = world();
-        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        // Room for two datagrams' worth of events beyond the largest.
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 2048 + 400);
-        let b_address = b.address().await;
-        let b_hint = SocketAddr::new(ip("10.0.1.1"), 7500);
-        a.set_hint(b_address.peer_id(), b_hint).await.unwrap();
-        for i in 0u8..20 {
-            a.send(&b_address, &[i; 100]).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            net.waiting(b_hint) > 0,
-            "the driver stopped reading the socket"
-        );
-        for i in 0u8..20 {
-            let (data, _) = datagram(&mut b_events, 5).await;
-            assert_eq!(data, vec![i; 100], "datagram {i}");
-        }
-    })
-    .await;
-}
-
-/// Scenario: a full event buffer stops only the reading. B reads no event
-/// for 65 s while A sends it datagrams: B's relay keep-alives go on, its
-/// sends complete, and afterwards every datagram is there, in order.
-#[tokio::test(flavor = "current_thread")]
-async fn a_full_event_buffer_stops_only_the_reading() {
-    local(async {
-        let (net, relay) = world();
-        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 2048 + 400);
+        net.no_direct(true);
+        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        // Room for the largest datagram's worth of events, and a little.
+        let (b, _b_slow) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 2048 + 400).await;
+        let (a_other, _a_other_events) = open(a.node, b"other", 8192).await;
+        let (_b_other, mut b_other) = open(b.node, b"other", 8192).await;
+        a.set_reachable(true).await;
         b.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let keepalives = b.stats().await.keepalives_sent;
         let (a_address, b_address) = (a.address().await, b.address().await);
-        let b_hint = SocketAddr::new(ip("10.0.1.1"), 7500);
-        let a_hint = SocketAddr::new(ip("10.0.0.1"), 7500);
-        a.set_hint(b_address.peer_id(), b_hint).await.unwrap();
-        b.set_hint(a_address.peer_id(), a_hint).await.unwrap();
+        // B reads the other context as its datagrams come.
+        let reader = tokio::task::spawn_local(async move {
+            let mut got = Vec::new();
+            for _ in 0u8..30 {
+                got.push(datagram(&mut b_other, 5).await.0);
+            }
+            got
+        });
         for i in 0u8..30 {
             a.send(&b_address, &[i; 100]).await.unwrap();
+            a_other.send(&b_address, &[i; 100]).await.unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_secs(65)).await;
-        assert!(net.waiting(b_hint) > 0, "B stopped reading its socket");
-        assert!(
-            b.stats().await.keepalives_sent > keepalives,
-            "the keep-alives go on"
+        assert_eq!(
+            reader.await.unwrap(),
+            (0u8..30).map(|i| vec![i; 100]).collect::<Vec<_>>(),
+            "every datagram of the other context, in order"
         );
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        let stats = b.stats().await;
+        assert!(stats.datagrams_dropped >= 1, "{stats:?}");
+        assert!(stats.keepalives_sent > keepalives, "the keep-alives go on");
         b.send(&a_address, b"meanwhile").await.unwrap();
         let (data, _) = datagram(&mut a_events, 5).await;
         assert_eq!(data, b"meanwhile", "a send completes");
-        for i in 0u8..30 {
-            let (data, _) = datagram(&mut b_events, 5).await;
-            assert_eq!(data, vec![i; 100], "datagram {i}");
-        }
     })
     .await;
 }
@@ -261,20 +316,17 @@ async fn generator_failure() {
     let result = convesso_embassy::start(
         support::identity(1),
         Config {
-            context: b"app",
             relay: Some(RelayLocation {
                 address: relay.address,
                 primary: relay.udp[0],
                 other: None,
             }),
-            credit: false,
         },
         datagrams,
         net.stream(ip("10.0.0.1")),
         MemInterfaces::new(&[ip("10.0.0.1")]),
         leak(BrokenRng),
-        None,
-        leak(vec![0u8; 4096]).as_mut_slice(),
+        leak(vec![0u8; 64]).as_mut_slice(),
         slot,
     );
     assert!(matches!(result, Err(StartError::Rng(RngFailed))));
@@ -291,8 +343,8 @@ async fn a_reachable_node_is_reached_over_its_link() {
     local(async {
         let (net, relay) = world();
         net.no_direct(true);
-        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192);
+        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192).await;
         net.fail_sends_from(ip("10.0.1.1"), true);
         b.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -316,8 +368,8 @@ async fn a_refused_link_is_an_input_not_a_crash() {
         let (net, relay) = world();
         net.no_direct(true);
         net.refuse(relay.udp[0], true);
-        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192);
+        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192).await;
         b.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(3500)).await;
         let attempts = net.connects();
@@ -356,8 +408,8 @@ async fn a_relay_in_both_families() {
         let (net, relay) = world();
         net.no_direct(true);
         let ips = [ip("10.0.0.1"), ip("2001:db8:a::1")];
-        let (a, _a_events) = node(&net, 1, &ips, 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192);
+        let (a, _a_events) = node(&net, 1, &ips, 7500, &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192).await;
         b.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         a.send(&b.address().await, b"hello").await.unwrap();
@@ -375,12 +427,12 @@ async fn a_relay_in_both_families() {
 
 // --- local addresses and resets ---------------------------------------------------------
 
-async fn locals(node: &TestNode) -> Vec<SocketAddr> {
+async fn locals(node: &Peer) -> Vec<SocketAddr> {
     let mut out = [convesso_core::paths::Candidate {
         kind: convesso_core::paths::CandidateKind::Local,
         address: SocketAddr::new(ip("0.0.0.0"), 0),
     }; 8];
-    let n = node.candidates(&mut out).await;
+    let n = node.node.candidates(&mut out).await;
     out[..n]
         .iter()
         .filter(|c| c.kind == convesso_core::paths::CandidateKind::Local)
@@ -395,7 +447,7 @@ async fn the_candidates_are_the_interfaces_addresses() {
     local(async {
         let (net, relay) = world();
         let interfaces = MemInterfaces::new(&[ip("10.0.0.1"), ip("2001:db8:a::1")]);
-        let (a, _events, _) = node_with(&net, 1, 7500, &relay, 8192, interfaces.clone());
+        let (a, _events, _) = node_with(&net, 1, 7500, &relay, 8192, interfaces.clone()).await;
         assert_eq!(
             locals(&a).await,
             [
@@ -422,7 +474,7 @@ async fn an_excluded_prefix_leaves_the_candidates() {
     local(async {
         let (net, relay) = world();
         let ips = [ip("10.0.0.1"), ip("100.64.3.7")];
-        let (a, _events) = node(&net, 1, &ips, 7500, &relay, 8192);
+        let (a, _events) = node(&net, 1, &ips, 7500, &relay, 8192).await;
         let tunnel: SocketAddr = "100.64.3.7:7500".parse().unwrap();
         assert!(locals(&a).await.contains(&tunnel));
 
@@ -446,8 +498,8 @@ async fn an_excluded_prefix_leaves_the_candidates() {
 async fn two_nodes_agree_on_the_binding() {
     local(async {
         let (net, relay) = world();
-        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192);
+        let (a, _a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, &[ip("10.0.1.1")], 7500, &relay, 8192).await;
         let b_address = b.address().await;
         a.set_hint(b_address.peer_id(), SocketAddr::new(ip("10.0.1.1"), 7500))
             .await
@@ -472,9 +524,9 @@ async fn a_device_reset_mid_session_is_reached_again() {
         let (net, relay) = world();
         net.no_direct(true);
         let device_ips = [ip("10.0.1.1")];
-        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192);
+        let (a, mut a_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
         let (device, mut device_events, task) =
-            node_with(&net, 2, 7500, &relay, 8192, MemInterfaces::new(&device_ips));
+            node_with(&net, 2, 7500, &relay, 8192, MemInterfaces::new(&device_ips)).await;
         // A is reachable: the relay knows it before the device sends.
         a.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -498,7 +550,7 @@ async fn a_device_reset_mid_session_is_reached_again() {
         task.abort();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (device, mut device_events, _) =
-            node_with(&net, 2, 7500, &relay, 8192, MemInterfaces::new(&device_ips));
+            node_with(&net, 2, 7500, &relay, 8192, MemInterfaces::new(&device_ips)).await;
         let sent = net.sent(|from, _| from == device_at);
         net.inject(relay.udp[0], device_at, &captured);
         tokio::time::sleep(Duration::from_millis(500)).await;

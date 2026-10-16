@@ -23,8 +23,8 @@ pub mod record;
 pub mod rng;
 pub mod socket;
 
-pub use events::{ENTRIES, HELD, NodeError, NodeEvent};
+pub use events::{ContextEvent, ENTRIES, HELD, NODE_ENTRIES, NODE_HELD, NodeError, NodeEvent};
 pub use node::{
-    Config, DIRECT_PATH_MAX, EVENTS_LEN, Events, Node, RelayLocation, Runner, Shared, StartError,
-    Stats, start,
+    Access, Config, Context, ContextEvents, ContextOptions, ContextSlot, DIRECT_PATH_MAX, DROPPED,
+    EVENTS_LEN, Events, Node, RelayLocation, Runner, Shared, StartError, Stats, start,
 };

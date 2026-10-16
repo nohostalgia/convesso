@@ -24,7 +24,7 @@ use core::num::NonZeroU16;
 use core::time::Duration;
 
 pub use initiator::{Dial, DialError, DialEvent, DialPoll, Established};
-pub use responder::{Pending, Responder, ResponderError, ResponderOutput};
+pub use responder::{Access, Pending, Responder, ResponderError, ResponderOutput, Served};
 
 use crate::identity::PeerId;
 
@@ -46,9 +46,6 @@ pub const MAX_RESPONDER_OUTPUT: usize = 62;
 
 /// The longest context an application may bind a handshake to.
 pub const MAX_CONTEXT_LEN: usize = 32;
-
-/// The most contexts a responder serves.
-pub const MAX_CONTEXTS: usize = 4;
 
 /// The most pending handshakes a responder holds for one `PeerId`.
 pub const PENDING_PER_PEER: usize = 2;

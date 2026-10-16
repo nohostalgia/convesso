@@ -3,13 +3,15 @@
 //! Each run completes a real handshake between two endpoints first. Half the
 //! inputs then get the live session's receiver index grafted in, so that the
 //! fuzzer reaches decryption and anti-replay rather than stopping at the index
-//! lookup.
+//! lookup. The first four bytes are changes to the contexts B serves (serving,
+//! a change of access, closing), two before the packet and two between it and
+//! its replay, so that the packet meets every state a context can be in.
 
 #![no_main]
 
 use convesso_core::dos::Source;
 use convesso_core::endpoint::{Endpoint, Output, Poll};
-use convesso_core::handshake::{Admission, Decision, Entropy};
+use convesso_core::handshake::{Access, Admission, Decision, Entropy, RefusalCode};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::storage::Mcu;
 use convesso_core::time::Instant;
@@ -62,6 +64,35 @@ impl Admission for Accept {
     fn admit(&mut self, _peer: &PeerId, _context: &[u8]) -> Decision {
         Decision::Accept { psk: None }
     }
+}
+
+/// Refuses everyone, with an application's code.
+struct Refuse;
+impl Admission for Refuse {
+    fn admit(&mut self, _peer: &PeerId, _context: &[u8]) -> Decision {
+        Decision::Refuse {
+            code: RefusalCode::application(0x0100).expect("an application's code"),
+            psk: None,
+        }
+    }
+}
+
+const CONTEXTS: [&[u8]; 3] = [b"session", b"other", b"third"];
+
+/// Applies the change to B's contexts that `op` names; a refusal is fine.
+fn change(b: &mut Endpoint<Mcu>, op: u8, a: PeerId) {
+    let context = CONTEXTS[usize::from(op / 8) % CONTEXTS.len()];
+    let _ = match op % 8 {
+        0 => b.serve(context, Access::Policy),
+        1 => b.serve(context, Access::Bound(a)),
+        2 => b.set_access(context, None, 0x0200, &mut Accept),
+        3 => b.set_access(context, Some(Access::Policy), 0x0200, &mut Refuse),
+        4 => b.set_access(context, Some(Access::Policy), 0x0200, &mut Accept),
+        5 => b.set_access(context, Some(Access::Bound(a)), 0x0200, &mut Accept),
+        6 => b.close_context(context, 0x0201),
+        _ => b.accept_payload(context),
+    };
+    assert!(b.contexts_served() <= 4, "the profile's table holds 4");
 }
 
 fn endpoint(scalar: [u8; 32], address: [u8; 32]) -> Endpoint<Mcu> {
@@ -121,18 +152,37 @@ fuzz_target!(|data: &[u8]| {
         &mut answer,
     );
 
+    let a_peer = Address::parse(A_ADDRESS).expect("valid").peer_id();
+    let (ops, data) = data.split_at(data.len().min(4));
+    let op = |i: usize| ops.get(i).copied();
+
     // The fuzzed packet, with the live session's index grafted in half the time.
     let mut packet = data.to_vec();
     if packet.len() >= 31 && packet[0] == 0x01 && packet[1] == 0x04 && packet[2] & 1 == 1 {
         packet[2..6].copy_from_slice(&keepalive[2..6]);
     }
-    let _ = b.handle_packet(
-        &mut packet,
-        Source::Direct(&A_SOURCE),
-        now,
-        &mut Accept,
-        &mut eb,
-        &mut answer,
-    );
-    let _ = b.poll(now, &mut Accept, &mut eb, &mut answer);
+    for round in 0..2 {
+        for i in [2 * round, 2 * round + 1] {
+            if let Some(op) = op(i) {
+                change(&mut b, op, a_peer);
+            }
+        }
+        let mut copy = packet.clone();
+        let _ = b.handle_packet(
+            &mut copy,
+            Source::Direct(&A_SOURCE),
+            now,
+            &mut Accept,
+            &mut eb,
+            &mut answer,
+        );
+        for _ in 0..8 {
+            if !matches!(
+                b.poll(now, &mut Accept, &mut eb, &mut answer),
+                Poll::Transmit { .. } | Poll::Event(_)
+            ) {
+                break;
+            }
+        }
+    }
 });

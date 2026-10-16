@@ -65,6 +65,10 @@ pub(crate) struct Side<C: StreamConfig> {
     pub(crate) entropy: Counter,
     pub(crate) got: Vec<Got>,
     pub(crate) deliver: bool,
+    /// The contexts this side delivers nothing in, `deliver` or not.
+    pub(crate) held: Vec<Context>,
+    /// Each message, with its context.
+    pub(crate) got_in: Vec<(Context, Vec<u8>)>,
     /// Every frame this side sent, with when.
     pub(crate) sent: Vec<(u64, FrameKind, Vec<u8>)>,
     pub(crate) dials: usize,
@@ -78,6 +82,8 @@ impl<C: StreamConfig> Side<C> {
             entropy: Counter(seed),
             got: Vec::new(),
             deliver: true,
+            held: Vec::new(),
+            got_in: Vec::new(),
             sent: Vec::new(),
             dials: 0,
         }
@@ -90,6 +96,16 @@ impl<C: StreamConfig> Side<C> {
                 Got::Message(m) => Some(m.clone()),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The messages delivered in `context`.
+    pub(crate) fn messages_in(&self, context: &[u8]) -> Vec<Vec<u8>> {
+        let context = Context::new(context).unwrap();
+        self.got_in
+            .iter()
+            .filter(|(c, _)| *c == context)
+            .map(|(_, m)| m.clone())
             .collect()
     }
 
@@ -107,6 +123,7 @@ impl<C: StreamConfig> Side<C> {
 struct InFlight {
     at: u64,
     to_b: bool,
+    context: Context,
     kind: FrameKind,
     bytes: Vec<u8>,
 }
@@ -158,6 +175,21 @@ impl<A: StreamConfig, B: StreamConfig> Pair<A, B> {
         Instant::from_millis(self.now)
     }
 
+    /// A sends `message` to B in `context`.
+    pub(crate) fn a_sends_in(&mut self, context: &[u8], message: &[u8]) -> Result<(), SendError> {
+        let now = self.t();
+        let address = address(1);
+        let peer = self.b.peer;
+        self.a.channels.send_message(
+            peer,
+            Some(&address),
+            context,
+            message,
+            now,
+            &mut self.a.entropy,
+        )
+    }
+
     pub(crate) fn a_sends(&mut self, message: &[u8]) -> Result<(), SendError> {
         let now = self.t();
         let address = address(1);
@@ -192,19 +224,34 @@ impl<A: StreamConfig, B: StreamConfig> Pair<A, B> {
         let mut out = [0u8; MAX_DATA_LEN];
         let mut launched = Vec::new();
         let deadline = loop {
-            let poll = if from_a {
-                let deliver = self.a.deliver;
-                self.a.channels.poll(now, deliver, &mut out)
+            let side_deliver = if from_a {
+                (self.a.deliver, &self.a.held)
             } else {
-                let deliver = self.b.deliver;
-                self.b.channels.poll(now, deliver, &mut out)
+                (self.b.deliver, &self.b.held)
+            };
+            let (deliver, held) = (side_deliver.0, side_deliver.1.clone());
+            let in_context = |context: &Context| deliver && !held.contains(context);
+            let poll = if from_a {
+                self.a.channels.poll_with(now, in_context, &mut out)
+            } else {
+                self.b.channels.poll_with(now, in_context, &mut out)
             };
             let got = match poll {
-                Poll::SendFrame { kind, len, .. } => {
-                    launched.push((kind, out[..len].to_vec()));
+                Poll::SendFrame {
+                    kind, len, context, ..
+                } => {
+                    launched.push((context, kind, out[..len].to_vec()));
                     continue;
                 }
-                Poll::Event(Event::Message { data, .. }) => Got::Message(data.to_vec()),
+                Poll::Event(Event::Message { data, context, .. }) => {
+                    let data = data.to_vec();
+                    if from_a {
+                        self.a.got_in.push((context, data.clone()));
+                    } else {
+                        self.b.got_in.push((context, data.clone()));
+                    }
+                    Got::Message(data)
+                }
                 Poll::Event(Event::Writable { .. }) => Got::Writable,
                 Poll::Event(Event::Reset { reason, .. }) => Got::Reset(reason),
                 Poll::Dial { .. } => {
@@ -224,18 +271,18 @@ impl<A: StreamConfig, B: StreamConfig> Pair<A, B> {
                 self.b.got.push(got);
             }
         };
-        for (kind, bytes) in launched {
+        for (context, kind, bytes) in launched {
             if from_a {
                 self.a.sent.push((self.now, kind, bytes.clone()));
             } else {
                 self.b.sent.push((self.now, kind, bytes.clone()));
             }
-            self.launch(from_a, kind, bytes);
+            self.launch(from_a, context, kind, bytes);
         }
         deadline
     }
 
-    fn launch(&mut self, to_b: bool, kind: FrameKind, bytes: Vec<u8>) {
+    fn launch(&mut self, to_b: bool, context: Context, kind: FrameKind, bytes: Vec<u8>) {
         if (to_b && self.cut_to_b) || (!to_b && self.cut_to_a) {
             return;
         }
@@ -249,6 +296,7 @@ impl<A: StreamConfig, B: StreamConfig> Pair<A, B> {
             self.wire.push(InFlight {
                 at: self.now + self.delay + jitter,
                 to_b,
+                context,
                 kind,
                 bytes: bytes.clone(),
             });
@@ -269,19 +317,23 @@ impl<A: StreamConfig, B: StreamConfig> Pair<A, B> {
         }
         let moved = !due.is_empty();
         for frame in due {
-            self.inject(frame.to_b, frame.kind, &frame.bytes);
+            self.inject_in(frame.to_b, frame.context, frame.kind, &frame.bytes);
         }
         moved
     }
 
     pub(crate) fn inject(&mut self, to_b: bool, kind: FrameKind, bytes: &[u8]) {
+        self.inject_in(to_b, ctx(), kind, bytes);
+    }
+
+    fn inject_in(&mut self, to_b: bool, context: Context, kind: FrameKind, bytes: &[u8]) {
         let t = self.t();
         if to_b {
             let peer = self.a.peer;
-            self.b.channels.handle_frame(peer, ctx(), kind, bytes, t);
+            self.b.channels.handle_frame(peer, context, kind, bytes, t);
         } else {
             let peer = self.b.peer;
-            self.a.channels.handle_frame(peer, ctx(), kind, bytes, t);
+            self.a.channels.handle_frame(peer, context, kind, bytes, t);
         }
     }
 
@@ -354,6 +406,66 @@ fn a_fifth_channel_on_mcu_is_refused() {
         assert_eq!(channels.memory(address(i).peer_id(), ctx()), Some(5));
     }
     assert_eq!(channels.memory(fifth, ctx()), None);
+}
+
+crate::config! {
+    /// `Mcu` with messages up to 1,024 bytes and 2 channels.
+    Small: Mcu { max_message: 1024, channels: 2 }
+}
+
+/// Scenario: a configuration derived from `Mcu` changes only what it names.
+/// (That a name which is not a size fails to build is `config!`'s
+/// `compile_fail` example.)
+#[test]
+fn a_configuration_derived_from_mcu_changes_only_what_it_names() {
+    let mut channels: Channels<Small> = Channels::new();
+    let mut entropy = Counter(1);
+    let now = Instant::from_millis(0);
+    let first = address(0).peer_id();
+    assert_eq!(
+        channels.send_message(first, None, b"ctx", &[1; 1025], now, &mut entropy),
+        Err(SendError::TooLarge {
+            size: 1025,
+            max: 1024
+        })
+    );
+    for i in 0..2 {
+        channels
+            .send_message(
+                address(i).peer_id(),
+                None,
+                b"ctx",
+                &[1; 1024],
+                now,
+                &mut entropy,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        channels.send_message(
+            address(2).peer_id(),
+            None,
+            b"ctx",
+            b"hello",
+            now,
+            &mut entropy
+        ),
+        Err(SendError::TableFull)
+    );
+
+    // The buffers are `Mcu`'s.
+    use crate::config::{Arena, ByteQueue, Slots, StreamConfig};
+    assert_eq!(
+        <Small as StreamConfig>::SendQueue::default().capacity(),
+        2048
+    );
+    assert_eq!(
+        <Small as StreamConfig>::ReceiveArena::default().capacity(),
+        2048
+    );
+    assert_eq!(<Small as StreamConfig>::Lengths::default().capacity(), 32);
+    assert_eq!(<Small as StreamConfig>::InFlight::default().capacity(), 16);
+    assert_eq!(<Small as StreamConfig>::Stored::default().capacity(), 16);
 }
 
 /// A server channel's buffers return to nothing once a 256 KiB message is
@@ -619,16 +731,17 @@ fn losses_slow_the_sender_down() {
     assert!(lossy < lossless, "{lossy} under loss, {lossless} without");
 }
 
-/// A configuration with room to receive many fragments early.
-struct BigReceiver;
-impl StreamConfig for BigReceiver {
-    const MAX_MESSAGE: usize = 4096;
-    type SendQueue = crate::config::FixedQueue<16384>;
-    type Lengths = crate::config::FixedSlots<u32, 64>;
-    type InFlight = crate::config::FixedSlots<crate::Sent, 64>;
-    type ReceiveArena = crate::config::FixedArena<16384>;
-    type Stored = crate::config::FixedSlots<crate::Stored, 64>;
-    type Channels<V> = convesso_core::storage::FixedTable<crate::config::Key, V, 2>;
+crate::config! {
+    /// A configuration with room to receive many fragments early.
+    BigReceiver: Mcu {
+        max_message: 4096,
+        send_bytes: 16384,
+        send_messages: 64,
+        in_flight: 64,
+        receive_bytes: 16384,
+        stored: 64,
+        channels: 2,
+    }
 }
 
 /// A closed window is probed, at most every 15 s once backed off, and a
@@ -1413,4 +1526,121 @@ fn two_resets_in_a_row_keep_the_room_a_sender_is_owed() {
         }
     }
     assert!(writable, "the sender is told room opened");
+}
+
+// --- limits per context -----------------------------------------------------------------
+
+/// Scenario: two contexts, two largest messages.
+#[cfg(feature = "alloc")]
+#[test]
+fn two_contexts_two_largest_messages() {
+    use crate::config::Server;
+
+    let mut pair: Pair<Server, Server> = Pair::new(40);
+    pair.b
+        .channels
+        .set_context(b"small", Some(1024), false)
+        .unwrap();
+    // An acknowledgement in each context first: each advertises its size.
+    pair.a_sends_in(b"small", b"hello").unwrap();
+    pair.a_sends_in(b"large", b"hello").unwrap();
+    pair.run_for(1000);
+
+    assert_eq!(
+        pair.a_sends_in(b"small", &message(1, 2000)),
+        Err(SendError::TooLarge {
+            size: 2000,
+            max: 1024
+        })
+    );
+    pair.a_sends_in(b"large", &message(2, 2000)).unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages_in(b"small"), vec![b"hello".to_vec()]);
+    assert_eq!(
+        pair.b.messages_in(b"large"),
+        vec![b"hello".to_vec(), message(2, 2000)]
+    );
+    // This side refuses a larger one too.
+    let peer = pair.a.peer;
+    let now = pair.t();
+    assert_eq!(
+        pair.b.channels.send_message(
+            peer,
+            None,
+            b"small",
+            &message(3, 1025),
+            now,
+            &mut pair.b.entropy
+        ),
+        Err(SendError::TooLarge {
+            size: 1025,
+            max: 1024
+        })
+    );
+    assert_eq!(
+        pair.b.channels.set_context(b"x", Some(262_145), false),
+        Err(SendError::TooLarge {
+            size: 262_145,
+            max: 262_144
+        })
+    );
+}
+
+/// Scenario: a peer that ignores the advertised size is reset, as one beyond
+/// the maximum is.
+#[test]
+fn a_peer_that_ignores_the_advertised_size_is_reset() {
+    let mut pair = mcu_pair(41);
+    pair.b
+        .channels
+        .set_context(b"small", Some(1024), false)
+        .unwrap();
+    // Before any acknowledgement: A does not know B's size yet.
+    pair.a_sends_in(b"small", &message(0, 2000)).unwrap();
+    pair.run_for(2000);
+    assert_eq!(pair.b.resets(), vec![Reason::MessageTooLarge]);
+    assert_eq!(pair.a.resets(), vec![Reason::ResetByPeer]);
+    assert!(pair.b.messages().is_empty());
+}
+
+/// Scenario: credit on in one context leaves another as it was.
+#[test]
+fn credit_on_in_one_context_leaves_another_as_it_was() {
+    let mut pair = mcu_pair(42);
+    pair.b
+        .channels
+        .set_context(b"credited", None, true)
+        .unwrap();
+    pair.a_sends_in(b"credited", b"one").unwrap();
+    pair.a_sends_in(b"plain", b"two").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages_in(b"plain"), vec![b"two".to_vec()]);
+    assert!(pair.b.messages_in(b"credited").is_empty());
+
+    // No credit in the plain context: a grant there does nothing.
+    let a = pair.a.peer;
+    pair.b.channels.grant(a, b"plain", 1).unwrap();
+    pair.b
+        .channels
+        .grant(a, b"credited", 3 + crate::ELEMENT_COST)
+        .unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages_in(b"credited"), vec![b"one".to_vec()]);
+}
+
+/// A context whose reader has no room keeps its messages; the others go on.
+#[test]
+fn a_context_held_back_holds_back_no_other() {
+    let mut pair = mcu_pair(43);
+    pair.b.held = vec![Context::new(b"slow").unwrap()];
+    pair.a_sends_in(b"slow", b"one").unwrap();
+    pair.a_sends_in(b"fast", b"two").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages_in(b"fast"), vec![b"two".to_vec()]);
+    assert!(pair.b.messages_in(b"slow").is_empty());
+
+    pair.b.held.clear();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages_in(b"slow"), vec![b"one".to_vec()]);
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
 }

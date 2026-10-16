@@ -13,25 +13,30 @@ use std::time::Duration;
 
 use convesso_core::identity::Identity;
 use convesso_core::paths::PathKind;
-use convesso_tokio::{Config, Events, Node, NodeEvent};
+use convesso_tokio::{Config, Context, ContextEvent, ContextEvents, ContextOptions, Node};
 use tokio::time::timeout;
 
 fn identity(seed: u8) -> Identity {
     Identity::from_ed25519_seed(&[seed; 32]).unwrap()
 }
 
-/// A node on the default socket: `[::]`, both families.
-async fn node(seed: u8) -> (Node, Events) {
-    convesso_tokio::start(identity(seed), Config::default())
+/// A node on the default socket, `[::]`, both families; and its context.
+async fn node(seed: u8) -> (Node, Context, ContextEvents) {
+    let (node, _events) = convesso_tokio::start(identity(seed), Config::default())
         .await
-        .unwrap()
+        .unwrap();
+    let (app, app_events) = node
+        .context(b"app", ContextOptions::default())
+        .await
+        .unwrap();
+    (node, app, app_events)
 }
 
-async fn datagram(events: &mut Events) -> Vec<u8> {
+async fn datagram(events: &mut ContextEvents) -> Vec<u8> {
     timeout(Duration::from_secs(2), async {
         loop {
             match events.next().await {
-                Some(NodeEvent::Datagram { data, .. }) => return data,
+                Some(ContextEvent::Datagram { data, .. }) => return data,
                 Some(_) => {}
                 None => panic!("the node stopped"),
             }
@@ -46,9 +51,9 @@ async fn datagram(events: &mut Events) -> Vec<u8> {
 /// the IPv4 one at a plain IPv4 address.
 #[tokio::test]
 async fn one_socket_carries_both_families() {
-    let (a, _a_events) = node(1).await;
-    let (b, mut b_events) = node(2).await;
-    let (c, mut c_events) = node(3).await;
+    let (a, a_app, _a_events) = node(1).await;
+    let (b, b_app, mut b_events) = node(2).await;
+    let (c, c_app, mut c_events) = node(3).await;
     assert!(a.dual_stack(), "this system offers a dual-stack socket");
     let port = a.local_addr().port();
 
@@ -56,14 +61,20 @@ async fn one_socket_carries_both_families() {
     let c_at = SocketAddr::from((Ipv6Addr::LOCALHOST, c.local_addr().port()));
     a.set_hint(b.address().peer_id(), b_at).await.unwrap();
     a.set_hint(c.address().peer_id(), c_at).await.unwrap();
-    a.send(b.address(), b"over IPv4".to_vec()).await.unwrap();
-    a.send(c.address(), b"over IPv6".to_vec()).await.unwrap();
+    a_app
+        .send(b.address(), b"over IPv4".to_vec())
+        .await
+        .unwrap();
+    a_app
+        .send(c.address(), b"over IPv6".to_vec())
+        .await
+        .unwrap();
     assert_eq!(datagram(&mut b_events).await, b"over IPv4");
     assert_eq!(datagram(&mut c_events).await, b"over IPv6");
 
     let a_peer = a.address().peer_id();
-    let seen_by_b = b.path(a_peer).await.unwrap().unwrap().path;
-    let seen_by_c = c.path(a_peer).await.unwrap().unwrap().path;
+    let seen_by_b = b_app.path(a_peer).await.unwrap().unwrap().path;
+    let seen_by_c = c_app.path(a_peer).await.unwrap().unwrap().path;
     assert_eq!(
         seen_by_b,
         PathKind::Direct(SocketAddr::from(([127, 0, 0, 1], port)))

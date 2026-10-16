@@ -16,7 +16,7 @@ use convesso_core::handshake::{
     Admission, Decision, Entropy, MAX_RESPONDER_OUTPUT, Responder, ResponderOutput,
 };
 use convesso_core::identity::{Address, Identity, PeerId};
-use convesso_core::storage::{Config, FixedTable, Mcu};
+use convesso_core::storage::{Config, Mcu};
 use convesso_core::time::Instant;
 use convesso_core::wire::{self, Mac1Key};
 use libfuzzer_sys::fuzz_target;
@@ -43,23 +43,9 @@ const fn nibble(c: u8) -> u8 {
     }
 }
 
-/// The microcontroller configuration, except that it is always under load.
-struct UnderLoad;
-
-impl Config for UnderLoad {
-    type Sessions<K: Ord, V> = FixedTable<K, V, 4>;
-    type Peers<K: Ord, V> = FixedTable<K, V, 16>;
-    type Pending<K: Ord, V> = FixedTable<K, V, 4>;
-    type RecentEphemerals<K: Ord, V> = FixedTable<K, V, 8>;
-    type SourceRates<K: Ord, V> = FixedTable<K, V, 8>;
-    type ReplayWindow = convesso_core::transport::Window<5>;
-    type Queue = convesso_core::session::FixedQueue<1024>;
-    type Dials<K: Ord, V> = FixedTable<K, V, 2>;
-    type Indices<K: Ord, V> = FixedTable<K, V, 12>;
-    type Hints<K: Ord, V> = FixedTable<K, V, 4>;
-    type Excluded<K: Ord, V> = FixedTable<K, V, 4>;
-    const LOAD_RATE_PER_SECOND: u32 = 0;
-    const LOAD_BURST: u32 = 0;
+convesso_core::profile! {
+    /// The microcontroller configuration, except that it is always under load.
+    UnderLoad: Mcu { load_rate_per_second: 0, load_burst: 0 }
 }
 
 struct Counter(u64);

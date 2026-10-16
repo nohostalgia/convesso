@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use convesso_core::identity::Address;
 use convesso_tokio::identity::load_or_create;
-use convesso_tokio::{Config, NodeEvent, RelayLocation};
+use convesso_tokio::{Config, ContextEvent, ContextOptions, NodeEvent, RelayLocation};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -106,19 +106,22 @@ pub async fn run(
         .collect();
     output(format!("address {hex}"));
     let reachable = args.relay.is_some();
-    let (node, mut events) = convesso_tokio::start(
+    let (node, mut node_events) = convesso_tokio::start(
         identity,
         Config {
             bind: args
                 .bind
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
-            context: b"chat".to_vec(),
             relay: args.relay,
             ..Config::default()
         },
     )
     .await
     .map_err(|e| e.to_string())?;
+    let (chat, mut events) = node
+        .context(b"example/chat/1", ContextOptions::default())
+        .await
+        .map_err(|e| e.to_string())?;
     if reachable {
         node.set_reachable(true).await.map_err(|e| e.to_string())?;
     }
@@ -135,15 +138,19 @@ pub async fn run(
                     output("no --peer to send to".into());
                     continue;
                 };
-                if let Err(error) = node.send(peer, line.into_bytes()).await {
+                if let Err(error) = chat.send(peer, line.into_bytes()).await {
                     output(format!("not sent: {error}"));
                 }
             }
             event = events.next() => match event {
-                Some(NodeEvent::Datagram { data, relayed, .. }) => {
+                Some(ContextEvent::Datagram { data, relayed, .. }) => {
                     let how = if relayed { "relayed" } else { "direct" };
                     output(format!("[{how}] {}", String::from_utf8_lossy(&data)));
                 }
+                Some(_) => {}
+                None => return Err("the node stopped".into()),
+            },
+            event = node_events.next() => match event {
                 Some(NodeEvent::PeerNotAtRelay { .. }) => output("the peer is not at the relay".into()),
                 Some(NodeEvent::RelayUnavailable { error }) => output(format!("the relay: {error:?}")),
                 Some(_) => {}

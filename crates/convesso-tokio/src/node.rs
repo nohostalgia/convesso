@@ -1,9 +1,11 @@
-//! An endpoint on tokio: the [`Node`] handle and the task that owns the core.
+//! An endpoint on tokio: the [`Node`] handle, a [`Context`] handle per
+//! context, and the task that owns the core.
 //!
 //! ```text
-//!  Node (cloneable) --- commands ---> task: Endpoint<Server>  <--- one UDP socket, both families
-//!  application <------ events (bounded) ----   |              <--- the relay's TCP link
-//!                                              +-- sleep until the core's next deadline
+//!  Node (cloneable) ------ commands ----> task: Endpoint<Server>  <--- one UDP socket, both families
+//!  Context per context --- commands ---->   |                     <--- the relay's TCP link
+//!  application <-- node events (bounded) ---+
+//!  application <-- each context's events ---+-- sleep until the core's next deadline
 //! ```
 //!
 //! The socket is dual-stack (`[::]`, `IPV6_V6ONLY` off) unless the
@@ -15,19 +17,21 @@
 //! The task decides nothing. It hands the core every packet with where it came
 //! from, sends what the core outputs on the path it names, opens and closes the
 //! relay link when told, reports what happened to it, and calls the core again
-//! at each deadline. It never waits on the application (`DESIGN.md §5`): while
-//! the event channel is full, it stops reading the socket and the relay link,
-//! and keeps its timers, acknowledgements, keep-alives and commands going.
-//! Events its timers produce meanwhile wait aside, one per peer and kind, the
-//! latest replacing the earlier, so an application that reads late sees the
-//! latest state. In the per-peer delivery mode, datagrams and messages go to a
-//! [`Receiver`] per peer instead, and the socket is always read.
+//! at each deadline. It never waits on the application, and never stops reading
+//! for it (`DESIGN.md §5`): a datagram for a context whose event stream is full
+//! is dropped and counted; events without data wait aside, one per context,
+//! peer and kind (for the node, one per kind), the latest replacing the
+//! earlier, so an application that reads late sees the latest state; a
+//! context's messages wait in their channel, whose window closes, so that only
+//! their sender waits. In a context with per-peer delivery, datagrams and
+//! messages go to a [`Receiver`] per peer instead.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant as Clock;
 
 use convesso_core::dos::Source;
@@ -35,7 +39,7 @@ use convesso_core::endpoint::{
     Endpoint, Event, ExcludeError, HintTooLong, Output, Poll, RelayError, RelayPath, SendError,
     Target, To,
 };
-use convesso_core::handshake::ChannelBinding;
+use convesso_core::handshake::{self, ChannelBinding, Context as Name};
 use convesso_core::handshake::{Admission, Decision, DialError, ResponderError};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::paths::{Candidate, PathInfo, PathKind};
@@ -54,8 +58,6 @@ use crate::receiver::{ELEMENT_COST, Receiver, SessionClosed, Shared};
 
 #[cfg(feature = "stream")]
 use convesso_core::endpoint::FrameKind;
-#[cfg(feature = "stream")]
-use convesso_core::handshake::Context;
 #[cfg(feature = "stream")]
 use convesso_stream::config::Server as StreamServer;
 #[cfg(feature = "stream")]
@@ -81,6 +83,10 @@ impl<T: 'static> Profile for T {}
 /// The largest datagram a direct path is given: a UDP payload that fits a
 /// 1,500-byte IPv6 path.
 pub const DIRECT_PATH_MAX: usize = 1452;
+
+/// The code a context's sessions are closed with when its handle is dropped
+/// without [`Context::close_context`]: the core's default code.
+pub const DROPPED: u16 = 1;
 
 /// How many rounds of ready commands and datagrams the task handles before
 /// it drains the core.
@@ -111,33 +117,90 @@ pub type SocketHandle = std::os::windows::io::RawSocket;
 /// stays out of the tunnel it carries. It must not block.
 pub type SocketHook = Arc<dyn Fn(SocketHandle) -> std::io::Result<()> + Send + Sync>;
 
-/// How to start a node.
+/// How to start a node. It serves no context until the application opens
+/// one with [`Node::context`].
 pub struct Config {
     /// The local UDP address to bind: `[::]:0` by default, a dual-stack
     /// socket; an IPv4 address binds IPv4 only.
     pub bind: SocketAddr,
-    /// The application's context.
-    pub context: Vec<u8>,
     /// The relay to pin, if any.
     pub relay: Option<RelayLocation>,
-    /// How many events wait for the application before the node stops reading.
+    /// How many of the node's own events wait for the application.
     pub events: usize,
-    /// Whom to admit. Everyone, when unset.
-    pub admission: Option<Box<dyn Admission + Send>>,
     /// Given every socket the node opens, before it is used.
     pub socket_hook: Option<SocketHook>,
-    /// Where peers' messages and datagrams go: the event stream, or a
-    /// [`Receiver`] per peer.
-    pub delivery: Delivery,
 }
 
-/// Where peers' messages and datagrams go.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            relay: None,
+            events: 64,
+            socket_hook: None,
+        }
+    }
+}
+
+/// Who may reach this node in a context.
+#[derive(Default)]
+pub enum Access {
+    /// Every peer.
+    #[default]
+    Everyone,
+    /// The peers this policy admits, asked for each first contact.
+    Admit(Box<dyn Admission + Send>),
+    /// This peer alone: a first contact from any other meets silence.
+    Bound(PeerId),
+    /// No one: the context is not served, and only dialled in.
+    DialOnly,
+}
+
+impl std::fmt::Debug for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Everyone => f.write_str("Everyone"),
+            Self::Admit(_) => f.write_str("Admit(..)"),
+            Self::Bound(peer) => f.debug_tuple("Bound").field(peer).finish(),
+            Self::DialOnly => f.write_str("DialOnly"),
+        }
+    }
+}
+
+/// How to open a context.
+#[derive(Debug)]
+pub struct ContextOptions {
+    /// Who may reach this node in it.
+    pub access: Access,
+    /// Where its peers' messages and datagrams go.
+    pub delivery: Delivery,
+    /// How many events wait in its event stream for the application.
+    pub events: usize,
+    /// Its largest message, at most the stream configuration's; the
+    /// configuration's when unset (feature `stream`).
+    #[cfg(feature = "stream")]
+    pub max_message: Option<usize>,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            access: Access::Everyone,
+            delivery: Delivery::Events,
+            events: 256,
+            #[cfg(feature = "stream")]
+            max_message: None,
+        }
+    }
+}
+
+/// Where a context's peers' messages and datagrams go.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Delivery {
-    /// To the event stream, with every other event.
+    /// To the context's event stream, with its other events.
     #[default]
     Events,
-    /// To a [`Receiver`] per peer, opened with [`Node::receiver`], each
+    /// To a [`Receiver`] per peer, opened with [`Context::receiver`], each
     /// holding at most `messages` bytes of messages and `datagrams` bytes of
     /// datagrams, every element costing its length plus
     /// [`crate::ELEMENT_COST`]. A peer's channel is granted only the free room
@@ -146,25 +209,12 @@ pub enum Delivery {
     /// peer with no receiver open, is dropped and counted in
     /// [`Stats::datagrams_dropped`].
     PerPeer {
-        /// The message budget, at least the largest message's cost.
+        /// The message budget, at least the cost of the context's largest
+        /// message.
         messages: usize,
         /// The datagram budget.
         datagrams: usize,
     },
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-            context: b"app".to_vec(),
-            relay: None,
-            events: 256,
-            admission: None,
-            socket_hook: None,
-            delivery: Delivery::Events,
-        }
-    }
 }
 
 /// Why a node did not start.
@@ -180,14 +230,6 @@ pub enum StartError {
     Resolve(std::io::Error),
     /// The core refused the configuration.
     Core(ResponderError),
-    /// The per-peer message budget is below the cost of the largest message,
-    /// which could then never be delivered.
-    Budget {
-        /// The budget given.
-        budget: usize,
-        /// The cost of the largest message.
-        needed: usize,
-    },
 }
 
 impl std::fmt::Display for StartError {
@@ -198,10 +240,6 @@ impl std::fmt::Display for StartError {
             Self::Hook(error) => write!(f, "the socket hook: {error}"),
             Self::Resolve(error) => write!(f, "resolving the relay: {error}"),
             Self::Core(error) => write!(f, "the core: {error}"),
-            Self::Budget { budget, needed } => write!(
-                f,
-                "a message budget of {budget} bytes is below the {needed} a largest message costs"
-            ),
         }
     }
 }
@@ -217,13 +255,28 @@ pub enum NodeError {
     Hint(HintTooLong),
     /// The prefix could not be excluded, with the core's named error.
     Exclude(ExcludeError),
+    /// The context could not be opened, or its access changed, with the
+    /// core's named error: open already, the relay context, or one more than
+    /// the storage profile serves.
+    Context(ResponderError),
+    /// The context was closed.
+    ContextClosed,
+    /// The per-peer message budget is below the cost of the context's
+    /// largest message, which could then never be delivered.
+    Budget {
+        /// The budget given.
+        budget: usize,
+        /// The cost of the largest message.
+        needed: usize,
+    },
     /// The node's task has ended.
     Stopped,
-    /// A receiver asked for while the node delivers to its event stream.
+    /// A receiver asked for in a context that delivers to its event stream.
     NotPerPeer,
     /// A receiver asked for a peer that already has one open.
     ReceiverOpen,
-    /// The stream layer refused a message, with its named error.
+    /// The stream layer refused a message, or a context's largest message,
+    /// with its named error.
     #[cfg(feature = "stream")]
     Message(convesso_stream::SendError),
 }
@@ -234,8 +287,16 @@ impl std::fmt::Display for NodeError {
             Self::Send(error) => error.fmt(f),
             Self::Hint(error) => error.fmt(f),
             Self::Exclude(error) => error.fmt(f),
+            Self::Context(error) => write!(f, "the context: {error}"),
+            Self::ContextClosed => f.write_str("the context was closed"),
+            Self::Budget { budget, needed } => write!(
+                f,
+                "a message budget of {budget} bytes is below the {needed} a largest message costs"
+            ),
             Self::Stopped => f.write_str("the node has stopped"),
-            Self::NotPerPeer => f.write_str("the node delivers to its event stream, not per peer"),
+            Self::NotPerPeer => {
+                f.write_str("the context delivers to its event stream, not per peer")
+            }
             Self::ReceiverOpen => f.write_str("the peer already has a receiver open"),
             #[cfg(feature = "stream")]
             Self::Message(error) => write!(f, "the message was refused: {error:?}"),
@@ -245,9 +306,35 @@ impl std::fmt::Display for NodeError {
 
 impl std::error::Error for NodeError {}
 
-/// Something the application should know.
+/// Something about the node the application should know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
+    /// The relay cannot reach a peer.
+    PeerNotAtRelay {
+        /// The peer.
+        peer: PeerId,
+    },
+    /// The address the relay sees this node at.
+    ObservedAddress {
+        /// The link.
+        link: Link,
+        /// The address.
+        address: SocketAddr,
+    },
+    /// The relay cannot be used: its session could not be opened, or ended,
+    /// or the link to it failed. Peers cannot reach this node through it
+    /// until the next relay-available event.
+    RelayUnavailable {
+        /// Why.
+        error: RelayError,
+    },
+    /// The node is registered with its relay: peers reach it through it.
+    RelayAvailable,
+}
+
+/// Something in a context the application should know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextEvent {
     /// A first session with a peer.
     Connected {
         /// The peer.
@@ -278,27 +365,6 @@ pub enum NodeEvent {
         /// Why.
         error: DialError,
     },
-    /// The relay cannot reach a peer.
-    PeerNotAtRelay {
-        /// The peer.
-        peer: PeerId,
-    },
-    /// The address the relay sees this node at.
-    ObservedAddress {
-        /// The link.
-        link: Link,
-        /// The address.
-        address: SocketAddr,
-    },
-    /// The relay cannot be used: its session could not be opened, or ended,
-    /// or the link to it failed. Peers cannot reach this node through it
-    /// until the next relay-available event.
-    RelayUnavailable {
-        /// Why.
-        error: RelayError,
-    },
-    /// The node is registered with its relay: peers reach it through it.
-    RelayAvailable,
     /// The path to a peer changed: a direct path was found, or lost and the
     /// relay carries the session again.
     PathChanged {
@@ -360,51 +426,113 @@ pub struct Stats {
     /// `stream`).
     #[cfg(feature = "stream")]
     pub stream_frames_sent: u64,
-    /// Datagrams dropped in the per-peer mode: for a peer with no receiver
-    /// open, or beyond its receiver's budget.
+    /// Datagrams dropped: for a context whose event stream had no room, or,
+    /// with per-peer delivery, for a peer with no receiver open or beyond its
+    /// receiver's budget.
     pub datagrams_dropped: u64,
 }
 
+/// A context, opened: what the task needs to open it.
+struct Opening {
+    name: Vec<u8>,
+    access: Access,
+    delivery: Delivery,
+    events: mpsc::Sender<ContextEvent>,
+    #[cfg(feature = "stream")]
+    max_message: Option<usize>,
+}
+
 enum Command {
-    Send(Address, Vec<u8>, oneshot::Sender<Result<(), NodeError>>),
-    SendToPeer(PeerId, Vec<u8>, oneshot::Sender<Result<(), NodeError>>),
+    Open(Opening, oneshot::Sender<Result<(), NodeError>>),
+    SetAccess(Name, Access, u16, oneshot::Sender<Result<(), NodeError>>),
+    Send(
+        Name,
+        Address,
+        Vec<u8>,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
+    SendToPeer(
+        Name,
+        PeerId,
+        Vec<u8>,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
     Hint(PeerId, SocketAddr, oneshot::Sender<Result<(), NodeError>>),
     Reachable(bool),
-    Close(PeerId, u16),
+    Close(Name, PeerId, u16),
     ClosePeer(PeerId, u16),
     NetworkChanged,
     Stats(oneshot::Sender<Stats>),
-    Path(PeerId, oneshot::Sender<Option<PathInfo>>),
+    Path(Name, PeerId, oneshot::Sender<Option<PathInfo>>),
     Candidates(oneshot::Sender<Vec<Candidate>>),
     Exclude(
         Vec<(IpAddr, u8)>,
         bool,
         oneshot::Sender<Result<(), NodeError>>,
     ),
-    Binding(PeerId, oneshot::Sender<Option<ChannelBinding>>),
+    Binding(Name, PeerId, oneshot::Sender<Option<ChannelBinding>>),
     RelayUdpProven(oneshot::Sender<bool>),
-    Receiver(PeerId, oneshot::Sender<Result<Receiver, NodeError>>),
+    Receiver(Name, PeerId, oneshot::Sender<Result<Receiver, NodeError>>),
     #[cfg(feature = "stream")]
     SendMessage(Parked),
 }
 
-/// A handle on a running node. Cloneable; the node stops when every handle
-/// and the [`Events`] are dropped.
+/// Wakes the task when the application reads an event stream while something
+/// waits for room in one.
+#[derive(Default)]
+struct Room {
+    notify: Notify,
+    waiting: AtomicBool,
+}
+
+impl Room {
+    fn read(&self) {
+        if self.waiting.load(Ordering::Acquire) {
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// A handle on a running node. Cloneable; the node stops when every handle,
+/// every [`Context`], and the [`Events`] are dropped.
 #[derive(Clone)]
 pub struct Node {
     commands: mpsc::Sender<Command>,
+    closes: mpsc::UnboundedSender<(Name, u16)>,
+    room: Arc<Room>,
     local: SocketAddr,
     address: Address,
     dual_stack: bool,
 }
 
-/// The node's events, in order.
-pub struct Events(mpsc::Receiver<NodeEvent>);
+/// The node's own events, in order.
+pub struct Events {
+    events: mpsc::Receiver<NodeEvent>,
+    room: Arc<Room>,
+}
 
 impl Events {
     /// The next event, or `None` once the node has stopped.
     pub async fn next(&mut self) -> Option<NodeEvent> {
-        self.0.recv().await
+        let event = self.events.recv().await;
+        self.room.read();
+        event
+    }
+}
+
+/// A context's events, in order.
+pub struct ContextEvents {
+    events: mpsc::Receiver<ContextEvent>,
+    room: Arc<Room>,
+}
+
+impl ContextEvents {
+    /// The next event, or `None` once the context is closed or the node has
+    /// stopped.
+    pub async fn next(&mut self) -> Option<ContextEvent> {
+        let event = self.events.recv().await;
+        self.room.read();
+        event
     }
 }
 
@@ -428,15 +556,50 @@ impl Node {
         self.dual_stack
     }
 
-    /// The path to `peer`, and how it got there; `None` without a session.
+    /// Opens the context `name` while the node runs: serves it under the
+    /// options' access, and returns its handle and its event stream. The
+    /// context lives as long as the handle: dropping every clone of it closes
+    /// the context.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Stopped`].
-    pub async fn path(&self, peer: PeerId) -> Result<Option<PathInfo>, NodeError> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(Command::Path(peer, reply)).await?;
-        answer.await.map_err(|_| NodeError::Stopped)
+    /// [`NodeError::Context`] with the core's error for a name already open,
+    /// the relay context, or one context more than the storage profile
+    /// serves; [`NodeError::Budget`] for a per-peer message budget below the
+    /// cost of the context's largest message; `NodeError::Message` (feature
+    /// `stream`) for a largest message over the stream configuration's; or
+    /// [`NodeError::Stopped`]. The context is then not open.
+    pub async fn context(
+        &self,
+        name: &[u8],
+        options: ContextOptions,
+    ) -> Result<(Context, ContextEvents), NodeError> {
+        let context = Name::new(name)
+            .map_err(|error| NodeError::Context(ResponderError::ContextTooLong(error)))?;
+        let (events_tx, events) = mpsc::channel(options.events.max(1));
+        let opening = Opening {
+            name: name.to_vec(),
+            access: options.access,
+            delivery: options.delivery,
+            events: events_tx,
+            #[cfg(feature = "stream")]
+            max_message: options.max_message,
+        };
+        self.answer(|reply| Command::Open(opening, reply)).await?;
+        Ok((
+            Context {
+                handle: Arc::new(Handle {
+                    commands: self.commands.clone(),
+                    closes: self.closes.clone(),
+                    context,
+                    closed: AtomicBool::new(false),
+                }),
+            },
+            ContextEvents {
+                events,
+                room: self.room.clone(),
+            },
+        ))
     }
 
     /// Whether UDP to the relay is proven now; otherwise the relay is reached
@@ -447,7 +610,7 @@ impl Node {
     /// [`NodeError::Stopped`].
     pub async fn relay_udp_proven(&self) -> Result<bool, NodeError> {
         let (reply, answer) = oneshot::channel();
-        self.ask(Command::RelayUdpProven(reply)).await?;
+        ask(&self.commands, Command::RelayUdpProven(reply)).await?;
         answer.await.map_err(|_| NodeError::Stopped)
     }
 
@@ -459,7 +622,7 @@ impl Node {
     /// [`NodeError::Stopped`].
     pub async fn candidates(&self) -> Result<Vec<Candidate>, NodeError> {
         let (reply, answer) = oneshot::channel();
-        self.ask(Command::Candidates(reply)).await?;
+        ask(&self.commands, Command::Candidates(reply)).await?;
         answer.await.map_err(|_| NodeError::Stopped)
     }
 
@@ -486,58 +649,14 @@ impl Node {
             .await
     }
 
-    /// The channel binding of the session with `peer`: the hash of the
-    /// handshake that opened it, the same at both ends and kept across key
-    /// renewals (`PROTOCOL.md §5`). `None` without a session with
-    /// keys.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeError::Stopped`].
-    pub async fn channel_binding(&self, peer: PeerId) -> Result<Option<[u8; 32]>, NodeError> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(Command::Binding(peer, reply)).await?;
-        answer.await.map_err(|_| NodeError::Stopped)
-    }
-
-    async fn ask(&self, command: Command) -> Result<(), NodeError> {
-        self.commands
-            .send(command)
-            .await
-            .map_err(|_| NodeError::Stopped)
-    }
-
     async fn answer(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<(), NodeError>>) -> Command,
     ) -> Result<(), NodeError> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(make(reply)).await?;
-        answer.await.map_err(|_| NodeError::Stopped)?
+        answer(&self.commands, make).await
     }
 
-    /// Sends a datagram to the peer at `to`: through its session, or a new
-    /// one, by the path the core chooses.
-    ///
-    /// # Errors
-    ///
-    /// The core's [`SendError`], or [`NodeError::Stopped`].
-    pub async fn send(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
-        self.answer(|reply| Command::Send(to, data, reply)).await
-    }
-
-    /// Sends a datagram to a peer by its identity: only while a session with
-    /// it has keys, or its handshake is pending here.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::send`].
-    pub async fn send_to_peer(&self, to: PeerId, data: Vec<u8>) -> Result<(), NodeError> {
-        self.answer(|reply| Command::SendToPeer(to, data, reply))
-            .await
-    }
-
-    /// Gives the core a direct address for `peer`.
+    /// Gives the core a direct address for `peer`, in every context.
     ///
     /// # Errors
     ///
@@ -552,25 +671,16 @@ impl Node {
     ///
     /// [`NodeError::Stopped`].
     pub async fn set_reachable(&self, reachable: bool) -> Result<(), NodeError> {
-        self.ask(Command::Reachable(reachable)).await
+        ask(&self.commands, Command::Reachable(reachable)).await
     }
 
-    /// Closes the session with `peer`, with `code`.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeError::Stopped`].
-    pub async fn close(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
-        self.ask(Command::Close(peer, code)).await
-    }
-
-    /// Revokes `peer`: closes every session with it.
+    /// Revokes `peer`: closes every session with it, in every context.
     ///
     /// # Errors
     ///
     /// [`NodeError::Stopped`].
     pub async fn close_peer(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
-        self.ask(Command::ClosePeer(peer, code)).await
+        ask(&self.commands, Command::ClosePeer(peer, code)).await
     }
 
     /// Tells the core the network changed: a reachable node replaces its
@@ -580,7 +690,173 @@ impl Node {
     ///
     /// [`NodeError::Stopped`].
     pub async fn network_changed(&self) -> Result<(), NodeError> {
-        self.ask(Command::NetworkChanged).await
+        ask(&self.commands, Command::NetworkChanged).await
+    }
+
+    /// What the node's sockets have carried so far.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn stats(&self) -> Result<Stats, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        ask(&self.commands, Command::Stats(reply)).await?;
+        answer.await.map_err(|_| NodeError::Stopped)
+    }
+}
+
+async fn ask(commands: &mpsc::Sender<Command>, command: Command) -> Result<(), NodeError> {
+    commands.send(command).await.map_err(|_| NodeError::Stopped)
+}
+
+async fn answer(
+    commands: &mpsc::Sender<Command>,
+    make: impl FnOnce(oneshot::Sender<Result<(), NodeError>>) -> Command,
+) -> Result<(), NodeError> {
+    let (reply, answer) = oneshot::channel();
+    ask(commands, make(reply)).await?;
+    answer.await.map_err(|_| NodeError::Stopped)?
+}
+
+/// What every clone of a [`Context`] shares: dropping the last closes the
+/// context.
+struct Handle {
+    commands: mpsc::Sender<Command>,
+    closes: mpsc::UnboundedSender<(Name, u16)>,
+    context: Name,
+    closed: AtomicBool,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if !self.closed.load(Ordering::Acquire) {
+            let _ = self.closes.send((self.context, DROPPED));
+        }
+    }
+}
+
+/// A handle on one context of a node: every operation acts in it, and its
+/// [`ContextEvents`] carry its events alone. Cloneable; the context is closed
+/// when every clone is dropped, or by [`Self::close_context`].
+#[derive(Clone)]
+pub struct Context {
+    handle: Arc<Handle>,
+}
+
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("name", &self.handle.context)
+            .finish()
+    }
+}
+
+impl Context {
+    /// The context's name.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        self.handle.context.as_bytes()
+    }
+
+    fn name_of(&self) -> Name {
+        self.handle.context
+    }
+
+    async fn ask(&self, command: Command) -> Result<(), NodeError> {
+        ask(&self.handle.commands, command).await
+    }
+
+    async fn answer(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<(), NodeError>>) -> Command,
+    ) -> Result<(), NodeError> {
+        answer(&self.handle.commands, make).await
+    }
+
+    /// Changes who may reach this node in the context. The sessions this side
+    /// accepted that the new access would not admit are closed: with a
+    /// policy's refusal code when it is a policy that refuses, with `code`
+    /// otherwise; and so are the pending handshakes. Sessions this side
+    /// dialled go on.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Context`] with the core's error when a dial-only context
+    /// cannot be served, [`NodeError::ContextClosed`], or
+    /// [`NodeError::Stopped`].
+    pub async fn set_access(&self, access: Access, code: u16) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::SetAccess(context, access, code, reply))
+            .await
+    }
+
+    /// Closes the context: its sessions closed with `code`, its dials and
+    /// pending handshakes discarded, its slot freed. Every clone of the handle
+    /// then refers to a closed context.
+    pub fn close_context(self, code: u16) {
+        if !self.handle.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.handle.closes.send((self.handle.context, code));
+        }
+    }
+
+    /// Sends a datagram to the peer at `to`: through its session, or a new
+    /// one, by the path the core chooses.
+    ///
+    /// # Errors
+    ///
+    /// The core's [`SendError`], [`NodeError::ContextClosed`], or
+    /// [`NodeError::Stopped`].
+    pub async fn send(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::Send(context, to, data, reply))
+            .await
+    }
+
+    /// Sends a datagram to a peer by its identity: only while a session with
+    /// it has keys, or its handshake is pending here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`].
+    pub async fn send_to_peer(&self, to: PeerId, data: Vec<u8>) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::SendToPeer(context, to, data, reply))
+            .await
+    }
+
+    /// Closes the session with `peer`, with `code`.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn close(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
+        self.ask(Command::Close(self.name_of(), peer, code)).await
+    }
+
+    /// The path to `peer`, and how it got there; `None` without a session.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn path(&self, peer: PeerId) -> Result<Option<PathInfo>, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::Path(self.name_of(), peer, reply)).await?;
+        answer.await.map_err(|_| NodeError::Stopped)
+    }
+
+    /// The channel binding of the session with `peer`: the hash of the
+    /// handshake that opened it, the same at both ends and kept across key
+    /// renewals (`PROTOCOL.md §5`). `None` without a session with
+    /// keys.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn channel_binding(&self, peer: PeerId) -> Result<Option<[u8; 32]>, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::Binding(self.name_of(), peer, reply))
+            .await?;
+        answer.await.map_err(|_| NodeError::Stopped)
     }
 
     /// Sends a reliable message to the peer at `to` (feature `stream`): it
@@ -589,12 +865,22 @@ impl Node {
     ///
     /// # Errors
     ///
-    /// [`NodeError::Message`] for a message that can never be sent, or
-    /// [`NodeError::Stopped`].
+    /// [`NodeError::Message`] for a message that can never be sent, larger
+    /// than the context's largest message included; [`NodeError::ContextClosed`];
+    /// or [`NodeError::Stopped`].
     #[cfg(feature = "stream")]
     pub async fn send_message(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
-        self.answer(|reply| Command::SendMessage((to.peer_id(), Some(to), data, reply)))
-            .await
+        let context = self.name_of();
+        self.answer(|reply| {
+            Command::SendMessage(Parked {
+                context,
+                peer: to.peer_id(),
+                address: Some(to),
+                data,
+                reply,
+            })
+        })
+        .await
     }
 
     /// Sends a reliable message to a peer by its identity (feature `stream`):
@@ -605,39 +891,39 @@ impl Node {
     /// As [`Self::send_message`].
     #[cfg(feature = "stream")]
     pub async fn send_message_to_peer(&self, to: PeerId, data: Vec<u8>) -> Result<(), NodeError> {
-        self.answer(|reply| Command::SendMessage((to, None, data, reply)))
-            .await
+        let context = self.name_of();
+        self.answer(|reply| {
+            Command::SendMessage(Parked {
+                context,
+                peer: to,
+                address: None,
+                data,
+                reply,
+            })
+        })
+        .await
     }
 
-    /// Opens the receiver of `peer`'s messages and datagrams, in the per-peer
-    /// delivery mode; before its session exists, too. Open it when the peer
-    /// connects: until then its messages wait in its channel, and its
-    /// datagrams are dropped.
+    /// Opens the receiver of `peer`'s messages and datagrams in this context,
+    /// whose delivery is per peer; before its session exists, too. Open it
+    /// when the peer connects: until then its messages wait in its channel,
+    /// and its datagrams are dropped.
     ///
     /// # Errors
     ///
-    /// [`NodeError::NotPerPeer`] in the event-stream mode,
-    /// [`NodeError::ReceiverOpen`] while the peer has one open, or
-    /// [`NodeError::Stopped`].
+    /// [`NodeError::NotPerPeer`] in a context that delivers to its event
+    /// stream, [`NodeError::ReceiverOpen`] while the peer has one open,
+    /// [`NodeError::ContextClosed`], or [`NodeError::Stopped`].
     pub async fn receiver(&self, peer: PeerId) -> Result<Receiver, NodeError> {
         let (reply, answer) = oneshot::channel();
-        self.ask(Command::Receiver(peer, reply)).await?;
+        self.ask(Command::Receiver(self.name_of(), peer, reply))
+            .await?;
         answer.await.map_err(|_| NodeError::Stopped)?
-    }
-
-    /// What the node's sockets have carried so far.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeError::Stopped`].
-    pub async fn stats(&self) -> Result<Stats, NodeError> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(Command::Stats(reply)).await?;
-        answer.await.map_err(|_| NodeError::Stopped)
     }
 }
 
-/// Starts a node for `identity`, with entropy from the operating system.
+/// Starts a node for `identity`, with entropy from the operating system. It
+/// serves no context until the application opens one with [`Node::context`].
 ///
 /// # Errors
 ///
@@ -662,15 +948,15 @@ pub async fn start_with<E: SystemEntropy>(
 }
 
 /// Starts a node whose message channels use the stream configuration `C`
-/// (feature `stream`): its largest message and its buffers. [`start`] and
-/// [`start_with`] use [`convesso_stream::config::Server`]. A peer refuses a
-/// message larger than the largest it advertised, so peers that exchange
-/// such messages use configurations that accept them.
+/// (feature `stream`): its largest message, every context's at most that, and
+/// its buffers. [`start`] and [`start_with`] use
+/// [`convesso_stream::config::Server`]. A peer refuses a message larger than
+/// the largest it advertised, so peers that exchange such messages use
+/// configurations that accept them.
 ///
 /// # Errors
 ///
-/// As [`start_with`]; in the per-peer mode, [`StartError::Budget`] against
-/// `C`'s largest message.
+/// As [`start_with`].
 #[cfg(feature = "stream")]
 pub async fn start_with_stream<C, E>(
     identity: Identity,
@@ -695,19 +981,8 @@ async fn build<E: SystemEntropy, C: Profile>(
     mut entropy: E,
 ) -> Result<(Task<E, C>, Node, Events), StartError> {
     entropy.check().map_err(StartError::Entropy)?;
-    #[cfg(feature = "stream")]
-    if let Delivery::PerPeer { messages, .. } = config.delivery {
-        let needed = C::MAX_MESSAGE + ELEMENT_COST;
-        if messages < needed {
-            return Err(StartError::Budget {
-                budget: messages,
-                needed,
-            });
-        }
-    }
     let address = *identity.address();
-    let mut endpoint = Endpoint::<Server>::new(identity, &[config.context.as_slice()])
-        .map_err(StartError::Core)?;
+    let mut endpoint = Endpoint::<Server>::new(identity, &[]).map_err(StartError::Core)?;
     let clock = Clock::now();
     let hook = config.socket_hook.take();
     let (udp, dual_stack) =
@@ -734,11 +1009,13 @@ async fn build<E: SystemEntropy, C: Profile>(
         endpoint.set_relay_families(primary.is_ipv6(), other.is_some());
     }
     let (commands_tx, commands) = mpsc::channel(64);
+    let (closes_tx, closes) = mpsc::unbounded_channel();
     let (events_tx, events) = mpsc::channel(config.events.max(1));
+    let room = Arc::new(Room::default());
     let task = Task {
         endpoint,
-        context: std::mem::take(&mut config.context),
-        policy: Policy(config.admission.take()),
+        policies: Policies(HashMap::new()),
+        contexts: HashMap::new(),
         entropy,
         udp,
         dual_stack,
@@ -748,23 +1025,19 @@ async fn build<E: SystemEntropy, C: Profile>(
         link: None,
         connecting: None,
         events: events_tx,
+        held: VecDeque::new(),
+        room: room.clone(),
         commands,
+        closes,
         stats: Stats::default(),
         clock,
         rx: vec![0; 2048],
         out: vec![0; 2048],
         link_rx: vec![0; 4096],
-        waiting_room: false,
         hook,
-        delivery: config.delivery,
-        receivers: HashMap::new(),
         receivers_wake: Arc::new(Notify::new()),
-        held: VecDeque::new(),
         #[cfg(feature = "stream")]
-        channels: Box::new(match config.delivery {
-            Delivery::Events => Channels::<C>::new(),
-            Delivery::PerPeer { .. } => Channels::<C>::with_credit(),
-        }),
+        channels: Box::new(Channels::<C>::new()),
         #[cfg(feature = "stream")]
         frame: vec![0; convesso_stream::frame::MAX_DATA_LEN],
         #[cfg(feature = "stream")]
@@ -776,11 +1049,13 @@ async fn build<E: SystemEntropy, C: Profile>(
         task,
         Node {
             commands: commands_tx,
+            closes: closes_tx,
+            room: room.clone(),
             local,
             address,
             dual_stack,
         },
-        Events(events),
+        Events { events, room },
     ))
 }
 
@@ -919,19 +1194,100 @@ pub(crate) fn interface_addresses(port: u16, dual_stack: bool) -> Vec<SocketAddr
         .collect()
 }
 
-/// The application's policy, or everyone.
-struct Policy(Option<Box<dyn Admission + Send>>);
+/// The core's one admission: each context's question goes to that context's
+/// policy; a context without one admits everyone (its access may still bind
+/// it to one peer, which the core checks first).
+struct Policies(HashMap<Name, Box<dyn Admission + Send>>);
 
-impl Admission for Policy {
+impl Policies {
+    fn of(&mut self, context: &[u8]) -> Option<&mut Box<dyn Admission + Send>> {
+        let context = Name::new(context).ok()?;
+        self.0.get_mut(&context)
+    }
+}
+
+impl Admission for Policies {
     fn admit(&mut self, peer: &PeerId, context: &[u8]) -> Decision {
-        match &mut self.0 {
+        match self.of(context) {
             Some(policy) => policy.admit(peer, context),
             None => Decision::Accept { psk: None },
         }
     }
 
     fn psk(&mut self, peer: &PeerId, context: &[u8]) -> Option<convesso_core::handshake::Psk> {
-        self.0.as_mut().and_then(|policy| policy.psk(peer, context))
+        self.of(context)
+            .and_then(|policy| policy.psk(peer, context))
+    }
+}
+
+/// An open context, as the task keeps it.
+struct Open {
+    events: mpsc::Sender<ContextEvent>,
+    /// Events without data waiting for room in `events`, in order; those of
+    /// a peer and kind coalesced, the latest replacing the earlier.
+    held: VecDeque<(Held, ContextEvent)>,
+    delivery: Delivery,
+    /// The open receivers, with per-peer delivery.
+    receivers: HashMap<PeerId, Arc<Shared>>,
+    /// Whether its messages wait in the channels for room in `events`.
+    blocked: bool,
+}
+
+impl Open {
+    /// Whether a message may be handed to the application now: with per-peer
+    /// delivery, always (the receiver's credit bounds it); otherwise while
+    /// the event stream has room and nothing waits aside before it.
+    #[cfg(feature = "stream")]
+    fn can_deliver(&self) -> bool {
+        match self.delivery {
+            Delivery::Events => self.held.is_empty() && self.events.capacity() > 0,
+            Delivery::PerPeer { .. } => true,
+        }
+    }
+
+    /// Hands an event to the application without ever waiting for it: into
+    /// the event stream, or aside while it is full. A datagram that finds no
+    /// room is dropped; returns whether it was.
+    fn emit(&mut self, event: ContextEvent) -> bool {
+        self.flush();
+        let event = if self.held.is_empty() {
+            match self.events.try_send(event) {
+                Ok(()) | Err(TrySendError::Closed(_)) => return false,
+                Err(TrySendError::Full(event)) => event,
+            }
+        } else {
+            event
+        };
+        let Some(key) = held_key(&event) else {
+            return true;
+        };
+        self.held.retain(|(k, _)| *k != key);
+        self.held.push_back((key, event));
+        false
+    }
+
+    /// Moves what waits aside into the event stream, in order, as far as
+    /// there is room.
+    fn flush(&mut self) {
+        while let Some((key, event)) = self.held.pop_front() {
+            match self.events.try_send(event) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(event)) => {
+                    self.held.push_front((key, event));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether something waits for room.
+    fn waiting(&self) -> bool {
+        self.blocked || !self.held.is_empty()
+    }
+
+    /// Whether something waits for room that there is room for now.
+    fn ready(&self) -> bool {
+        self.waiting() && self.events.capacity() > 0
     }
 }
 
@@ -950,10 +1306,14 @@ enum Owned {
         to: To,
         len: usize,
     },
-    Event(NodeEvent),
-    /// A datagram, with whether it also confirmed a first session: in the
-    /// per-peer mode, the connection is told on the event stream apart.
+    /// An event of the node's.
+    Node(NodeEvent),
+    /// An event in a context.
+    Context(Name, ContextEvent),
+    /// A datagram, with whether it also confirmed a first session: with
+    /// per-peer delivery, the connection is told on the event stream apart.
     Datagram {
+        context: Name,
         peer: PeerId,
         data: Vec<u8>,
         relayed: bool,
@@ -963,7 +1323,7 @@ enum Owned {
     #[cfg(feature = "stream")]
     Frame {
         peer: PeerId,
-        context: Context,
+        context: Name,
         kind: FrameKind,
         data: Vec<u8>,
         connected: bool,
@@ -974,94 +1334,100 @@ enum Owned {
 fn own(output: Output<'_>) -> Owned {
     match output {
         Output::Transmit { to, len } => Owned::Transmit { to, len },
-        #[cfg(feature = "stream")]
-        Output::Event(Event::Frame {
-            peer,
-            context,
-            kind,
-            data,
-            connected,
-            ..
-        }) => Owned::Frame {
-            peer,
-            context,
-            kind,
-            data: data.to_vec(),
-            connected,
-        },
         Output::Event(event) => owned_event(event),
         Output::Nothing => Owned::Nothing,
     }
 }
 
-/// A core event the task keeps: a datagram with its connection flag, any
-/// other as the application's event.
+/// A core event, as the task keeps it.
 fn owned_event(event: Event<'_>) -> Owned {
     match event {
+        Event::Connected { peer, context } => {
+            Owned::Context(context, ContextEvent::Connected { peer })
+        }
         Event::Datagram {
             peer,
+            context,
             data,
             relayed,
             connected,
-            ..
         } => Owned::Datagram {
+            context,
             peer,
             data: data.to_vec(),
             relayed,
             connected,
-        },
-        event => event_of(event).map_or(Owned::Nothing, Owned::Event),
-    }
-}
-
-fn event_of(event: Event<'_>) -> Option<NodeEvent> {
-    Some(match event {
-        Event::Connected { peer, .. } => NodeEvent::Connected { peer },
-        Event::Datagram {
-            peer,
-            data,
-            relayed,
-            ..
-        } => NodeEvent::Datagram {
-            peer,
-            data: data.to_vec(),
-            relayed,
         },
         Event::Closed {
             peer,
+            context,
             code,
             by_peer,
-            ..
-        } => NodeEvent::Closed {
+        } => Owned::Context(
+            context,
+            ContextEvent::Closed {
+                peer,
+                code,
+                by_peer,
+            },
+        ),
+        Event::ReopenFailed {
             peer,
-            code,
-            by_peer,
+            context,
+            error,
+        } => Owned::Context(context, ContextEvent::ReopenFailed { peer, error }),
+        Event::PathChanged {
+            peer,
+            context,
+            path,
+        } => Owned::Context(context, ContextEvent::PathChanged { peer, path }),
+        Event::PeerNotAtRelay { peer } => Owned::Node(NodeEvent::PeerNotAtRelay { peer }),
+        Event::ObservedAddress { link, address } => {
+            Owned::Node(NodeEvent::ObservedAddress { link, address })
+        }
+        Event::RelayUnavailable { error } => Owned::Node(NodeEvent::RelayUnavailable { error }),
+        Event::RelayAvailable => Owned::Node(NodeEvent::RelayAvailable),
+        #[cfg(feature = "stream")]
+        Event::Frame {
+            peer,
+            context,
+            kind,
+            data,
+            connected,
+            ..
+        } => Owned::Frame {
+            peer,
+            context,
+            kind,
+            data: data.to_vec(),
+            connected,
         },
-        Event::ReopenFailed { peer, error, .. } => NodeEvent::ReopenFailed { peer, error },
-        Event::PeerNotAtRelay { peer } => NodeEvent::PeerNotAtRelay { peer },
-        Event::ObservedAddress { link, address } => NodeEvent::ObservedAddress { link, address },
-        Event::RelayUnavailable { error } => NodeEvent::RelayUnavailable { error },
-        Event::RelayAvailable => NodeEvent::RelayAvailable,
-        Event::PathChanged { peer, path, .. } => NodeEvent::PathChanged { peer, path },
         // Without the stream layer, a frame is not the application's: only
         // the connection it may confirm is.
+        #[cfg(not(feature = "stream"))]
         Event::Frame {
-            peer, connected, ..
+            peer,
+            context,
+            connected,
+            ..
         } => {
-            if !connected {
-                return None;
+            if connected {
+                Owned::Context(context, ContextEvent::Connected { peer })
+            } else {
+                Owned::Nothing
             }
-            NodeEvent::Connected { peer }
         }
         // Only the relay context accepts payloads, and the core consumes them.
-        Event::Payload { .. } => return None,
-    })
+        Event::Payload { .. } => Owned::Nothing,
+    }
 }
 
 struct Task<E, C: Profile> {
     endpoint: Endpoint<Server>,
-    context: Vec<u8>,
-    policy: Policy,
+    /// Each context's policy, the core's one admission.
+    policies: Policies,
+    /// The open contexts.
+    contexts: HashMap<Name, Open>,
     entropy: E,
     udp: UdpSocket,
     dual_stack: bool,
@@ -1072,26 +1438,23 @@ struct Task<E, C: Profile> {
     relay_other: Option<SocketAddr>,
     link: Option<LinkIo>,
     connecting: Option<Connecting>,
+    /// The node's events, and those waiting aside for room, one per kind.
     events: mpsc::Sender<NodeEvent>,
+    held: VecDeque<(NodeKind, NodeEvent)>,
+    /// Woken when the application reads while something waits for room.
+    room: Arc<Room>,
     commands: mpsc::Receiver<Command>,
+    /// The contexts whose handles were dropped or closed, with the code.
+    closes: mpsc::UnboundedReceiver<(Name, u16)>,
     stats: Stats,
     clock: Clock,
     rx: Vec<u8>,
     out: Vec<u8>,
     link_rx: Vec<u8>,
-    /// Whether messages wait in the channels for room in the event channel:
-    /// the task then also wakes when the application reads.
-    waiting_room: bool,
     /// Given every TCP connection to the relay before it connects.
     hook: Option<SocketHook>,
-    delivery: Delivery,
-    /// The open receivers, in the per-peer mode.
-    receivers: HashMap<PeerId, Arc<Shared>>,
     /// Woken by a receiver that freed room or was dropped.
     receivers_wake: Arc<Notify>,
-    /// Events waiting for room in the event channel, in order; those of a
-    /// peer and kind coalesced, the latest replacing the earlier.
-    held: VecDeque<(Option<Held>, NodeEvent)>,
     /// The message channels, and the frame they write.
     #[cfg(feature = "stream")]
     channels: Box<Channels<C>>,
@@ -1105,14 +1468,16 @@ struct Task<E, C: Profile> {
     stream: std::marker::PhantomData<C>,
 }
 
-/// A message for a peer, with its address when known and the sender's reply.
+/// A message for a peer in a context, with its address when known and the
+/// sender's reply.
 #[cfg(feature = "stream")]
-type Parked = (
-    PeerId,
-    Option<Address>,
-    Vec<u8>,
-    oneshot::Sender<Result<(), NodeError>>,
-);
+struct Parked {
+    context: Name,
+    peer: PeerId,
+    address: Option<Address>,
+    data: Vec<u8>,
+    reply: oneshot::Sender<Result<(), NodeError>>,
+}
 
 /// What woke the task.
 enum Wake {
@@ -1120,48 +1485,60 @@ enum Wake {
     Link(std::io::Result<usize>),
     Connected(std::io::Result<(TcpStream, SocketAddr, Option<SocketAddr>)>),
     Command(Option<Command>),
+    /// A context's handle was dropped, or closed.
+    CloseContext(Option<(Name, u16)>),
     Deadline,
-    /// The application read: room for an event that waited.
+    /// The application read: room for what waited.
     Room,
     /// A receiver freed room, or was dropped.
     Receivers,
 }
 
-/// What a waiting event is coalesced by: its peer, or none for the relay's
-/// reports, and its kind.
+/// What a context's waiting event is coalesced by: its peer and its kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Held(Option<PeerId>, Kind);
+struct Held(PeerId, Kind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Connected,
     Closed,
     ReopenFailed,
-    NotAtRelay,
-    Observed(Link),
-    Relay,
     PathChanged,
     #[cfg(feature = "stream")]
     ChannelReset,
 }
 
-/// The key an event is coalesced by; `None` for one that carries data.
-fn held_key(event: &NodeEvent) -> Option<Held> {
+/// What a node's waiting event is coalesced by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    NotAtRelay(PeerId),
+    Observed(Link),
+    /// The relay's state: whether it is available, the latest only.
+    Relay,
+}
+
+/// The key a context's event is coalesced by; `None` for one that carries
+/// data.
+fn held_key(event: &ContextEvent) -> Option<Held> {
     Some(match *event {
-        NodeEvent::Connected { peer } => Held(Some(peer), Kind::Connected),
-        NodeEvent::Closed { peer, .. } => Held(Some(peer), Kind::Closed),
-        NodeEvent::ReopenFailed { peer, .. } => Held(Some(peer), Kind::ReopenFailed),
-        NodeEvent::PeerNotAtRelay { peer } => Held(Some(peer), Kind::NotAtRelay),
-        NodeEvent::ObservedAddress { link, .. } => Held(None, Kind::Observed(link)),
-        // The relay's state: whether it is available, the latest only.
-        NodeEvent::RelayUnavailable { .. } | NodeEvent::RelayAvailable => Held(None, Kind::Relay),
-        NodeEvent::PathChanged { peer, .. } => Held(Some(peer), Kind::PathChanged),
+        ContextEvent::Connected { peer } => Held(peer, Kind::Connected),
+        ContextEvent::Closed { peer, .. } => Held(peer, Kind::Closed),
+        ContextEvent::ReopenFailed { peer, .. } => Held(peer, Kind::ReopenFailed),
+        ContextEvent::PathChanged { peer, .. } => Held(peer, Kind::PathChanged),
         #[cfg(feature = "stream")]
-        NodeEvent::ChannelReset { peer, .. } => Held(Some(peer), Kind::ChannelReset),
-        NodeEvent::Datagram { .. } => return None,
+        ContextEvent::ChannelReset { peer, .. } => Held(peer, Kind::ChannelReset),
+        ContextEvent::Datagram { .. } => return None,
         #[cfg(feature = "stream")]
-        NodeEvent::Message { .. } => return None,
+        ContextEvent::Message { .. } => return None,
     })
+}
+
+const fn node_kind(event: &NodeEvent) -> NodeKind {
+    match *event {
+        NodeEvent::PeerNotAtRelay { peer } => NodeKind::NotAtRelay(peer),
+        NodeEvent::ObservedAddress { link, .. } => NodeKind::Observed(link),
+        NodeEvent::RelayUnavailable { .. } | NodeEvent::RelayAvailable => NodeKind::Relay,
+    }
 }
 
 impl<E: SystemEntropy, C: Profile> Task<E, C> {
@@ -1184,20 +1561,26 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 }
                 armed = deadline;
             }
-            let reading = self.reading();
-            let waiting = self.waiting_room || !self.held.is_empty();
-            let wake = tokio::select! {
-                r = self.udp.recv_from(&mut self.rx), if reading => Wake::Udp(r),
-                r = read_link(&mut self.link, &mut self.link_rx), if reading && self.link.is_some() => Wake::Link(r),
-                r = poll_connecting(&mut self.connecting), if self.connecting.is_some() => Wake::Connected(r),
-                c = self.commands.recv() => Wake::Command(c),
-                () = &mut sleep, if armed.is_some() => Wake::Deadline,
-                () = room(&self.events, waiting) => Wake::Room,
-                () = self.receivers_wake.notified() => Wake::Receivers,
+            let waiting = self.waiting();
+            self.room.waiting.store(waiting, Ordering::Release);
+            // Room may have opened before the flag was up: no wake would come.
+            let wake = if waiting && self.room_now() {
+                Wake::Room
+            } else {
+                tokio::select! {
+                    r = self.udp.recv_from(&mut self.rx) => Wake::Udp(r),
+                    r = read_link(&mut self.link, &mut self.link_rx), if self.link.is_some() => Wake::Link(r),
+                    r = poll_connecting(&mut self.connecting), if self.connecting.is_some() => Wake::Connected(r),
+                    c = self.commands.recv() => Wake::Command(c),
+                    c = self.closes.recv() => Wake::CloseContext(c),
+                    () = &mut sleep, if armed.is_some() => Wake::Deadline,
+                    () = self.room.notify.notified(), if waiting => Wake::Room,
+                    () = self.receivers_wake.notified() => Wake::Receivers,
+                }
             };
             match wake {
                 Wake::Udp(Ok((len, from))) => self.udp_packet(len, from).await,
-                Wake::Udp(Err(_)) => {}
+                Wake::Udp(Err(_)) | Wake::CloseContext(None) => {}
                 Wake::Link(Ok(0) | Err(_)) => {
                     self.link = None;
                     let now = self.now();
@@ -1205,8 +1588,17 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 }
                 Wake::Link(Ok(len)) => self.link_bytes(len).await,
                 Wake::Connected(result) => self.connected(result).await,
-                Wake::Command(None) => return,
+                Wake::Command(None) => {
+                    // The last handle is gone: the contexts it closed close
+                    // first, their closes sent.
+                    while let Ok((context, code)) = self.closes.try_recv() {
+                        self.close_context(context, code);
+                    }
+                    self.drain().await;
+                    return;
+                }
                 Wake::Command(Some(command)) => self.command(command).await,
+                Wake::CloseContext(Some((context, code))) => self.close_context(context, code),
                 // An elapsed timer is ready at every poll: armed again below.
                 Wake::Deadline => armed = None,
                 Wake::Room => self.flush(),
@@ -1214,10 +1606,22 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             }
             self.take_ready().await;
             deadline = self.drain().await;
-            if self.events.is_closed() && self.commands.is_closed() {
+            if self.events.is_closed() && self.commands.is_closed() && self.contexts.is_empty() {
                 return;
             }
         }
+    }
+
+    /// Whether something waits for room in an event stream: events without
+    /// data aside, or messages in their channels.
+    fn waiting(&self) -> bool {
+        !self.held.is_empty() || self.contexts.values().any(Open::waiting)
+    }
+
+    /// Whether there is room now for something that waits.
+    fn room_now(&self) -> bool {
+        (!self.held.is_empty() && self.events.capacity() > 0)
+            || self.contexts.values().any(Open::ready)
     }
 
     /// Handles, without waiting, the commands and datagrams already there,
@@ -1230,9 +1634,11 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 self.command(command).await;
                 took = true;
             }
-            if self.reading()
-                && let Ok((len, from)) = self.udp.try_recv_from(&mut self.rx)
-            {
+            if let Ok((context, code)) = self.closes.try_recv() {
+                self.close_context(context, code);
+                took = true;
+            }
+            if let Ok((len, from)) = self.udp.try_recv_from(&mut self.rx) {
                 self.udp_packet(len, from).await;
                 took = true;
             }
@@ -1255,7 +1661,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 packet,
                 Link::Udp,
                 now,
-                &mut self.policy,
+                &mut self.policies,
                 &mut self.entropy,
                 &mut self.out,
             ))
@@ -1265,7 +1671,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 packet,
                 Source::Direct(source.get(..source_len).unwrap_or_default()),
                 now,
-                &mut self.policy,
+                &mut self.policies,
                 &mut self.entropy,
                 &mut self.out,
             ))
@@ -1307,7 +1713,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 &mut packet,
                 Link::Tcp,
                 now,
-                &mut self.policy,
+                &mut self.policies,
                 &mut self.entropy,
                 &mut self.out,
             ));
@@ -1352,30 +1758,48 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per command, each a call or two into the core"
+    )]
     async fn command(&mut self, command: Command) {
         let now = self.now();
         match command {
-            Command::Send(to, data, reply) => {
+            Command::Open(opening, reply) => {
+                let _ = reply.send(self.open(opening));
+            }
+            Command::SetAccess(context, access, code, reply) => {
+                let _ = reply.send(self.set_access(context, access, code));
+            }
+            Command::Send(context, to, data, reply) => {
+                if !self.contexts.contains_key(&context) {
+                    let _ = reply.send(Err(NodeError::ContextClosed));
+                    return;
+                }
                 let result = self.endpoint.send(
                     Target::Address(&to),
-                    &self.context,
+                    context.as_bytes(),
                     &data,
                     DIRECT_PATH_MAX,
                     now,
-                    &mut self.policy,
+                    &mut self.policies,
                     &mut self.entropy,
                     &mut self.out,
                 );
                 self.sent(result, reply).await;
             }
-            Command::SendToPeer(to, data, reply) => {
+            Command::SendToPeer(context, to, data, reply) => {
+                if !self.contexts.contains_key(&context) {
+                    let _ = reply.send(Err(NodeError::ContextClosed));
+                    return;
+                }
                 let result = self.endpoint.send(
                     Target::Peer(to),
-                    &self.context,
+                    context.as_bytes(),
                     &data,
                     DIRECT_PATH_MAX,
                     now,
-                    &mut self.policy,
+                    &mut self.policies,
                     &mut self.entropy,
                     &mut self.out,
                 );
@@ -1390,15 +1814,19 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 let _ = reply.send(result);
             }
             Command::Reachable(on) => self.endpoint.set_reachable(on, now),
-            Command::Close(peer, code) => {
+            Command::Close(context, peer, code) => {
+                if !self.contexts.contains_key(&context) {
+                    return;
+                }
                 let output =
                     own(self
                         .endpoint
-                        .close(peer, &self.context, code, now, &mut self.out));
+                        .close(peer, context.as_bytes(), code, now, &mut self.out));
                 self.execute(output, None).await;
                 #[cfg(feature = "stream")]
-                self.close_channel(peer, code);
+                self.channels.session_closed(peer, context, code);
                 self.close_receiver(
+                    context,
                     peer,
                     SessionClosed {
                         code,
@@ -1408,15 +1836,19 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             }
             Command::ClosePeer(peer, code) => {
                 self.endpoint.close_peer(peer, code);
-                #[cfg(feature = "stream")]
-                self.close_channel(peer, code);
-                self.close_receiver(
-                    peer,
-                    SessionClosed {
-                        code,
-                        by_peer: false,
-                    },
-                );
+                let contexts: Vec<Name> = self.contexts.keys().copied().collect();
+                for context in contexts {
+                    #[cfg(feature = "stream")]
+                    self.channels.session_closed(peer, context, code);
+                    self.close_receiver(
+                        context,
+                        peer,
+                        SessionClosed {
+                            code,
+                            by_peer: false,
+                        },
+                    );
+                }
             }
             Command::NetworkChanged => {
                 self.report_interfaces();
@@ -1439,27 +1871,35 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 }
                 let _ = reply.send(result.map_err(NodeError::Exclude));
             }
-            Command::Binding(peer, reply) => {
-                let _ = reply.send(self.endpoint.channel_binding(&peer, &self.context));
+            Command::Binding(context, peer, reply) => {
+                let _ = reply.send(self.endpoint.channel_binding(&peer, context.as_bytes()));
             }
             Command::Stats(reply) => {
                 let _ = reply.send(self.stats);
             }
-            Command::Path(peer, reply) => {
-                let _ = reply.send(self.endpoint.path_info(&peer, &self.context));
+            Command::Path(context, peer, reply) => {
+                let _ = reply.send(self.endpoint.path_info(&peer, context.as_bytes()));
             }
             Command::RelayUdpProven(reply) => {
                 let _ = reply.send(self.endpoint.relay_udp_proven(now));
             }
-            Command::Receiver(peer, reply) => {
-                let _ = reply.send(self.open_receiver(peer, now));
+            Command::Receiver(context, peer, reply) => {
+                let _ = reply.send(self.open_receiver(context, peer, now));
             }
             #[cfg(feature = "stream")]
             Command::SendMessage(parked) => {
+                if !self.contexts.contains_key(&parked.context) {
+                    let _ = parked.reply.send(Err(NodeError::ContextClosed));
+                    return;
+                }
                 // A sender that went away no longer waits.
-                self.parked.retain(|(.., reply)| !reply.is_closed());
-                // Behind those already waiting for the same peer: in order.
-                if self.parked.iter().any(|(p, ..)| *p == parked.0) {
+                self.parked.retain(|parked| !parked.reply.is_closed());
+                // Behind those already waiting for the same channel: in order.
+                if self
+                    .parked
+                    .iter()
+                    .any(|p| p.peer == parked.peer && p.context == parked.context)
+                {
                     self.parked.push(parked);
                 } else {
                     self.offer(parked, now);
@@ -1468,30 +1908,130 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         }
     }
 
-    /// This side closed the session with `peer`. The core raises no event for
-    /// it: the channel is reset here, as the peer's is on the close
-    /// (DESIGN.md §8).
-    #[cfg(feature = "stream")]
-    fn close_channel(&mut self, peer: PeerId, code: u16) {
-        if let Ok(context) = Context::new(&self.context) {
-            self.channels.session_closed(peer, context, code);
+    /// Opens a context: serves it as its access says, and keeps its stream.
+    fn open(&mut self, opening: Opening) -> Result<(), NodeError> {
+        let Opening {
+            name,
+            access,
+            delivery,
+            events,
+            #[cfg(feature = "stream")]
+            max_message,
+        } = opening;
+        let context = Name::new(&name)
+            .map_err(|error| NodeError::Context(ResponderError::ContextTooLong(error)))?;
+        if name == convesso_core::relay::CONTEXT {
+            return Err(NodeError::Context(ResponderError::RelayContext));
+        }
+        if self.contexts.contains_key(&context) {
+            return Err(NodeError::Context(ResponderError::AlreadyServed));
+        }
+        #[cfg(feature = "stream")]
+        {
+            let largest = max_message.unwrap_or(C::MAX_MESSAGE);
+            if largest > C::MAX_MESSAGE {
+                return Err(NodeError::Message(convesso_stream::SendError::TooLarge {
+                    size: largest,
+                    max: C::MAX_MESSAGE,
+                }));
+            }
+            if let Delivery::PerPeer { messages, .. } = delivery {
+                let needed = largest + ELEMENT_COST;
+                if messages < needed {
+                    return Err(NodeError::Budget {
+                        budget: messages,
+                        needed,
+                    });
+                }
+            }
+        }
+        if let Some(access) = core_access(&access) {
+            self.endpoint
+                .serve(&name, access)
+                .map_err(NodeError::Context)?;
+        }
+        #[cfg(feature = "stream")]
+        if let Err(error) = self.channels.set_context(
+            &name,
+            max_message,
+            matches!(delivery, Delivery::PerPeer { .. }),
+        ) {
+            // Not opened: nothing of it stays.
+            let _ = self.endpoint.close_context(&name, DROPPED);
+            return Err(NodeError::Message(error));
+        }
+        if let Access::Admit(policy) = access {
+            self.policies.0.insert(context, policy);
+        }
+        self.contexts.insert(
+            context,
+            Open {
+                events,
+                held: VecDeque::new(),
+                delivery,
+                receivers: HashMap::new(),
+                blocked: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Changes a context's access, judging again the sessions it accepted.
+    fn set_access(&mut self, context: Name, access: Access, code: u16) -> Result<(), NodeError> {
+        if !self.contexts.contains_key(&context) {
+            return Err(NodeError::ContextClosed);
+        }
+        let core = core_access(&access);
+        let previous = self.policies.0.remove(&context);
+        if let Access::Admit(policy) = access {
+            self.policies.0.insert(context, policy);
+        }
+        let result = self
+            .endpoint
+            .set_access(context.as_bytes(), core, code, &mut self.policies)
+            .map_err(NodeError::Context);
+        if result.is_err() {
+            // Refused: the context keeps the access it had.
+            self.policies.0.remove(&context);
+            if let Some(previous) = previous {
+                self.policies.0.insert(context, previous);
+            }
+        }
+        result
+    }
+
+    /// Closes a context: its sessions with `code`, its channels, its
+    /// receivers; its event stream ends.
+    fn close_context(&mut self, context: Name, code: u16) {
+        let Some(open) = self.contexts.remove(&context) else {
+            return;
+        };
+        let _ = self.endpoint.close_context(context.as_bytes(), code);
+        self.policies.0.remove(&context);
+        #[cfg(feature = "stream")]
+        {
+            self.channels.context_closed(context, code);
+            for parked in std::mem::take(&mut self.parked) {
+                if parked.context == context {
+                    let _ = parked.reply.send(Err(NodeError::ContextClosed));
+                } else {
+                    self.parked.push(parked);
+                }
+            }
+        }
+        for (_, shared) in open.receivers {
+            shared.lock().closed.get_or_insert(SessionClosed {
+                code,
+                by_peer: false,
+            });
+            shared.closed();
         }
     }
 
-    /// Whether to read the socket and the relay link: in the event-stream
-    /// mode, only while the event channel has room and nothing waits aside,
-    /// since datagrams cannot be coalesced; always in the per-peer mode,
-    /// whose event stream carries none.
-    fn reading(&self) -> bool {
-        match self.delivery {
-            Delivery::Events => self.held.is_empty() && self.events.capacity() > 0,
-            Delivery::PerPeer { .. } => true,
-        }
-    }
-
-    /// Hands an event to the application without ever waiting for it: into
-    /// the event channel, or aside while it is full (`DESIGN.md §5`).
-    fn emit(&mut self, event: NodeEvent) {
+    /// Hands a node event to the application without ever waiting for it:
+    /// into the node's stream, or aside, one per kind, while it is full.
+    fn emit_node(&mut self, event: NodeEvent) {
+        self.flush_node();
         let event = if self.held.is_empty() {
             match self.events.try_send(event) {
                 Ok(()) | Err(TrySendError::Closed(_)) => return,
@@ -1500,34 +2040,57 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         } else {
             event
         };
-        let key = held_key(&event);
-        if key.is_some() {
-            self.held.retain(|(k, _)| *k != key);
-        }
-        self.held.push_back((key, event));
+        let kind = node_kind(&event);
+        self.held.retain(|(k, _)| *k != kind);
+        self.held.push_back((kind, event));
     }
 
-    /// Moves what waits aside into the event channel, in order, as far as
-    /// there is room.
-    fn flush(&mut self) {
-        while let Some((key, event)) = self.held.pop_front() {
+    fn flush_node(&mut self) {
+        while let Some((kind, event)) = self.held.pop_front() {
             match self.events.try_send(event) {
                 Ok(()) | Err(TrySendError::Closed(_)) => {}
                 Err(TrySendError::Full(event)) => {
-                    self.held.push_front((key, event));
+                    self.held.push_front((kind, event));
                     return;
                 }
             }
         }
     }
 
-    /// Opens `peer`'s receiver, granting its channel the message budget. A
-    /// receiver dropped and not yet settled is settled first.
-    fn open_receiver(&mut self, peer: PeerId, now: Instant) -> Result<Receiver, NodeError> {
-        let Delivery::PerPeer { messages, .. } = self.delivery else {
+    /// Hands an event to its context; a datagram that finds no room is
+    /// dropped and counted. An event of a context no longer open is dropped.
+    fn emit(&mut self, context: Name, event: ContextEvent) {
+        if let Some(open) = self.contexts.get_mut(&context)
+            && open.emit(event)
+        {
+            self.stats.datagrams_dropped += 1;
+        }
+    }
+
+    /// Moves what waits aside into the event streams, as far as there is
+    /// room.
+    fn flush(&mut self) {
+        self.flush_node();
+        for open in self.contexts.values_mut() {
+            open.flush();
+        }
+    }
+
+    /// Opens `peer`'s receiver in `context`, granting its channel the message
+    /// budget. A receiver dropped and not yet settled is settled first.
+    fn open_receiver(
+        &mut self,
+        context: Name,
+        peer: PeerId,
+        now: Instant,
+    ) -> Result<Receiver, NodeError> {
+        let Some(open) = self.contexts.get(&context) else {
+            return Err(NodeError::ContextClosed);
+        };
+        let Delivery::PerPeer { messages, .. } = open.delivery else {
             return Err(NodeError::NotPerPeer);
         };
-        if let Some(shared) = self.receivers.get(&peer) {
+        if let Some(shared) = open.receivers.get(&peer) {
             if !shared.lock().dropped {
                 return Err(NodeError::ReceiverOpen);
             }
@@ -1536,11 +2099,13 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         let shared = Shared::new(self.receivers_wake.clone());
         #[cfg(feature = "stream")]
         self.channels
-            .grant(peer, &self.context, messages)
+            .grant(peer, context.as_bytes(), messages)
             .map_err(NodeError::Message)?;
         #[cfg(not(feature = "stream"))]
         let _ = messages;
-        self.receivers.insert(peer, shared.clone());
+        if let Some(open) = self.contexts.get_mut(&context) {
+            open.receivers.insert(peer, shared.clone());
+        }
         Ok(Receiver::new(peer, shared))
     }
 
@@ -1553,48 +2118,61 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
     /// a receiver the application dropped, which tells the peer.
     fn settle_receivers_at(&mut self, now: Instant) {
         let mut dropped = Vec::new();
-        for (&peer, shared) in &self.receivers {
-            #[cfg_attr(not(feature = "stream"), allow(unused_mut))]
-            let mut state = shared.lock();
-            if state.dropped {
-                dropped.push(peer);
-                continue;
-            }
-            #[cfg(feature = "stream")]
-            {
-                let freed = std::mem::take(&mut state.freed);
-                drop(state);
-                if freed > 0 {
-                    let _ = self.channels.grant(peer, &self.context, freed);
+        #[cfg(feature = "stream")]
+        let mut grants = Vec::new();
+        for (&context, open) in &self.contexts {
+            for (&peer, shared) in &open.receivers {
+                #[cfg_attr(not(feature = "stream"), allow(unused_mut))]
+                let mut state = shared.lock();
+                if state.dropped {
+                    dropped.push((context, peer));
+                    continue;
+                }
+                #[cfg(feature = "stream")]
+                {
+                    let freed = std::mem::take(&mut state.freed);
+                    if freed > 0 {
+                        grants.push((context, peer, freed));
+                    }
                 }
             }
         }
-        for peer in dropped {
-            self.receivers.remove(&peer);
-            #[cfg(feature = "stream")]
-            if let Ok(context) = Context::new(&self.context) {
-                self.channels.reset_here(peer, context, now);
+        #[cfg(feature = "stream")]
+        for (context, peer, freed) in grants {
+            let _ = self.channels.grant(peer, context.as_bytes(), freed);
+        }
+        for (context, peer) in dropped {
+            if let Some(open) = self.contexts.get_mut(&context) {
+                open.receivers.remove(&peer);
             }
+            #[cfg(feature = "stream")]
+            self.channels.reset_here(peer, context, now);
         }
         #[cfg(not(feature = "stream"))]
         let _ = now;
     }
 
-    /// The session with `peer` ended: its receiver says so once it has been
-    /// read up to here, and stays closed.
-    fn close_receiver(&mut self, peer: PeerId, closed: SessionClosed) {
-        if let Some(shared) = self.receivers.remove(&peer) {
+    /// The session with `peer` in `context` ended: its receiver says so once
+    /// it has been read up to here, and stays closed.
+    fn close_receiver(&mut self, context: Name, peer: PeerId, closed: SessionClosed) {
+        let Some(open) = self.contexts.get_mut(&context) else {
+            return;
+        };
+        if let Some(shared) = open.receivers.remove(&peer) {
             shared.lock().closed.get_or_insert(closed);
             shared.closed();
         }
     }
 
-    /// A datagram, in the per-peer mode: to its receiver, or dropped.
-    fn receive_datagram(&mut self, peer: PeerId, data: Vec<u8>, relayed: bool) {
-        let Delivery::PerPeer { datagrams, .. } = self.delivery else {
+    /// A datagram, with per-peer delivery: to its receiver, or dropped.
+    fn receive_datagram(&mut self, context: Name, peer: PeerId, data: Vec<u8>, relayed: bool) {
+        let Some(open) = self.contexts.get(&context) else {
             return;
         };
-        if let Some(shared) = self.receivers.get(&peer) {
+        let Delivery::PerPeer { datagrams, .. } = open.delivery else {
+            return;
+        };
+        if let Some(shared) = open.receivers.get(&peer) {
             let mut state = shared.lock();
             let cost = data.len() + ELEMENT_COST;
             if !state.dropped && state.datagram_bytes + cost <= datagrams {
@@ -1608,14 +2186,17 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         self.stats.datagrams_dropped += 1;
     }
 
-    /// A message, in the per-peer mode: to its receiver, whose room the
+    /// A message, with per-peer delivery: to its receiver, whose room the
     /// channel's credit reserved.
     #[cfg(feature = "stream")]
-    fn receive_message(&mut self, peer: PeerId, data: Vec<u8>) {
+    fn receive_message(&mut self, context: Name, peer: PeerId, data: Vec<u8>) {
         // Credit is granted only for an open receiver, and goes with it: a
         // message for none was meant for one just dropped, whose channel is
         // about to be reset.
-        if let Some(shared) = self.receivers.get(&peer) {
+        let Some(open) = self.contexts.get(&context) else {
+            return;
+        };
+        if let Some(shared) = open.receivers.get(&peer) {
             let mut state = shared.lock();
             if !state.dropped {
                 state.held += data.len() + ELEMENT_COST;
@@ -1626,15 +2207,18 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         }
     }
 
-    /// A channel reset, in the per-peer mode: to its receiver after the
+    /// A channel reset, with per-peer delivery: to its receiver after the
     /// messages before it, and the channel granted the receiver's free room
     /// again, since the reset left it no credit.
     #[cfg(feature = "stream")]
-    fn receive_reset(&mut self, peer: PeerId, reason: convesso_stream::Reason) {
-        let Delivery::PerPeer { messages, .. } = self.delivery else {
+    fn receive_reset(&mut self, context: Name, peer: PeerId, reason: convesso_stream::Reason) {
+        let Some(open) = self.contexts.get(&context) else {
             return;
         };
-        let Some(shared) = self.receivers.get(&peer) else {
+        let Delivery::PerPeer { messages, .. } = open.delivery else {
+            return;
+        };
+        let Some(shared) = open.receivers.get(&peer) else {
             return;
         };
         let mut state = shared.lock();
@@ -1646,44 +2230,50 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         let room = messages.saturating_sub(state.held);
         drop(state);
         shared.messages_ready();
-        let _ = self.channels.grant(peer, &self.context, room);
+        let _ = self.channels.grant(peer, context.as_bytes(), room);
+    }
+
+    /// Whether `context` delivers per peer.
+    fn per_peer(&self, context: &Name) -> bool {
+        self.contexts
+            .get(context)
+            .is_some_and(|open| matches!(open.delivery, Delivery::PerPeer { .. }))
     }
 
     /// Offers a message to its channel: accepted or refused, the sender is
     /// answered; without room, it waits for the channel's `Writable`.
     #[cfg(feature = "stream")]
     fn offer(&mut self, parked: Parked, now: Instant) -> bool {
-        let (peer, address, data, reply) = parked;
         // A sender that went away no longer wants its message sent.
-        if reply.is_closed() {
+        if parked.reply.is_closed() {
             return true;
         }
         let result = self.channels.send_message(
-            peer,
-            address.as_ref(),
-            &self.context,
-            &data,
+            parked.peer,
+            parked.address.as_ref(),
+            parked.context.as_bytes(),
+            &parked.data,
             now,
             &mut self.entropy,
         );
         match result {
             Err(convesso_stream::SendError::Full) => {
-                self.parked.push((peer, address, data, reply));
+                self.parked.push(parked);
                 false
             }
             other => {
-                let _ = reply.send(other.map_err(NodeError::Message));
+                let _ = parked.reply.send(other.map_err(NodeError::Message));
                 true
             }
         }
     }
 
-    /// Room opened in `peer`'s channel: offers its waiting messages, in order.
+    /// Room opened in a channel: offers its waiting messages, in order.
     #[cfg(feature = "stream")]
-    fn retry_parked(&mut self, peer: PeerId, now: Instant) {
+    fn retry_parked(&mut self, context: Name, peer: PeerId, now: Instant) {
         let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
             .into_iter()
-            .partition(|(p, ..)| *p == peer);
+            .partition(|p| p.peer == peer && p.context == context);
         self.parked = others;
         let mut waiting = mine.into_iter();
         for parked in waiting.by_ref() {
@@ -1733,14 +2323,20 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         let mut worked = false;
         loop {
             let now = self.now();
-            // A message is handed out only when the application can take it:
-            // otherwise the channel keeps it and its window closes.
-            let deliver = match self.delivery {
-                Delivery::Events => self.held.is_empty() && self.events.capacity() > 0,
-                Delivery::PerPeer { .. } => true,
+            // A context's message is handed out only when the application can
+            // take it: otherwise its channel keeps it and its window closes,
+            // and the other contexts go on.
+            let contexts = &self.contexts;
+            let mut blocked: Vec<Name> = Vec::new();
+            let deliver = |context: &Name| {
+                let can = contexts.get(context).is_some_and(Open::can_deliver);
+                if !can && !blocked.contains(context) {
+                    blocked.push(*context);
+                }
+                can
             };
-            self.waiting_room = !deliver;
-            let output = match self.channels.poll(now, deliver, &mut self.frame) {
+            let poll = self.channels.poll_with(now, deliver, &mut self.frame);
+            let output = match poll {
                 StreamPoll::SendFrame {
                     peer,
                     context,
@@ -1754,7 +2350,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                         kind,
                         frame,
                         now,
-                        &mut self.policy,
+                        &mut self.policies,
                         &mut self.entropy,
                         &mut self.out,
                     ) {
@@ -1774,37 +2370,60 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                         &address,
                         context.as_bytes(),
                         now,
-                        &mut self.policy,
+                        &mut self.policies,
                         &mut self.entropy,
                         &mut self.out,
                     )
                     .map_or(Owned::Nothing, own),
-                StreamPoll::Event(StreamEvent::Message { peer, data, .. }) => {
+                StreamPoll::Event(StreamEvent::Message {
+                    peer,
+                    context,
+                    data,
+                }) => {
                     let data = data.to_vec();
-                    if matches!(self.delivery, Delivery::PerPeer { .. }) {
-                        self.receive_message(peer, data);
+                    if self.per_peer(&context) {
+                        self.receive_message(context, peer, data);
                         Owned::Nothing
                     } else {
-                        Owned::Event(NodeEvent::Message { peer, data })
+                        Owned::Context(context, ContextEvent::Message { peer, data })
                     }
                 }
-                StreamPoll::Event(StreamEvent::Reset { peer, reason, .. }) => {
-                    if matches!(self.delivery, Delivery::PerPeer { .. }) {
-                        self.receive_reset(peer, reason);
+                StreamPoll::Event(StreamEvent::Reset {
+                    peer,
+                    context,
+                    reason,
+                }) => {
+                    if self.per_peer(&context) {
+                        self.receive_reset(context, peer, reason);
                         Owned::Nothing
                     } else {
-                        Owned::Event(NodeEvent::ChannelReset { peer, reason })
+                        Owned::Context(context, ContextEvent::ChannelReset { peer, reason })
                     }
                 }
-                StreamPoll::Event(StreamEvent::Writable { peer, .. }) => {
-                    self.retry_parked(peer, now);
+                StreamPoll::Event(StreamEvent::Writable { peer, context }) => {
+                    self.retry_parked(context, peer, now);
                     Owned::Nothing
                 }
-                StreamPoll::Wait(at) => return (Some(at), worked),
-                StreamPoll::Idle => return (None, worked),
+                StreamPoll::Wait(at) => {
+                    self.mark_blocked(&blocked);
+                    return (Some(at), worked);
+                }
+                StreamPoll::Idle => {
+                    self.mark_blocked(&blocked);
+                    return (None, worked);
+                }
             };
+            self.mark_blocked(&blocked);
             worked = true;
             self.execute(output, None).await;
+        }
+    }
+
+    /// Records which contexts' messages wait for room in their streams.
+    #[cfg(feature = "stream")]
+    fn mark_blocked(&mut self, blocked: &[Name]) {
+        for (context, open) in &mut self.contexts {
+            open.blocked = blocked.contains(context);
         }
     }
 
@@ -1812,9 +2431,9 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
     async fn drain_core(&mut self) -> Option<Instant> {
         loop {
             let now = self.now();
-            let poll = self
-                .endpoint
-                .poll(now, &mut self.policy, &mut self.entropy, &mut self.out);
+            let poll =
+                self.endpoint
+                    .poll(now, &mut self.policies, &mut self.entropy, &mut self.out);
             match poll {
                 Poll::Transmit { to, len } => self.execute(Owned::Transmit { to, len }, None).await,
                 Poll::Event(event) => {
@@ -1878,53 +2497,55 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 let now = self.now();
                 self.channels.handle_frame(peer, context, kind, &data, now);
                 if connected {
-                    let _ = self.events.send(NodeEvent::Connected { peer }).await;
+                    self.emit(context, ContextEvent::Connected { peer });
                 }
             }
             Owned::Datagram {
+                context,
                 peer,
                 data,
                 relayed,
                 connected,
             } => {
-                if matches!(self.delivery, Delivery::PerPeer { .. }) {
+                if self.per_peer(&context) {
                     if connected {
-                        self.emit(NodeEvent::Connected { peer });
+                        self.emit(context, ContextEvent::Connected { peer });
                     }
-                    self.receive_datagram(peer, data, relayed);
+                    self.receive_datagram(context, peer, data, relayed);
                 } else {
                     // The application learns of the connection with the
                     // datagram itself.
-                    self.emit(NodeEvent::Datagram {
-                        peer,
-                        data,
-                        relayed,
-                    });
+                    self.emit(
+                        context,
+                        ContextEvent::Datagram {
+                            peer,
+                            data,
+                            relayed,
+                        },
+                    );
                 }
             }
-            Owned::Event(event) => {
+            Owned::Node(event) => self.emit_node(event),
+            Owned::Context(context, event) => {
                 #[cfg(feature = "stream")]
-                if let Ok(context) = Context::new(&self.context) {
-                    match event {
-                        NodeEvent::Closed { peer, code, .. } => {
-                            self.channels.session_closed(peer, context, code);
-                        }
-                        NodeEvent::ReopenFailed { peer, error } => {
-                            self.channels.reopen_failed(peer, context, error);
-                        }
-                        _ => {}
+                match event {
+                    ContextEvent::Closed { peer, code, .. } => {
+                        self.channels.session_closed(peer, context, code);
                     }
+                    ContextEvent::ReopenFailed { peer, error } => {
+                        self.channels.reopen_failed(peer, context, error);
+                    }
+                    _ => {}
                 }
-                if matches!(self.delivery, Delivery::PerPeer { .. })
-                    && let NodeEvent::Closed {
-                        peer,
-                        code,
-                        by_peer,
-                    } = event
+                if let ContextEvent::Closed {
+                    peer,
+                    code,
+                    by_peer,
+                } = event
                 {
-                    self.close_receiver(peer, SessionClosed { code, by_peer });
+                    self.close_receiver(context, peer, SessionClosed { code, by_peer });
                 }
-                self.emit(event);
+                self.emit(context, event);
             }
             Owned::Transmit { to, len } => {
                 let Some(packet) = self.out.get(..len) else {
@@ -1982,13 +2603,13 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
     }
 }
 
-/// Resolves once the event channel has room, when `waiting`; never otherwise.
-async fn room(events: &mpsc::Sender<NodeEvent>, waiting: bool) {
-    if waiting {
-        // The permit is dropped at once: only the wake is wanted.
-        let _ = events.reserve().await;
-    } else {
-        std::future::pending::<()>().await;
+/// The core's access for the driver's: `None` for a dial-only context, which
+/// the core does not serve.
+const fn core_access(access: &Access) -> Option<handshake::Access> {
+    match access {
+        Access::Everyone | Access::Admit(_) => Some(handshake::Access::Policy),
+        Access::Bound(peer) => Some(handshake::Access::Bound(*peer)),
+        Access::DialOnly => None,
     }
 }
 

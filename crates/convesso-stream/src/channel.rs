@@ -256,6 +256,9 @@ pub(crate) struct Channel<C: StreamConfig> {
     /// The bytes the reader still takes, with delivery credit on; `None`
     /// with it off, when every message may be handed out.
     credit: Option<usize>,
+    /// The largest message this side takes and sends: its context's, at most
+    /// the configuration's.
+    max_message: usize,
     unacked: usize,
     ack_now: bool,
     ack_deadline: Option<Instant>,
@@ -273,9 +276,9 @@ pub(crate) struct Channel<C: StreamConfig> {
 }
 
 impl<C: StreamConfig> Channel<C> {
-    /// A channel; with `credit`, it hands out nothing until credit is
-    /// granted.
-    pub(crate) fn new(credit: bool) -> Self {
+    /// A channel taking messages up to `max_message`; with `credit`, it
+    /// hands out nothing until credit is granted.
+    pub(crate) fn new(credit: bool, max_message: usize) -> Self {
         Self {
             address: None,
             send_incarnation: None,
@@ -320,6 +323,7 @@ impl<C: StreamConfig> Channel<C> {
             ready: None,
             delivered: false,
             credit: credit.then_some(0),
+            max_message: max_message.min(C::MAX_MESSAGE),
             unacked: 0,
             ack_now: false,
             ack_deadline: None,
@@ -350,6 +354,18 @@ impl<C: StreamConfig> Channel<C> {
             && self.credit.unwrap_or(0) == 0
     }
 
+    /// Its context's limits changed: the largest message, at most the
+    /// configuration's, and whether delivery credit is on. Credit turned on
+    /// starts at none.
+    pub(crate) fn set_limits(&mut self, credit: bool, max_message: usize) {
+        self.max_message = max_message.min(C::MAX_MESSAGE);
+        self.credit = match (credit, self.credit) {
+            (false, _) => None,
+            (true, None) => Some(0),
+            (true, held) => held,
+        };
+    }
+
     /// Adds `bytes` to the delivery credit; nothing with credit off.
     pub(crate) fn grant(&mut self, bytes: usize) {
         if let Some(credit) = self.credit.as_mut() {
@@ -370,10 +386,10 @@ impl<C: StreamConfig> Channel<C> {
         if message.is_empty() {
             return Err(SendError::Empty);
         }
-        if message.len() > C::MAX_MESSAGE {
+        if message.len() > self.max_message {
             return Err(SendError::TooLarge {
                 size: message.len(),
-                max: C::MAX_MESSAGE,
+                max: self.max_message,
             });
         }
         if let Some(max) = self.peer_max.map(|max| max as usize)
@@ -387,7 +403,7 @@ impl<C: StreamConfig> Channel<C> {
         let Ok(length) = u32::try_from(message.len()) else {
             return Err(SendError::TooLarge {
                 size: message.len(),
-                max: C::MAX_MESSAGE,
+                max: self.max_message,
             });
         };
         let room = self.queue.capacity() - self.queue.len();
@@ -756,7 +772,7 @@ impl<C: StreamConfig> Channel<C> {
             self.rcv_next = 0;
         }
         if let Some(length) = data.length
-            && length as usize > C::MAX_MESSAGE
+            && length as usize > self.max_message
         {
             self.reset_answer = Some(data.incarnation);
             self.reset(Reason::MessageTooLarge);
@@ -992,7 +1008,7 @@ impl<C: StreamConfig> Channel<C> {
             false,
             self.rcv_next,
             window,
-            u32::try_from(C::MAX_MESSAGE).unwrap_or(u32::MAX),
+            u32::try_from(self.max_message).unwrap_or(u32::MAX),
         );
         let mut range: Option<Range> = None;
         for i in 0..self.early.len() {

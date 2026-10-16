@@ -7,7 +7,8 @@
 //! core's, so this driver and the embedded one behave alike.
 //!
 //! - [`start`] runs an endpoint and returns a [`Node`] handle and its
-//!   [`Events`].
+//!   [`Events`]; [`Node::context`] opens a context, returning its [`Context`]
+//!   handle and its [`ContextEvents`].
 //! - [`relay_server::serve`] runs a relay; the `convesso-relay` binary
 //!   (feature `relay-bin`) wraps it with a configuration file.
 //! - [`identity::load_or_create`] keeps an identity in a private file.
@@ -25,7 +26,8 @@ pub mod relay_config;
 #[cfg(feature = "stream")]
 pub use node::start_with_stream;
 pub use node::{
-    Config, DIRECT_PATH_MAX, Delivery, Events, Node, NodeError, NodeEvent, RelayLocation,
-    SocketHandle, SocketHook, StartError, Stats, start, start_with,
+    Access, Config, Context, ContextEvent, ContextEvents, ContextOptions, DIRECT_PATH_MAX, DROPPED,
+    Delivery, Events, Node, NodeError, NodeEvent, RelayLocation, SocketHandle, SocketHook,
+    StartError, Stats, start, start_with,
 };
 pub use receiver::{ELEMENT_COST, Received, Receiver, SessionClosed};

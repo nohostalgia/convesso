@@ -42,7 +42,7 @@ use super::{
     Output, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
-use crate::handshake::{Decision, Psk, ResponderError};
+use crate::handshake::{Access, Decision, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
 use crate::storage::{Config, Table};
@@ -477,18 +477,34 @@ impl<C: Config> Endpoint<C> {
         }
     }
 
-    /// Pins `relay`: this endpoint reaches peers it cannot reach directly
-    /// through it, and serves the relay context to it alone.
+    /// Serves the relay context to whoever admission accepts, with a payload
+    /// in first contacts: what a relay does (`PROTOCOL.md §6`).
     ///
     /// # Errors
     ///
-    /// A [`ResponderError`] when the endpoint already serves as many contexts
-    /// as it can.
+    /// A [`ResponderError`] when the relay context is served already, or the
+    /// storage profile's contexts table is full.
+    pub fn serve_relay_context(&mut self) -> Result<(), ResponderError> {
+        self.responder.serve(relay::CONTEXT, Access::Policy)?;
+        self.responder.accept_payload(relay::CONTEXT)
+    }
+
+    /// Pins `relay`: this endpoint reaches peers it cannot reach directly
+    /// through it, and serves the relay context to it alone. Pinning another
+    /// relay binds the context to that one instead.
+    ///
+    /// # Errors
+    ///
+    /// A [`ResponderError`] when the storage profile's contexts table is full.
     pub fn pin_relay(&mut self, relay: Address, now: Instant) -> Result<(), ResponderError> {
-        self.responder.serve(relay::CONTEXT)?;
-        self.responder.accept_payload(relay::CONTEXT)?;
-        self.responder.bind(relay::CONTEXT, relay.peer_id())?;
         let context = Context::new(relay::CONTEXT).map_err(ResponderError::ContextTooLong)?;
+        let access = Access::Bound(relay.peer_id());
+        if self.responder.serves(&context) {
+            self.responder.set_access(&context, access)?;
+        } else {
+            self.responder.serve(relay::CONTEXT, access)?;
+        }
+        self.responder.accept_payload(relay::CONTEXT)?;
         self.relay = Some(RelayClient {
             address: relay,
             context,

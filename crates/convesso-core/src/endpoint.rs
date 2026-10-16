@@ -22,12 +22,13 @@ use core::net::{IpAddr, SocketAddr};
 use crate::dos::{Source, SourceKey};
 use crate::handshake::messages::{TYPE_INITIATION, TYPE_INITIATION_PAYLOAD, TYPE_RESPONSE};
 use crate::handshake::{
-    Admission, ChannelBinding, Context, ContextTooLong, Dial, DialError, DialEvent, DialPoll,
-    Entropy, Established, RESPONSE_LEN, Responder, ResponderError, ResponderOutput,
+    Access, Admission, ChannelBinding, Context, ContextTooLong, Decision, Dial, DialError,
+    DialEvent, DialPoll, Entropy, Established, RESPONSE_LEN, Responder, ResponderError,
+    ResponderOutput,
 };
 use crate::identity::{Address, Identity, PeerId};
 use crate::paths::PathKind;
-use crate::relay::Link;
+use crate::relay::{self, Link};
 use crate::session::{DatagramQueue, KeyPair, QueueFull, Session};
 use crate::storage::{Config, Table};
 use crate::time::Instant;
@@ -359,12 +360,17 @@ pub struct Endpoint<C: Config> {
 }
 
 impl<C: Config> Endpoint<C> {
-    /// An endpoint for `identity`, accepting first contacts in `contexts`.
+    /// An endpoint for `identity`, serving `contexts` under
+    /// [`Access::Policy`]. With none, it answers no first contact until it
+    /// serves one, and it can dial in any context.
     ///
     /// # Errors
     ///
-    /// As [`Responder::new`].
+    /// As [`Self::serve`].
     pub fn new(identity: Identity, contexts: &[&[u8]]) -> Result<Self, ResponderError> {
+        if contexts.contains(&relay::CONTEXT) {
+            return Err(ResponderError::RelayContext);
+        }
         Ok(Self {
             responder: Responder::new(identity, contexts)?,
             dials: Default::default(),
@@ -379,14 +385,137 @@ impl<C: Config> Endpoint<C> {
         })
     }
 
-    /// Serves `context` too, and accepts first contacts with a payload in it.
+    /// Serves `context`, reached under `access`, while the endpoint runs. A
+    /// first contact in a context not served meets silence, as one in a
+    /// context unknown.
     ///
     /// # Errors
     ///
-    /// As [`Responder::serve`].
+    /// A [`ResponderError`] for the relay context, which only
+    /// [`Self::pin_relay`] or [`Self::serve_relay_context`] serve; for a
+    /// context served already; or for one more than the storage profile's
+    /// contexts table holds, the relay's included.
+    pub fn serve(&mut self, context: &[u8], access: Access) -> Result<(), ResponderError> {
+        if context == relay::CONTEXT {
+            return Err(ResponderError::RelayContext);
+        }
+        self.responder.serve(context, access)
+    }
+
+    /// Accepts first contacts with a payload in `context`, served already.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::RelayContext`] for the relay context, and
+    /// [`ResponderError::NotServed`] for a context not served.
     pub fn accept_payload(&mut self, context: &[u8]) -> Result<(), ResponderError> {
-        self.responder.serve(context)?;
+        if context == relay::CONTEXT {
+            return Err(ResponderError::RelayContext);
+        }
         self.responder.accept_payload(context)
+    }
+
+    /// Changes who may reach this endpoint in `context`: `Some(access)` serves
+    /// it under that access, `None` serves it no longer, so that it is only
+    /// dialled in.
+    ///
+    /// Every session this side accepted in it (whose latest handshake this
+    /// side answered) and every pending handshake in it that the new access
+    /// would not admit is closed, with an authenticated close that leaves
+    /// through [`Self::poll`], or discarded. Under [`Access::Policy`],
+    /// `policy` is asked again, and a refusal closes with its code; otherwise
+    /// the close carries `code`. Sessions whose latest handshake this side
+    /// started are not affected: access governs who may reach this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::RelayContext`] for the relay context, and as
+    /// [`Self::serve`] when a context not served is served.
+    pub fn set_access(
+        &mut self,
+        context: &[u8],
+        access: Option<Access>,
+        code: u16,
+        policy: &mut impl Admission,
+    ) -> Result<(), ResponderError> {
+        if context == relay::CONTEXT {
+            return Err(ResponderError::RelayContext);
+        }
+        let served = Context::new(context).map_err(ResponderError::ContextTooLong)?;
+        match access {
+            Some(access) if self.responder.serves(&served) => {
+                self.responder.set_access(&served, access)?;
+            }
+            Some(access) => self.responder.serve(context, access)?,
+            None => {
+                self.responder.stop_serving(&served);
+            }
+        }
+        self.sessions.retain(|(peer, in_context), session| {
+            if *in_context == served
+                && session.accepted
+                && session.closing.is_none()
+                && let Some(code) = refused(access, code, peer, context, policy)
+            {
+                session.closing = Some(code.max(1));
+                session.queue.clear();
+            }
+            true
+        });
+        self.responder.retain_pending(|pending| {
+            *pending.context() != served
+                || refused(access, code, pending.peer(), context, policy).is_none()
+        });
+        Ok(())
+    }
+
+    /// Closes `context`: every session in it, accepted or dialled, is closed
+    /// with `code` (the closes leave through [`Self::poll`]); its dials and
+    /// pending handshakes are discarded; and it is served no longer, freeing
+    /// its entry. Sessions in other contexts are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::RelayContext`] for the relay context.
+    pub fn close_context(&mut self, context: &[u8], code: u16) -> Result<(), ResponderError> {
+        if context == relay::CONTEXT {
+            return Err(ResponderError::RelayContext);
+        }
+        let closed = Context::new(context).map_err(ResponderError::ContextTooLong)?;
+        self.sessions.retain(|(_, in_context), session| {
+            if *in_context == closed {
+                session.closing.get_or_insert(code.max(1));
+                session.queue.clear();
+            }
+            true
+        });
+        let indices = &mut self.indices;
+        self.dials.retain(|(_, in_context), dial| {
+            if *in_context == closed {
+                for index in dial.attempt_indices() {
+                    indices.remove(&index);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.responder
+            .retain_pending(|pending| *pending.context() != closed);
+        self.responder.stop_serving(&closed);
+        Ok(())
+    }
+
+    /// Whether `context` is served: a first contact in it can be answered.
+    #[must_use]
+    pub fn serves(&self, context: &[u8]) -> bool {
+        Context::new(context).is_ok_and(|context| self.responder.serves(&context))
+    }
+
+    /// How many contexts are served, the relay's included.
+    #[must_use]
+    pub fn contexts_served(&self) -> usize {
+        self.responder.contexts_served()
     }
 
     /// This endpoint's identity.
@@ -592,6 +721,7 @@ impl<C: Config> Endpoint<C> {
         }
         let first = !session.ever_connected;
         session.ever_connected = true;
+        session.accepted = false;
         let freed = session.promote(pair, established.channel_binding());
         // The dial carried the head of the queue in its first contact.
         if session.carried {
@@ -740,6 +870,7 @@ impl<C: Config> Endpoint<C> {
         };
         let first = !session.ever_connected;
         session.ever_connected = true;
+        session.accepted = true;
         // The first packet of a pending pair: the newest it has.
         heard(session, opened.inner_type, source, path, true, now);
         let local_index = pair.local_index;
@@ -1751,6 +1882,25 @@ fn candidates_owed<W, Q>(key: &Key, session: &Session<W, Q>, generation: Option<
         .last_source
         .is_some_and(|source| source.relayed_from().is_some());
     key.1.as_bytes() != crate::relay::CONTEXT && session.paths.owes(generation, relayed)
+}
+
+/// The code a session or pending handshake with `peer` is closed with when its
+/// context's access becomes `access`, or `None` when the access admits it.
+fn refused(
+    access: Option<Access>,
+    code: u16,
+    peer: &PeerId,
+    context: &[u8],
+    policy: &mut impl Admission,
+) -> Option<u16> {
+    match access {
+        None => Some(code),
+        Some(Access::Bound(bound)) => (bound != *peer).then_some(code),
+        Some(Access::Policy) => match policy.admit(peer, context) {
+            Decision::Accept { .. } => None,
+            Decision::Refuse { code, .. } => Some(code.get()),
+        },
+    }
 }
 
 #[cfg(test)]

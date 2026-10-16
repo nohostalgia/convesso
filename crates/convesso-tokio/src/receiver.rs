@@ -115,7 +115,7 @@ impl Shared {
 }
 
 /// A peer's messages and datagrams, in the per-peer delivery mode: opened with
-/// [`crate::Node::receiver`].
+/// [`crate::Context::receiver`].
 ///
 /// Read it as long as the session lives: a receiver that is not read holds
 /// back its peer's sender, and drops its datagrams once their budget is

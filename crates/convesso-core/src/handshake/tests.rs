@@ -489,13 +489,19 @@ fn contexts_are_bounded() {
         Responder::<Mcu>::new(identity(RESPONDER), &[&[0; 33]]),
         Err(ResponderError::ContextTooLong(_))
     ));
-    assert!(matches!(
-        Responder::<Mcu>::new(identity(RESPONDER), &[]),
-        Err(ResponderError::NoContext)
-    ));
+    assert_eq!(
+        Responder::<Mcu>::new(identity(RESPONDER), &[])
+            .unwrap()
+            .contexts_served(),
+        0
+    );
     assert!(matches!(
         Responder::<Mcu>::new(identity(RESPONDER), &[b"a", b"b", b"c", b"d", b"e"]),
-        Err(ResponderError::TooManyContexts)
+        Err(ResponderError::TooManyContexts { capacity: 4 })
+    ));
+    assert!(matches!(
+        Responder::<Mcu>::new(identity(RESPONDER), &[b"a", b"a"]),
+        Err(ResponderError::AlreadyServed)
     ));
     assert!(Responder::<Mcu>::new(identity(RESPONDER), &[&[0; 32]]).is_ok());
 }
@@ -2157,7 +2163,10 @@ fn the_bound_peer_is_admitted() {
     let mut entropy = TestEntropy(5900);
     let mut responder = payload_responder();
     responder
-        .bind(RELAY_CONTEXT, identity(INITIATOR).peer_id())
+        .set_access(
+            &Context::new(RELAY_CONTEXT).unwrap(),
+            Access::Bound(identity(INITIATOR).peer_id()),
+        )
         .unwrap();
     let (_, first) = dial_with(&mut entropy, RELAY_CONTEXT, &a_payload(20));
     let mut admission = Fixed::accept();
@@ -2174,7 +2183,10 @@ fn any_other_peer_meets_silence_in_a_bound_context() {
     let mut entropy = TestEntropy(6000);
     let mut responder = payload_responder();
     responder
-        .bind(RELAY_CONTEXT, identity(2).peer_id())
+        .set_access(
+            &Context::new(RELAY_CONTEXT).unwrap(),
+            Access::Bound(identity(2).peer_id()),
+        )
         .unwrap();
     let code = RefusalCode::application(0x0100).unwrap();
     for decision in [
@@ -2205,23 +2217,34 @@ fn any_other_peer_meets_silence_in_a_bound_context() {
     );
 }
 
-/// Binding or accepting payloads in a context not served is an error.
+/// Binding or accepting payloads in a context not served is an error; serving
+/// one twice, or one more than the profile holds, is refused.
 #[test]
 fn only_served_contexts_can_be_bound() {
     let mut served = responder();
+    let relay = Context::new(RELAY_CONTEXT).unwrap();
     assert_eq!(
-        served.bind(RELAY_CONTEXT, identity(2).peer_id()),
+        served.set_access(&relay, Access::Bound(identity(2).peer_id())),
         Err(ResponderError::NotServed)
     );
     assert_eq!(
         served.accept_payload(RELAY_CONTEXT),
         Err(ResponderError::NotServed)
     );
-    served.serve(RELAY_CONTEXT).unwrap();
-    served.serve(RELAY_CONTEXT).unwrap();
+    served.serve(RELAY_CONTEXT, Access::Policy).unwrap();
+    assert_eq!(
+        served.serve(RELAY_CONTEXT, Access::Policy),
+        Err(ResponderError::AlreadyServed)
+    );
     assert!(served.accept_payload(RELAY_CONTEXT).is_ok());
     for extra in [&b"a"[..], b"b"] {
-        served.serve(extra).unwrap();
+        served.serve(extra, Access::Policy).unwrap();
     }
-    assert_eq!(served.serve(b"c"), Err(ResponderError::TooManyContexts));
+    assert_eq!(
+        served.serve(b"c", Access::Policy),
+        Err(ResponderError::TooManyContexts { capacity: 4 })
+    );
+    assert!(served.stop_serving(&relay));
+    assert!(!served.serves(&relay));
+    served.serve(b"c", Access::Policy).unwrap();
 }

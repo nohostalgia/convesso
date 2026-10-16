@@ -14,15 +14,60 @@ mod support;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use convesso_core::identity::{Address, PeerId};
 use convesso_core::storage::Mcu;
 use convesso_embassy::rng::{RngFailed, SecureRng};
-use convesso_embassy::{Config, Events, Node, NodeEvent, RelayLocation, Shared};
+use convesso_embassy::{
+    Access, Config, Context, ContextEvent, ContextEvents, ContextOptions, ContextSlot, Node,
+    NodeError, RelayLocation, Shared,
+};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use support::{MemDatagrams, MemInterfaces, Net, RelayHost};
 use tokio::time::timeout;
 
 type TestNode = Node<'static, NoopRawMutex, Mcu, MemDatagrams>;
-type TestEvents = Events<'static, NoopRawMutex, Mcu, MemDatagrams>;
+type TestContext = Context<'static, NoopRawMutex, Mcu, MemDatagrams>;
+type TestEvents = ContextEvents<'static, NoopRawMutex, Mcu, MemDatagrams>;
+
+/// A node and its one context, `app`, kept for the test's life.
+struct Peer {
+    node: TestNode,
+    app: TestContext,
+}
+
+impl Peer {
+    async fn address(&self) -> Address {
+        self.node.address().await
+    }
+
+    async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
+        self.node.set_hint(peer, at).await
+    }
+
+    async fn set_reachable(&self, on: bool) {
+        self.node.set_reachable(on).await;
+    }
+
+    async fn close_peer(&self, peer: PeerId, code: u16) {
+        self.node.close_peer(peer, code).await;
+    }
+
+    async fn close(&self, peer: PeerId, code: u16) {
+        self.app.close(peer, code).await;
+    }
+
+    async fn send_message(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
+        self.app.send_message(to, data).await
+    }
+
+    async fn send_message_to_peer(&self, peer: PeerId, data: &[u8]) -> Result<(), NodeError> {
+        self.app.send_message_to_peer(peer, data).await
+    }
+
+    async fn grant(&self, peer: PeerId, bytes: usize) -> Result<(), NodeError> {
+        self.app.grant(peer, bytes).await
+    }
+}
 
 fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
@@ -47,51 +92,61 @@ fn leak<T>(value: T) -> &'static mut T {
     Box::leak(Box::new(value))
 }
 
-fn node(
+async fn node(
     net: &Net,
     key: usize,
     ip_text: &str,
     relay: &RelayHost,
     events: usize,
-) -> (TestNode, TestEvents) {
-    node_with(net, key, ip_text, relay, events, false)
+) -> (&'static Peer, TestEvents) {
+    node_with(net, key, ip_text, relay, events, false).await
 }
 
-fn node_with(
+async fn node_with(
     net: &Net,
     key: usize,
     ip_text: &str,
     relay: &RelayHost,
     events: usize,
     credit: bool,
-) -> (TestNode, TestEvents) {
+) -> (&'static Peer, TestEvents) {
     let ips = [ip(ip_text)];
     let datagrams: &'static MemDatagrams = leak(net.bind(&ips, 7500));
     let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
-    let (node, runner, events) = convesso_embassy::start(
+    let (node, runner, _node_events) = convesso_embassy::start(
         support::identity(key),
         Config {
-            context: b"app",
             relay: Some(RelayLocation {
                 address: relay.address,
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
-            credit,
         },
         datagrams,
         net.stream(ips[0]),
         MemInterfaces::new(&ips),
         leak(TestRng(key as u64 * 977)),
-        None,
-        leak(vec![0u8; events]).as_mut_slice(),
+        leak(vec![0u8; 64]).as_mut_slice(),
         slot,
     )
     .unwrap_or_else(|_| panic!("node {key} starts"));
     tokio::task::spawn_local(async move {
         let _: () = runner.run().await;
     });
-    (node, events)
+    let (app, events) = node
+        .context(
+            b"app",
+            ContextOptions {
+                access: Access::Everyone,
+                events: leak(vec![0u8; events]).as_mut_slice(),
+                slot: leak(ContextSlot::new()),
+                credit,
+                max_message: None,
+            },
+        )
+        .await
+        .unwrap();
+    (&*leak(Peer { node, app }), events)
 }
 
 async fn local<F: std::future::Future>(f: F) -> F::Output {
@@ -111,8 +166,8 @@ async fn messages(events: &mut TestEvents, count: usize, secs: u64) -> Vec<Vec<u
         let mut got = Vec::new();
         while got.len() < count {
             match events.next(&mut buf).await {
-                NodeEvent::Message { data, .. } => got.push(data.to_vec()),
-                NodeEvent::ChannelReset { reason, .. } => panic!("a reset: {reason:?}"),
+                Some(ContextEvent::Message { data, .. }) => got.push(data.to_vec()),
+                Some(ContextEvent::ChannelReset { reason, .. }) => panic!("a reset: {reason:?}"),
                 _ => {}
             }
         }
@@ -133,8 +188,8 @@ async fn two_embedded_nodes_exchange_messages_through_a_relay() {
     local(async {
         let (net, relay) = world();
         net.no_direct(true);
-        let (a, mut a_events) = node(&net, 1, "10.0.0.1", &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 8192);
+        let (a, mut a_events) = node(&net, 1, "10.0.0.1", &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 8192).await;
         b.set_reachable(true).await;
         a.set_reachable(true).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -166,8 +221,8 @@ async fn two_embedded_nodes_exchange_messages_through_a_relay() {
 async fn a_message_after_closing_arrives(revoke: bool) {
     local(async {
         let (net, relay) = world();
-        let (a, mut a_events) = node(&net, 1, "10.0.0.1", &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 8192);
+        let (a, mut a_events) = node(&net, 1, "10.0.0.1", &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 8192).await;
         let b_address = b.address().await;
         let b_hint = SocketAddr::new(ip("10.0.1.1"), 7500);
         a.set_hint(b_address.peer_id(), b_hint).await.unwrap();
@@ -183,7 +238,9 @@ async fn a_message_after_closing_arrives(revoke: bool) {
         let mut buf = [0u8; 2048];
         let reset = timeout(Duration::from_secs(5), async {
             loop {
-                if let NodeEvent::ChannelReset { reason, .. } = a_events.next(&mut buf).await {
+                if let Some(ContextEvent::ChannelReset { reason, .. }) =
+                    a_events.next(&mut buf).await
+                {
                     return reason;
                 }
             }
@@ -196,8 +253,8 @@ async fn a_message_after_closing_arrives(revoke: bool) {
         let got = timeout(Duration::from_secs(5), async {
             loop {
                 match b_events.next(&mut buf).await {
-                    NodeEvent::Message { data, .. } => return data.to_vec(),
-                    NodeEvent::ChannelReset { reason, .. } => assert_eq!(reason, closed),
+                    Some(ContextEvent::Message { data, .. }) => return data.to_vec(),
+                    Some(ContextEvent::ChannelReset { reason, .. }) => assert_eq!(reason, closed),
                     _ => {}
                 }
             }
@@ -208,7 +265,9 @@ async fn a_message_after_closing_arrives(revoke: bool) {
         // No second reset on the closing side.
         let more = timeout(Duration::from_millis(500), async {
             loop {
-                if let NodeEvent::ChannelReset { reason, .. } = a_events.next(&mut buf).await {
+                if let Some(ContextEvent::ChannelReset { reason, .. }) =
+                    a_events.next(&mut buf).await
+                {
                     return reason;
                 }
             }
@@ -237,8 +296,8 @@ async fn a_message_after_close_peer_arrives() {
 async fn a_slow_reader_holds_the_sender_back() {
     local(async {
         let (net, relay) = world();
-        let (a, _a_events) = node(&net, 1, "10.0.0.1", &relay, 8192);
-        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 2048 + 400);
+        let (a, _a_events) = node(&net, 1, "10.0.0.1", &relay, 8192).await;
+        let (b, mut b_events) = node(&net, 2, "10.0.1.1", &relay, 2048 + 400).await;
         let b_address = b.address().await;
         let b_hint = SocketAddr::new(ip("10.0.1.1"), 7500);
         a.set_hint(b_address.peer_id(), b_hint).await.unwrap();
@@ -269,9 +328,9 @@ async fn a_peer_without_credit_waits_alone() {
 
     local(async {
         let (net, relay) = world();
-        let (r, mut r_events) = node_with(&net, 1, "10.0.0.1", &relay, 8192, true);
-        let (a, _a_events) = node(&net, 2, "10.0.1.1", &relay, 8192);
-        let (c, _c_events) = node(&net, 3, "10.0.2.1", &relay, 8192);
+        let (r, mut r_events) = node_with(&net, 1, "10.0.0.1", &relay, 8192, true).await;
+        let (a, _a_events) = node(&net, 2, "10.0.1.1", &relay, 8192).await;
+        let (c, _c_events) = node(&net, 3, "10.0.2.1", &relay, 8192).await;
         let r_address = r.address().await;
         let r_hint = SocketAddr::new(ip("10.0.0.1"), 7500);
         a.set_hint(r_address.peer_id(), r_hint).await.unwrap();
@@ -304,16 +363,18 @@ async fn a_peer_without_credit_waits_alone() {
         timeout(Duration::from_secs(20), async {
             while got.len() < pieces.len() || alarm_after.is_none() {
                 match r_events.next(&mut buf).await {
-                    NodeEvent::Message { peer, data } if peer == a_id => {
+                    Some(ContextEvent::Message { peer, data }) if peer == a_id => {
                         got.push(data.to_vec());
                         // Writing the piece to flash, slowly.
                         tokio::time::sleep(Duration::from_millis(300)).await;
                         r.grant(a_id, cost).await.unwrap();
                     }
-                    NodeEvent::Message { peer, .. } if peer == c_id => {
+                    Some(ContextEvent::Message { peer, .. }) if peer == c_id => {
                         alarm_after = alarm_sent.get().map(|at| at.elapsed());
                     }
-                    NodeEvent::ChannelReset { reason, .. } => panic!("a reset: {reason:?}"),
+                    Some(ContextEvent::ChannelReset { reason, .. }) => {
+                        panic!("a reset: {reason:?}")
+                    }
                     _ => {}
                 }
             }

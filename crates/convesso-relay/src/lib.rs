@@ -445,8 +445,8 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         config: Config,
         now: Instant,
     ) -> Result<Self, ResponderError> {
-        let mut endpoint = Endpoint::new(identity, &[relay::CONTEXT])?;
-        endpoint.accept_payload(relay::CONTEXT)?;
+        let mut endpoint = Endpoint::new(identity, &[])?;
+        endpoint.serve_relay_context()?;
         Ok(Self {
             endpoint,
             policy,

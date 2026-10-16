@@ -34,9 +34,8 @@ use super::messages::{
     WireDecision,
 };
 use super::{
-    Admission, ChannelBinding, Context, ContextTooLong, Decision, Entropy, MAX_CONTEXTS,
-    MAX_PAYLOAD, NO_PSK, PENDING_LIFETIME, PENDING_PER_PEER, PROLOGUE_MAX, RESPONSE_LEN,
-    RefusalCode,
+    Admission, ChannelBinding, Context, ContextTooLong, Decision, Entropy, MAX_PAYLOAD, NO_PSK,
+    PENDING_LIFETIME, PENDING_PER_PEER, PROLOGUE_MAX, RESPONSE_LEN, RefusalCode,
 };
 use crate::dos::{self, Bucket, CookieSecret, Source, SourceKey};
 use crate::identity::{Identity, PeerId};
@@ -48,15 +47,20 @@ use crate::wire::{self, Classified, Mac1Key, Version};
 /// How often a responder draws a new index before giving up on a collision.
 const INDEX_DRAWS: usize = 8;
 
-/// Why a responder could not be built.
+/// Why a context could not be served, or changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponderError {
     /// A context is longer than allowed.
     ContextTooLong(ContextTooLong),
-    /// More than [`MAX_CONTEXTS`] contexts.
-    TooManyContexts,
-    /// No context at all: the responder would answer nobody.
-    NoContext,
+    /// The storage profile's contexts table is full.
+    TooManyContexts {
+        /// How many contexts the profile serves, the relay's included.
+        capacity: usize,
+    },
+    /// The context is served already.
+    AlreadyServed,
+    /// The relay context, which only pinning a relay, or a relay, serves.
+    RelayContext,
     /// The context is not one this responder serves.
     NotServed,
 }
@@ -65,13 +69,37 @@ impl core::fmt::Display for ResponderError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::ContextTooLong(error) => error.fmt(f),
-            Self::TooManyContexts => {
-                write!(f, "a responder serves at most {MAX_CONTEXTS} contexts")
+            Self::TooManyContexts { capacity } => write!(
+                f,
+                "the contexts table is full: the storage profile serves at most {capacity} \
+                 contexts, the relay's included"
+            ),
+            Self::AlreadyServed => f.write_str("the context is served already"),
+            Self::RelayContext => {
+                f.write_str("the relay context is served only by pinning a relay, or by a relay")
             }
-            Self::NoContext => f.write_str("a responder must serve at least one context"),
             Self::NotServed => f.write_str("the context is not served"),
         }
     }
+}
+
+/// Who may reach this endpoint in a context it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Whoever the application's [`Admission`] accepts, asked for each first
+    /// contact.
+    Policy,
+    /// This peer alone: a first contact from any other is met with silence,
+    /// and admission is not asked.
+    Bound(PeerId),
+}
+
+/// A context served: who may reach it, and whether a first contact may carry
+/// a payload in it.
+#[derive(Debug, Clone, Copy)]
+pub struct Served {
+    access: Access,
+    accepts_payload: bool,
 }
 
 impl core::error::Error for ResponderError {}
@@ -175,9 +203,7 @@ impl Pending {
 pub struct Responder<C: Config> {
     identity: Identity,
     mac1_key: Mac1Key,
-    contexts: [Option<Context>; MAX_CONTEXTS],
-    accepts_payload: [bool; MAX_CONTEXTS],
-    bound: [Option<PeerId>; MAX_CONTEXTS],
+    contexts: C::Contexts<Context, Served>,
     pending: C::Pending<u32, Pending>,
     accepted: u64,
     load: Option<Bucket>,
@@ -189,29 +215,17 @@ pub struct Responder<C: Config> {
 }
 
 impl<C: Config> Responder<C> {
-    /// A responder for `identity`, serving `contexts`.
+    /// A responder for `identity`, serving `contexts` under [`Access::Policy`].
+    /// With none, it answers no first contact until it serves one.
     ///
     /// # Errors
     ///
-    /// A [`ResponderError`] when a context is too long, or when there are none
-    /// or more than [`MAX_CONTEXTS`].
+    /// As [`Self::serve`].
     pub fn new(identity: Identity, contexts: &[&[u8]]) -> Result<Self, ResponderError> {
-        if contexts.is_empty() {
-            return Err(ResponderError::NoContext);
-        }
-        if contexts.len() > MAX_CONTEXTS {
-            return Err(ResponderError::TooManyContexts);
-        }
-        let mut served = [None; MAX_CONTEXTS];
-        for (slot, context) in served.iter_mut().zip(contexts) {
-            *slot = Some(Context::new(context).map_err(ResponderError::ContextTooLong)?);
-        }
-        Ok(Self {
+        let mut responder = Self {
             mac1_key: Mac1Key::for_address(identity.address().as_bytes()),
             identity,
-            contexts: served,
-            accepts_payload: [false; MAX_CONTEXTS],
-            bound: [None; MAX_CONTEXTS],
+            contexts: Default::default(),
             pending: Default::default(),
             accepted: 0,
             load: None,
@@ -220,28 +234,69 @@ impl<C: Config> Responder<C> {
             rates: Default::default(),
             #[cfg(test)]
             diffie_hellmans: 0,
-        })
+        };
+        for context in contexts {
+            responder.serve(context, Access::Policy)?;
+        }
+        Ok(responder)
     }
 
-    /// Serves one more context.
+    /// Serves `context`, reached under `access`. A first contact in a context
+    /// not served meets silence.
     ///
     /// # Errors
     ///
-    /// A [`ResponderError`] when the context is too long, or when the
-    /// responder already serves [`MAX_CONTEXTS`]. Serving a context already
-    /// served changes nothing.
-    pub fn serve(&mut self, context: &[u8]) -> Result<(), ResponderError> {
+    /// A [`ResponderError`] when the context is too long, is served already,
+    /// or would be one more than the storage profile's contexts table holds.
+    pub fn serve(&mut self, context: &[u8], access: Access) -> Result<(), ResponderError> {
         let context = Context::new(context).map_err(ResponderError::ContextTooLong)?;
-        if self.slot(&context).is_some() {
-            return Ok(());
+        if self.contexts.get(&context).is_some() {
+            return Err(ResponderError::AlreadyServed);
         }
-        let slot = self
+        let served = Served {
+            access,
+            accepts_payload: false,
+        };
+        self.contexts
+            .insert(context, served)
+            .map(|_| ())
+            .map_err(|full| ResponderError::TooManyContexts {
+                capacity: full.capacity,
+            })
+    }
+
+    /// Whether `context` is served.
+    #[must_use]
+    pub fn serves(&self, context: &Context) -> bool {
+        self.contexts.get(context).is_some()
+    }
+
+    /// The access of `context`, if it is served.
+    #[must_use]
+    pub fn access(&self, context: &Context) -> Option<Access> {
+        self.contexts.get(context).map(|served| served.access)
+    }
+
+    /// Changes the access of a context served. Pending handshakes and sessions
+    /// are not judged again here: the endpoint does that.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::NotServed`] for a context not served.
+    pub fn set_access(&mut self, context: &Context, access: Access) -> Result<(), ResponderError> {
+        let served = self
             .contexts
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .ok_or(ResponderError::TooManyContexts)?;
-        *slot = Some(context);
+            .get_mut(context)
+            .ok_or(ResponderError::NotServed)?;
+        served.access = access;
         Ok(())
+    }
+
+    /// Stops serving `context`, freeing its entry; returns whether it was
+    /// served. Its pending handshakes are not discarded here: the endpoint
+    /// does that.
+    pub fn stop_serving(&mut self, context: &Context) -> bool {
+        self.contexts.remove(context).is_some()
     }
 
     /// Accepts first contacts with a payload in `context`. None does unless
@@ -251,36 +306,19 @@ impl<C: Config> Responder<C> {
     ///
     /// [`ResponderError::NotServed`] for a context not served.
     pub fn accept_payload(&mut self, context: &[u8]) -> Result<(), ResponderError> {
-        let slot = self.served_slot(context)?;
-        if let Some(flag) = self.accepts_payload.get_mut(slot) {
-            *flag = true;
-        }
-        Ok(())
-    }
-
-    /// Binds `context` to `peer`: a first contact in it from any other
-    /// `PeerId` is met with silence, and admission is not asked.
-    ///
-    /// # Errors
-    ///
-    /// [`ResponderError::NotServed`] for a context not served.
-    pub fn bind(&mut self, context: &[u8], peer: PeerId) -> Result<(), ResponderError> {
-        let slot = self.served_slot(context)?;
-        if let Some(bound) = self.bound.get_mut(slot) {
-            *bound = Some(peer);
-        }
-        Ok(())
-    }
-
-    fn served_slot(&self, context: &[u8]) -> Result<usize, ResponderError> {
         let context = Context::new(context).map_err(ResponderError::ContextTooLong)?;
-        self.slot(&context).ok_or(ResponderError::NotServed)
+        let served = self
+            .contexts
+            .get_mut(&context)
+            .ok_or(ResponderError::NotServed)?;
+        served.accepts_payload = true;
+        Ok(())
     }
 
-    fn slot(&self, context: &Context) -> Option<usize> {
-        self.contexts
-            .iter()
-            .position(|served| served.as_ref() == Some(context))
+    /// How many contexts are served, the relay's included.
+    #[must_use]
+    pub fn contexts_served(&self) -> usize {
+        self.contexts.len()
     }
 
     /// Handles a packet received at `now` from `source`. When it says
@@ -326,7 +364,7 @@ impl<C: Config> Responder<C> {
         let first = if packet.get(1) == Some(&TYPE_INITIATION_PAYLOAD) {
             match messages::parse_payload_first_contact(packet) {
                 Ok(first)
-                    if self.accepts_payload.contains(&true)
+                    if self.any_accepts_payload()
                         && out.len() >= RESPONSE_LEN + first.payload_len() =>
                 {
                     Initiation {
@@ -380,23 +418,16 @@ impl<C: Config> Responder<C> {
             return Silent;
         };
         let mut initiation = [0u8; INITIATION_NOISE_LEN + MAX_PAYLOAD];
-        let Some((read, slot, payload_len)) =
+        let Some((read, context, access, payload_len)) =
             self.decrypt_under_a_context(first.noise, &re, &es, &mut initiation)
         else {
-            return Silent;
-        };
-        let Some(context) = self.contexts.get(slot).copied().flatten() else {
             return Silent;
         };
         let Ok(peer) = PeerId::from_static(*read.remote_static()) else {
             return Silent;
         };
-        if self
-            .bound
-            .get(slot)
-            .copied()
-            .flatten()
-            .is_some_and(|bound| bound != peer)
+        if let Access::Bound(bound) = access
+            && bound != peer
         {
             return Silent;
         }
@@ -502,36 +533,51 @@ impl<C: Config> Responder<C> {
         ResponderOutput::Send(dos::COOKIE_REPLY_LEN)
     }
 
+    /// Whether some context served accepts a first contact with a payload.
+    fn any_accepts_payload(&self) -> bool {
+        let mut any = false;
+        self.contexts
+            .for_each(|_, served| any |= served.accepts_payload);
+        any
+    }
+
     /// Tries each served context with the one `es` result; the first that
     /// decrypts wins. A message without a payload must decrypt to an empty
     /// one; a message with a payload is tried only under the contexts that
-    /// accept one. Returns the context's slot and the payload's length, the
-    /// plaintext left in `buffer`.
+    /// accept one. Returns the context, its access and the payload's length,
+    /// the plaintext left in `buffer`.
+    ///
+    /// A wrong context fails at the initiator's static key, before `ss`: each
+    /// costs a hash and an AEAD, never a Diffie-Hellman.
     fn decrypt_under_a_context(
         &self,
         message: &[u8],
         re: &[u8; 32],
         es: &[u8; 32],
         buffer: &mut [u8; INITIATION_NOISE_LEN + MAX_PAYLOAD],
-    ) -> Option<(noise::ResponderRead, usize, usize)> {
+    ) -> Option<(noise::ResponderRead, Context, Access, usize)> {
         let expected = message.len().checked_sub(INITIATION_NOISE_LEN)?;
         let buffer = buffer.get_mut(..message.len())?;
-        for (slot, context) in self.contexts.iter().enumerate() {
-            let Some(context) = context else { continue };
-            if expected > 0 && !self.accepts_payload.get(slot).copied().unwrap_or(false) {
-                continue;
+        let mut found = None;
+        let mut done = false;
+        self.contexts.for_each(|context, served| {
+            if done || (expected > 0 && !served.accepts_payload) {
+                return;
             }
             let mut prologue = [0u8; PROLOGUE_MAX];
             let prologue = context.prologue(&mut prologue);
             buffer.copy_from_slice(message);
             match noise::read_initiation(self.identity.secret(), prologue, re, es, buffer) {
-                Ok((read, len)) if len == expected => return Some((read, slot, len)),
+                Ok((read, len)) if len == expected => {
+                    found = Some((read, *context, served.access, len));
+                    done = true;
+                }
                 // A payload where there must be none: no context will do better.
-                Ok(_) => return None,
+                Ok(_) => done = true,
                 Err(_) => {}
             }
-        }
-        None
+        });
+        found
     }
 
     /// Makes room for one more pending handshake from `peer` and returns a free
@@ -628,6 +674,11 @@ impl<C: Config> Responder<C> {
     /// Discards every pending handshake from `peer`: revocation reaches them.
     pub(crate) fn discard_peer(&mut self, peer: &PeerId) {
         self.pending.retain(|_, pending| pending.peer != *peer);
+    }
+
+    /// Keeps only the pending handshakes for which `keep` returns `true`.
+    pub(crate) fn retain_pending(&mut self, mut keep: impl FnMut(&Pending) -> bool) {
+        self.pending.retain(|_, pending| keep(pending));
     }
 
     /// This responder's identity, which a dial from the same endpoint uses.

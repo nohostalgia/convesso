@@ -220,7 +220,10 @@ Other values are reserved: such a packet is counted against replay, and its cont
   server); a datagram that does not fit is refused.
 - **A session reopens only from an address,** since `mac1` needs the address. Sending by peer id
   works only while the session has keys.
-- **Close** is one authenticated packet with a code. It is not retransmitted.
+- **Close** is one authenticated packet with a code. It is not retransmitted. Codes `0x0001` to
+  `0x00FF` are the library's, `0x0100` to `0xFFFF` the application's, as for refusals; `0x0000` is
+  not sent. `0x0001` is a close without a code: one asked with `0x0000`, or a context closed by
+  dropping its handle (`DESIGN.md §10`).
 - **A datagram too large for the path is refused,** never truncated.
 - **The channel binding** of a session is that of the handshake that opened it, kept across
   renewals.

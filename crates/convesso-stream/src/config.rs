@@ -1,13 +1,13 @@
 //! Where a channel's memory comes from (`PROTOCOL.md §8`): a
 //! configuration names its buffers, as the core's `Config` names its tables.
 //!
-//! [`Mcu`] keeps everything in fixed arrays; [`Server`], behind the `alloc`
+//! [`Mcu`] keeps everything in fixed arrays; `Server`, behind the `alloc`
 //! feature, in buffers that grow on demand up to a bound and are released
 //! when they empty. An integrator can define its own.
 
 use convesso_core::handshake::Context;
 use convesso_core::identity::PeerId;
-use convesso_core::storage::{FixedTable, Table};
+use convesso_core::storage::Table;
 
 use crate::channel::{Sent, Stored};
 
@@ -31,6 +31,132 @@ pub trait StreamConfig {
     type Stored: Slots<Stored>;
     /// The channels, by session.
     type Channels<V>: Table<Key, V> + Default;
+    /// What each context's channels take, for the contexts given limits of
+    /// their own.
+    type Contexts<V>: Table<Context, V> + Default;
+}
+
+/// Every size of a configuration. A configuration derived with
+/// [`config!`](crate::config!) starts from its base's and changes only the
+/// fields it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    /// The largest message, in bytes.
+    pub max_message: usize,
+    /// A channel's send buffer, in bytes.
+    pub send_bytes: usize,
+    /// The messages a channel's send buffer holds at most.
+    pub send_messages: usize,
+    /// The fragments a channel has in flight at most.
+    pub in_flight: usize,
+    /// A channel's receive buffer, in bytes.
+    pub receive_bytes: usize,
+    /// The fragments a channel holds that came early, at most.
+    pub stored: usize,
+    /// The channels, at most (`usize::MAX`: as memory allows).
+    pub channels: usize,
+    /// The contexts given limits of their own, at most.
+    pub contexts: usize,
+}
+
+/// Derives a stream configuration from [`Mcu`] or `Server`, naming only the
+/// sizes that change; every other one is the base's ([`Sizes`] lists them).
+///
+/// ```
+/// convesso_stream::config! {
+///     /// Small messages, two channels.
+///     pub Small: Mcu { max_message: 1024, channels: 2 }
+/// }
+/// use convesso_stream::config::Mcu;
+/// assert_eq!(Small::SIZES.max_message, 1024);
+/// assert_eq!(Small::SIZES.send_bytes, Mcu::SIZES.send_bytes);
+/// ```
+///
+/// A name that is not a size fails to build:
+///
+/// ```compile_fail,E0560
+/// convesso_stream::config! { pub Small: Mcu { max_mesage: 1024 } }
+/// ```
+#[macro_export]
+macro_rules! config {
+    ($(#[$meta:meta])* $vis:vis $name:ident : Mcu { $($field:ident : $value:expr),* $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis struct $name;
+        impl $name {
+            /// This configuration's sizes.
+            $vis const SIZES: $crate::config::Sizes = $crate::config::Sizes {
+                $($field: $value,)*
+                ..$crate::config::Mcu::SIZES
+            };
+        }
+        $crate::__fixed_stream_config!($name);
+    };
+    ($(#[$meta:meta])* $vis:vis $name:ident : Server { $($field:ident : $value:expr),* $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis struct $name;
+        impl $name {
+            /// This configuration's sizes.
+            $vis const SIZES: $crate::config::Sizes = $crate::config::Sizes {
+                $($field: $value,)*
+                ..$crate::config::Server::SIZES
+            };
+        }
+        $crate::__growable_stream_config!($name);
+    };
+}
+
+/// The [`StreamConfig`] of a type with fixed buffers, from its `SIZES`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __fixed_stream_config {
+    ($name:ident) => {
+        impl $crate::config::StreamConfig for $name {
+            const MAX_MESSAGE: usize = $name::SIZES.max_message;
+            type SendQueue = $crate::config::FixedQueue<{ $name::SIZES.send_bytes }>;
+            type Lengths = $crate::config::FixedSlots<u32, { $name::SIZES.send_messages }>;
+            type InFlight = $crate::config::FixedSlots<$crate::Sent, { $name::SIZES.in_flight }>;
+            type ReceiveArena = $crate::config::FixedArena<{ $name::SIZES.receive_bytes }>;
+            type Stored = $crate::config::FixedSlots<$crate::Stored, { $name::SIZES.stored }>;
+            type Channels<V> = $crate::__core::storage::FixedTable<
+                $crate::config::Key,
+                V,
+                { $name::SIZES.channels },
+            >;
+            type Contexts<V> = $crate::__core::storage::FixedTable<
+                $crate::__core::handshake::Context,
+                V,
+                { $name::SIZES.contexts },
+            >;
+        }
+    };
+}
+
+/// The [`StreamConfig`] of a type with growable buffers, from its `SIZES`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __growable_stream_config {
+    ($name:ident) => {
+        impl $crate::config::StreamConfig for $name {
+            const MAX_MESSAGE: usize = $name::SIZES.max_message;
+            type SendQueue = $crate::config::GrowableQueue<{ $name::SIZES.send_bytes }>;
+            type Lengths = $crate::config::GrowableSlots<u32, { $name::SIZES.send_messages }>;
+            type InFlight = $crate::config::GrowableSlots<$crate::Sent, { $name::SIZES.in_flight }>;
+            type ReceiveArena = $crate::config::GrowableArena<{ $name::SIZES.receive_bytes }>;
+            type Stored = $crate::config::GrowableSlots<$crate::Stored, { $name::SIZES.stored }>;
+            type Channels<V> = $crate::__core::storage::GrowableTable<
+                $crate::config::Key,
+                V,
+                { $name::SIZES.channels },
+            >;
+            type Contexts<V> = $crate::__core::storage::GrowableTable<
+                $crate::__core::handshake::Context,
+                V,
+                { $name::SIZES.contexts },
+            >;
+        }
+    };
 }
 
 /// The microcontroller configuration: messages up to 2,048 bytes, 2,048
@@ -39,15 +165,22 @@ pub trait StreamConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mcu;
 
-impl StreamConfig for Mcu {
-    const MAX_MESSAGE: usize = 2048;
-    type SendQueue = FixedQueue<2048>;
-    type Lengths = FixedSlots<u32, 32>;
-    type InFlight = FixedSlots<Sent, 16>;
-    type ReceiveArena = FixedArena<2048>;
-    type Stored = FixedSlots<Stored, 16>;
-    type Channels<V> = FixedTable<Key, V, 4>;
+impl Mcu {
+    /// This configuration's sizes.
+    pub const SIZES: Sizes = Sizes {
+        max_message: 2048,
+        send_bytes: 2048,
+        send_messages: 32,
+        in_flight: 16,
+        receive_bytes: 2048,
+        stored: 16,
+        channels: 4,
+        // As many as the core's `Mcu` serves.
+        contexts: 4,
+    };
 }
+
+crate::__fixed_stream_config!(Mcu);
 
 /// The server configuration: messages up to 262,144 bytes (peerfectly's
 /// largest payload), buffers that grow to twice that per channel and are
@@ -57,15 +190,22 @@ impl StreamConfig for Mcu {
 pub struct Server;
 
 #[cfg(feature = "alloc")]
-impl StreamConfig for Server {
-    const MAX_MESSAGE: usize = 262_144;
-    type SendQueue = GrowableQueue<524_288>;
-    type Lengths = GrowableSlots<u32, 4096>;
-    type InFlight = GrowableSlots<Sent, 1024>;
-    type ReceiveArena = GrowableArena<524_288>;
-    type Stored = GrowableSlots<Stored, 1024>;
-    type Channels<V> = convesso_core::storage::GrowableTable<Key, V>;
+impl Server {
+    /// This configuration's sizes.
+    pub const SIZES: Sizes = Sizes {
+        max_message: 262_144,
+        send_bytes: 524_288,
+        send_messages: 4096,
+        in_flight: 1024,
+        receive_bytes: 524_288,
+        stored: 1024,
+        channels: usize::MAX,
+        contexts: usize::MAX,
+    };
 }
+
+#[cfg(feature = "alloc")]
+crate::__growable_stream_config!(Server);
 
 /// A queue of bytes: appended at the back, read anywhere, released from the
 /// front.

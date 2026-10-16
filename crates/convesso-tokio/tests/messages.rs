@@ -15,7 +15,9 @@ use std::time::Duration;
 use convesso_core::identity::{Identity, PeerId};
 use convesso_relay::{Config as RelayConfig, Open, Relay};
 use convesso_tokio::entropy::OsEntropy;
-use convesso_tokio::{Config, Events, Node, NodeEvent, RelayLocation};
+use convesso_tokio::{
+    Config, Context, ContextEvent, ContextEvents, ContextOptions, Events, Node, RelayLocation,
+};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 
@@ -48,18 +50,60 @@ async fn relay() -> RelayLocation {
     }
 }
 
-async fn node(seed: u8, relay: Option<&RelayLocation>, events: usize) -> (Node, Events) {
-    convesso_tokio::start(
+/// A node with the context `app`, `events` of it waiting at most.
+async fn node(
+    seed: u8,
+    relay: Option<&RelayLocation>,
+    events: usize,
+) -> (Node, Events, Context, ContextEvents) {
+    let (node, node_events) = convesso_tokio::start(
         identity(seed),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             relay: relay.cloned(),
-            events,
             ..Config::default()
         },
     )
     .await
+    .unwrap();
+    let (app, app_events) = open(&node, b"app", events).await;
+    (node, node_events, app, app_events)
+}
+
+async fn open(node: &Node, name: &[u8], events: usize) -> (Context, ContextEvents) {
+    node.context(
+        name,
+        ContextOptions {
+            events,
+            ..ContextOptions::default()
+        },
+    )
+    .await
     .unwrap()
+}
+
+async fn hints(a: &Node, b: &Node) {
+    a.set_hint(b.address().peer_id(), b.local_addr())
+        .await
+        .unwrap();
+    b.set_hint(a.address().peer_id(), a.local_addr())
+        .await
+        .unwrap();
+}
+
+/// The next channel reset, skipping other events, within `within`.
+async fn reset(events: &mut ContextEvents, within: Duration) -> convesso_stream::Reason {
+    timeout(within, async {
+        loop {
+            match events.next().await {
+                Some(ContextEvent::ChannelReset { reason, .. }) => return reason,
+                Some(_) => {}
+                None => panic!("the context closed"),
+            }
+        }
+    })
+    .await
+    .expect("a reset in time")
 }
 
 async fn reachable(node: &Node) {
@@ -74,15 +118,19 @@ async fn reachable(node: &Node) {
 }
 
 /// The next `count` messages, skipping other events, within `within`.
-async fn messages(events: &mut Events, count: usize, within: Duration) -> Vec<(PeerId, Vec<u8>)> {
+async fn messages(
+    events: &mut ContextEvents,
+    count: usize,
+    within: Duration,
+) -> Vec<(PeerId, Vec<u8>)> {
     timeout(within, async {
         let mut got = Vec::new();
         while got.len() < count {
             match events.next().await {
-                Some(NodeEvent::Message { peer, data }) => got.push((peer, data)),
-                Some(NodeEvent::ChannelReset { reason, .. }) => panic!("a reset: {reason:?}"),
+                Some(ContextEvent::Message { peer, data }) => got.push((peer, data)),
+                Some(ContextEvent::ChannelReset { reason, .. }) => panic!("a reset: {reason:?}"),
                 Some(_) => {}
-                None => panic!("the node stopped"),
+                None => panic!("the context closed"),
             }
         }
         got
@@ -100,12 +148,12 @@ fn message(i: usize) -> Vec<u8> {
 #[tokio::test]
 async fn two_nodes_exchange_messages_through_a_relay() {
     let relay = relay().await;
-    let (a, mut a_events) = node(1, Some(&relay), 64).await;
-    let (b, mut b_events) = node(2, Some(&relay), 64).await;
+    let (a, _a_node, a_app, mut a_events) = node(1, Some(&relay), 64).await;
+    let (b, _b_node, b_app, mut b_events) = node(2, Some(&relay), 64).await;
     reachable(&b).await;
     reachable(&a).await;
     let sent: Vec<_> = (0..100).map(message).collect();
-    let (a2, b_address, sent_a) = (a.clone(), b.address(), sent.clone());
+    let (a2, b_address, sent_a) = (a_app.clone(), b.address(), sent.clone());
     let sender = tokio::spawn(async move {
         for m in sent_a {
             a2.send_message(b_address, m).await.unwrap();
@@ -117,7 +165,8 @@ async fn two_nodes_exchange_messages_through_a_relay() {
     assert_eq!(at_b.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), sent);
 
     for m in &sent {
-        b.send_message_to_peer(a.address().peer_id(), m.clone())
+        b_app
+            .send_message_to_peer(a.address().peer_id(), m.clone())
             .await
             .unwrap();
     }
@@ -130,16 +179,11 @@ async fn two_nodes_exchange_messages_through_a_relay() {
 /// in order, once B reads; no channel is reset.
 #[tokio::test]
 async fn a_slow_reader_holds_the_sender_back() {
-    let (a, _a_events) = node(8, None, 64).await;
-    let (b, mut b_events) = node(9, None, 2).await;
-    a.set_hint(b.address().peer_id(), b.local_addr())
-        .await
-        .unwrap();
-    b.set_hint(a.address().peer_id(), a.local_addr())
-        .await
-        .unwrap();
+    let (a, _a_node, a_app, _a_events) = node(8, None, 64).await;
+    let (b, _b_node, _b_app, mut b_events) = node(9, None, 2).await;
+    hints(&a, &b).await;
     let sent: Vec<_> = (0..300).map(|i| vec![i as u8; 2000]).collect();
-    let (a2, b_address, sent_a) = (a.clone(), b.address(), sent.clone());
+    let (a2, b_address, sent_a) = (a_app.clone(), b.address(), sent.clone());
     let sender = tokio::spawn(async move {
         for m in sent_a {
             a2.send_message(b_address, m).await.unwrap();
@@ -156,14 +200,12 @@ async fn a_slow_reader_holds_the_sender_back() {
 /// `close_peer`: the channel is reset on both sides, once, and the next
 /// message opens a new channel and arrives.
 async fn a_message_after_closing_arrives(seeds: (u8, u8), revoke: bool) {
-    let (a, mut a_events) = node(seeds.0, None, 64).await;
-    let (b, mut b_events) = node(seeds.1, None, 64).await;
+    let (a, _a_node, a_app, mut a_events) = node(seeds.0, None, 64).await;
+    let (b, _b_node, _b_app, mut b_events) = node(seeds.1, None, 64).await;
     let b_peer = b.address().peer_id();
-    a.set_hint(b_peer, b.local_addr()).await.unwrap();
-    b.set_hint(a.address().peer_id(), a.local_addr())
-        .await
-        .unwrap();
-    a.send_message(b.address(), b"before".to_vec())
+    hints(&a, &b).await;
+    a_app
+        .send_message(b.address(), b"before".to_vec())
         .await
         .unwrap();
     let _ = messages(&mut b_events, 1, Duration::from_secs(5)).await;
@@ -171,30 +213,20 @@ async fn a_message_after_closing_arrives(seeds: (u8, u8), revoke: bool) {
     if revoke {
         a.close_peer(b_peer, 7).await.unwrap();
     } else {
-        a.close(b_peer, 7).await.unwrap();
+        a_app.close(b_peer, 7).await.unwrap();
     }
     let closed = convesso_stream::Reason::SessionClosed { code: 7 };
-    let reset = timeout(Duration::from_secs(5), async {
-        loop {
-            match a_events.next().await {
-                Some(NodeEvent::ChannelReset { reason, .. }) => return reason,
-                Some(_) => {}
-                None => panic!("stopped"),
-            }
-        }
-    })
-    .await
-    .expect("a reset on the closing side at once");
-    assert_eq!(reset, closed);
+    assert_eq!(reset(&mut a_events, Duration::from_secs(5)).await, closed);
 
-    a.send_message(b.address(), b"after".to_vec())
+    a_app
+        .send_message(b.address(), b"after".to_vec())
         .await
         .unwrap();
     let got = timeout(Duration::from_secs(5), async {
         loop {
             match b_events.next().await {
-                Some(NodeEvent::Message { data, .. }) => return data,
-                Some(NodeEvent::ChannelReset { reason, .. }) => assert_eq!(reason, closed),
+                Some(ContextEvent::Message { data, .. }) => return data,
+                Some(ContextEvent::ChannelReset { reason, .. }) => assert_eq!(reason, closed),
                 Some(_) => {}
                 None => panic!("stopped"),
             }
@@ -206,7 +238,7 @@ async fn a_message_after_closing_arrives(seeds: (u8, u8), revoke: bool) {
     // No second reset on the closing side.
     let more = timeout(Duration::from_millis(500), async {
         loop {
-            if let Some(NodeEvent::ChannelReset { reason, .. }) = a_events.next().await {
+            if let Some(ContextEvent::ChannelReset { reason, .. }) = a_events.next().await {
                 return reason;
             }
         }
@@ -226,18 +258,18 @@ async fn a_message_after_close_peer_arrives() {
 }
 
 /// Scenario: a peer switched off in mid-transfer: the sender's channel is
-/// reset within 30 s.
-#[tokio::test]
+/// reset within 30 s. B runs on a runtime of its own, shut down at once: its
+/// task ends without closing anything, as a process killed would.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_vanished_peer_resets_the_channel() {
-    let (a, mut a_events) = node(10, None, 64).await;
-    let (b, mut b_events) = node(11, None, 64).await;
-    a.set_hint(b.address().peer_id(), b.local_addr())
+    let (a, _a_node, a_app, mut a_events) = node(10, None, 64).await;
+    let elsewhere = tokio::runtime::Runtime::new().unwrap();
+    let (b, b_node, b_app, mut b_events) = elsewhere
+        .spawn(async { node(11, None, 64).await })
         .await
         .unwrap();
-    b.set_hint(a.address().peer_id(), a.local_addr())
-        .await
-        .unwrap();
-    let (a2, b_address) = (a.clone(), b.address());
+    hints(&a, &b).await;
+    let (a2, b_address) = (a_app.clone(), b.address());
     tokio::spawn(async move {
         for i in 0..100_000u32 {
             if a2
@@ -250,23 +282,48 @@ async fn a_vanished_peer_resets_the_channel() {
         }
     });
     let _ = messages(&mut b_events, 20, Duration::from_secs(5)).await;
-    drop(b);
-    drop(b_events);
+    elsewhere.shutdown_background();
+    // Its handles never drop: a dropped context would close its sessions.
+    std::mem::forget((b, b_node, b_app, b_events));
     let started = std::time::Instant::now();
-    let reset = timeout(Duration::from_secs(40), async {
-        loop {
-            match a_events.next().await {
-                Some(NodeEvent::ChannelReset { reason, .. }) => return reason,
-                Some(_) => {}
-                None => panic!("stopped"),
-            }
-        }
-    })
-    .await
-    .expect("a reset within 40 s");
+    let reset = reset(&mut a_events, Duration::from_secs(40)).await;
     std::println!(
         "reset {reason:?} after {:?}",
         started.elapsed(),
         reason = reset
     );
+}
+
+/// Scenario: a slow reader of one context's messages holds back no other
+/// context: the messages in the other keep arriving, and the sender waits only
+/// in the unread one.
+#[tokio::test]
+async fn a_slow_reader_of_one_contexts_messages_holds_back_no_other() {
+    let (a, _a_node, a_app, _a_events) = node(16, None, 64).await;
+    let (a_other, _a_other_events) = open(&a, b"other", 64).await;
+    let (b, _b_node, _b_app, mut b_slow) = node(17, None, 2).await;
+    let (_b_other, mut b_other) = open(&b, b"other", 64).await;
+    hints(&a, &b).await;
+    let b_address = b.address();
+    // A clone: the context stays open after the last send, until it arrives.
+    let a_slow = a_app.clone();
+    let slow = tokio::spawn(async move {
+        for i in 0..300u32 {
+            a_slow
+                .send_message(b_address, vec![i as u8; 2000])
+                .await
+                .unwrap();
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sent: Vec<_> = (0..50).map(message).collect();
+    for m in &sent {
+        a_other.send_message(b_address, m.clone()).await.unwrap();
+    }
+    let got = messages(&mut b_other, 50, Duration::from_secs(10)).await;
+    assert_eq!(got.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), sent);
+    assert!(!slow.is_finished(), "the unread context's sender waits");
+    let got = messages(&mut b_slow, 300, Duration::from_secs(30)).await;
+    assert_eq!(got.len(), 300);
+    slow.await.unwrap();
 }

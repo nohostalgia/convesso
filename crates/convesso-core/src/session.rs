@@ -247,6 +247,9 @@ pub(crate) struct Session<W, Q> {
     /// Whether the application was told of a connection with this peer in this
     /// context: later handshakes are silent rekeys.
     pub(crate) ever_connected: bool,
+    /// Whether this side answered the handshake that gave the current keys:
+    /// admission was asked for it, and a change of access judges it again.
+    pub(crate) accepted: bool,
     /// Whether the dial in progress carries the head of the queue in its first
     /// contacts (the relay context): established, the head was delivered.
     pub(crate) carried: bool,
@@ -274,6 +277,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
             last_sent: None,
             last_used: now,
             ever_connected: false,
+            accepted: false,
             carried: false,
             paths: PeerPaths::new(),
             binding: None,

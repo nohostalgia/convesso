@@ -32,8 +32,10 @@ bytes and the next deadline come out.
   network, and the core makes the protocol's decisions.
 - **No allocator.** The core does not ask for memory. Its tables (sessions, known peers, pending
   handshakes) are supplied by the integrator through a storage configuration: fixed capacity on a
-  microcontroller (`Mcu`), growable on a server (`Server`, behind the `alloc` feature). When a
-  table is full, the core returns a named error instead of growing.
+  microcontroller (`Mcu`), growable on a server (`Server`, behind the `alloc` feature). An
+  integrator who needs other sizes derives a configuration from either, naming only what changes
+  (`convesso_core::profile!`, and `convesso_stream::config!` for the stream layer's buffers). When
+  a table is full, the core returns a named error instead of growing.
 - **Time is passed in.** The core does not read a clock. Every call takes "now", and every poll
   returns the next deadline. This lets the tests drive every timer with a virtual clock, and lets
   a microcontroller drive the core from its own timer.
@@ -118,12 +120,17 @@ alike, and leaves a new driver less room for protocol mistakes.
 A driver uses **one UDP socket** for the relay and for peers alike, so that the address the relay
 sees is the address peers will reach.
 
-A driver **never waits on the application**. When the application does not read its events, the
-driver stops reading its socket and the relay link, so that what is lost is lost on the network,
-where the protocol expects it. Its timers, acknowledgements, keep-alives and commands go on. Events
-its timers produce meanwhile wait aside, one per peer and kind, the latest replacing the earlier:
-an application that reads late sees the latest state of each peer and of the relay, not every
-step.
+A driver **never waits on the application**, and never stops reading its socket or the relay link
+for it: one part of an application that does not read must not hold back another (§10). Its timers,
+acknowledgements, keep-alives and commands go on whatever the application reads.
+
+- **A datagram** for a context whose event stream has no room is dropped and counted. For its
+  sender that is a loss on the network, which datagrams already expect.
+- **Events without data** wait aside while their stream is full, one per context, peer and kind
+  (for the node's own events, one per kind), the latest replacing the earlier: an application that
+  reads late sees the latest state of each peer and of the relay, not every step.
+- **Reliable messages** wait in their channel while their context's stream is full: its window
+  closes, and only their sender waits (§8).
 
 An embedded device is given its identity when it is made, as a 64-byte record, and takes its
 randomness from the chip's hardware generator. If the generator does not work, the driver does not
@@ -184,7 +191,10 @@ a device that does not need it does not carry it.
   only as many bytes as its reader granted, so a reader that stops taking one peer's messages holds
   back that peer's sender alone, through the channel's own window. A reader that gives a channel up
   resets it on its side, and the sender is told. The tokio driver builds a receiver per peer on
-  this.
+  this, for the contexts that ask for it.
+- **Each context may take smaller messages** than the configuration's largest: its channels
+  advertise that size, refuse a larger one from the application, and reset a peer that sends one.
+  The buffers stay the configuration's.
 - **Datagrams do not wait for messages.**
 - **Quiet at rest:** with everything acknowledged, the channel sets no timer.
 
@@ -204,3 +214,36 @@ a device that does not need it does not carry it.
   check runs when the files it covers change: the host checks always, the embedded ones for what
   the firmware links, the fuzz targets of the crates that changed. Everything runs every week and
   before a release.
+
+## 10. Contexts
+
+A **context** is an application protocol, named by the application: a chat, a file transfer, a
+sensor's readings. Every handshake is bound to one, through the Noise prologue (`PROTOCOL.md §3`),
+so a session in one context is never a session in another, and a peer that dials a context the node
+does not serve meets silence, as a stranger does.
+
+- **A node serves contexts while it runs.** It starts serving none. The application opens a
+  context, gets a handle for it, and closes it by dropping the handle: a library started later, or
+  a feature switched on at runtime, takes its protocol without restarting the node, and a library
+  that stops releases it. Closing a context closes its sessions, each with one authenticated close:
+  with the application's code, or `0x0001`, a close without a code, when the handle is dropped.
+- **Each context has its own access:** a policy that admits peers, one peer it is bound to, or
+  none, when the application only dials in it. Changing the access judges again the sessions this
+  side accepted in that context, and closes those no longer admitted; sessions this side dialled go
+  on, since access governs who may reach the node.
+- **Each handle sees its context alone:** its peers' connections, datagrams, messages and closes.
+  Two libraries on one node do not see each other's peers, and one that does not read holds back
+  neither the other nor the node (§5). The node's own events (the relay's availability, the
+  address it is seen at) have a stream of their own.
+- **How many contexts** a node serves is its storage configuration's, like its other tables
+  (§2): 4 on the reference microcontroller configuration, the relay's included; as memory allows
+  on a server.
+
+**Names** are bytes, up to 32, and nothing enforces their form. The convention is that of ALPN,
+`organisation/protocol/version`, such as `example.org/chat/1`, so that two libraries do not pick
+the same name by chance.
+
+**Versions** are contexts: a protocol that changes incompatibly takes a new name. To migrate, a
+node serves both versions for as long as old peers remain, and a dialer tries the newer first,
+falling back to the older when the newer meets silence. A context is not negotiated with the peer:
+a dialer names the one it wants.

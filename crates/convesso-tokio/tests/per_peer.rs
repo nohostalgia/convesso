@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use convesso_core::handshake::RefusalCode;
-use convesso_core::identity::{Identity, PeerId};
+use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_relay::{Admit, Config as RelayConfig, Open, Policy, Relay};
 use convesso_stream::Reason;
 use convesso_tokio::entropy::OsEntropy;
 use convesso_tokio::{
-    Config, Delivery, ELEMENT_COST, Events, Node, NodeError, NodeEvent, Received, Receiver,
-    RelayLocation, SessionClosed, StartError,
+    Config, Context, ContextEvent, ContextEvents, ContextOptions, Delivery, ELEMENT_COST, Events,
+    Node, NodeError, NodeEvent, Received, Receiver, RelayLocation, SessionClosed, Stats,
 };
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{Instant, sleep, timeout};
@@ -75,28 +75,94 @@ async fn relay_with<P: Policy + Send + 'static>(policy: P) -> RelayLocation {
     }
 }
 
+/// A node and its one context, `app`, with what the tests here use of both.
+#[derive(Clone)]
+struct N {
+    node: Node,
+    app: Context,
+    node_events: Arc<tokio::sync::Mutex<Events>>,
+}
+
+impl N {
+    fn address(&self) -> Address {
+        self.node.address()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.node.local_addr()
+    }
+
+    async fn send(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
+        self.app.send(to, data).await
+    }
+
+    async fn send_message(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
+        self.app.send_message(to, data).await
+    }
+
+    async fn receiver(&self, peer: PeerId) -> Result<Receiver, NodeError> {
+        self.app.receiver(peer).await
+    }
+
+    async fn close(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
+        self.app.close(peer, code).await
+    }
+
+    async fn stats(&self) -> Result<Stats, NodeError> {
+        self.node.stats().await
+    }
+
+    async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
+        self.node.set_hint(peer, at).await
+    }
+
+    async fn set_reachable(&self, on: bool) -> Result<(), NodeError> {
+        self.node.set_reachable(on).await
+    }
+}
+
+/// A node with the context `app`, delivering by `delivery`; `events` of the
+/// node's and of the context's wait at most.
 async fn node(
     seed: u8,
     relay: Option<&RelayLocation>,
     events: usize,
     delivery: Delivery,
-) -> (Node, Events) {
-    convesso_tokio::start(
+) -> (N, ContextEvents) {
+    let (node, node_events) = convesso_tokio::start(
         identity(seed),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             relay: relay.cloned(),
             events,
-            delivery,
             ..Config::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let (app, app_events) = node
+        .context(
+            b"app",
+            ContextOptions {
+                delivery,
+                events,
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    (
+        N {
+            node,
+            app,
+            node_events: Arc::new(tokio::sync::Mutex::new(node_events)),
+        },
+        app_events,
+    )
 }
 
 /// Each node knows the other's direct address.
-async fn hints(a: &Node, b: &Node) {
+async fn hints(a: &N, b: &N) {
     a.set_hint(b.address().peer_id(), b.local_addr())
         .await
         .unwrap();
@@ -105,7 +171,7 @@ async fn hints(a: &Node, b: &Node) {
         .unwrap();
 }
 
-async fn reachable(node: &Node) {
+async fn reachable(node: &N) {
     node.set_reachable(true).await.unwrap();
     timeout(Duration::from_secs(2), async {
         while node.stats().await.unwrap().keepalives_received == 0 {
@@ -132,43 +198,52 @@ async fn message(receiver: &Receiver) -> Vec<u8> {
 
 // --- 3.1 ---------------------------------------------------------------------------------
 
-/// Scenario: a message budget too small is refused at start, naming both
-/// sizes, and no socket is bound.
+/// Scenario: a message budget too small is refused when the context opens,
+/// naming both sizes, and the context is not served.
 #[tokio::test]
-async fn a_message_budget_too_small_is_refused_at_start() {
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let result = convesso_tokio::start(
+async fn a_message_budget_too_small_is_refused_when_the_context_opens() {
+    let (node, _events) = convesso_tokio::start(
         identity(1),
         Config {
-            bind: SocketAddr::from(([127, 0, 0, 1], port)),
-            delivery: Delivery::PerPeer {
-                messages: 262_144,
-                datagrams: 64_000,
-            },
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             ..Config::default()
         },
     )
-    .await;
-    let Err(error) = result else {
-        panic!("started")
-    };
-    assert!(matches!(
+    .await
+    .unwrap();
+    let result = node
+        .context(
+            b"app",
+            ContextOptions {
+                delivery: Delivery::PerPeer {
+                    messages: 262_144,
+                    datagrams: 64_000,
+                },
+                ..ContextOptions::default()
+            },
+        )
+        .await;
+    let Err(error) = result else { panic!("opened") };
+    assert_eq!(
         error,
-        StartError::Budget {
+        NodeError::Budget {
             budget: 262_144,
             needed: 262_208
         }
-    ));
+    );
     let text = error.to_string();
     assert!(text.contains("262144") && text.contains("262208"), "{text}");
     assert_eq!(262_144 + ELEMENT_COST, 262_208);
-    // The port is still free: nothing was bound.
-    UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
+    // Not open: the name opens now, with a budget that fits.
+    node.context(
+        b"app",
+        ContextOptions {
+            delivery: PER_PEER,
+            ..ContextOptions::default()
+        },
+    )
+    .await
+    .unwrap();
 }
 
 // --- 3.2 ---------------------------------------------------------------------------------
@@ -179,7 +254,12 @@ async fn a_message_budget_too_small_is_refused_at_start() {
 #[tokio::test]
 async fn a_receiver_yields_the_reset_and_the_close_in_order() {
     let (r, _r_events) = node(1, None, 64, PER_PEER).await;
-    let (s, _s_events) = node(2, None, 64, Delivery::Events).await;
+    // S's first process, on a runtime of its own, killed below.
+    let process = tokio::runtime::Runtime::new().unwrap();
+    let (s, s_events) = process
+        .spawn(async { node(2, None, 64, Delivery::Events).await })
+        .await
+        .unwrap();
     hints(&r, &s).await;
     let s_peer = s.address().peer_id();
     let receiver = r.receiver(s_peer).await.unwrap();
@@ -189,8 +269,11 @@ async fn a_receiver_yields_the_reset_and_the_close_in_order() {
     for m in [b"one".as_slice(), b"two", b"three"] {
         assert_eq!(message(&receiver).await, m);
     }
-    // S restarts: the same key, a new process, a new incarnation.
-    drop(s);
+    // S restarts: the same key, a new process, a new incarnation. The old
+    // one ends without closing anything, as a process killed does.
+    process.shutdown_background();
+    // Its handles never drop: a dropped context would close its sessions.
+    std::mem::forget((s, s_events));
     let (s, _s_events) = node(2, None, 64, Delivery::Events).await;
     hints(&r, &s).await;
     s.send_message(r.address(), b"four".to_vec()).await.unwrap();
@@ -233,7 +316,7 @@ async fn before_a_receiver_opens_messages_wait_and_datagrams_are_dropped() {
     // The connection is announced on the event stream.
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(NodeEvent::Connected { peer }) = r_events.next().await
+            if let Some(ContextEvent::Connected { peer }) = r_events.next().await
                 && peer == s_peer
             {
                 return;
@@ -336,7 +419,7 @@ async fn a_dropped_receiver_tells_the_sender() {
     drop(receiver);
     let reason = timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(NodeEvent::ChannelReset { reason, .. }) = s_events.next().await {
+            if let Some(ContextEvent::ChannelReset { reason, .. }) = s_events.next().await {
                 return reason;
             }
         }
@@ -445,7 +528,7 @@ async fn reads_pauses_and_drops_never_strand_a_message() {
 
 /// Sends a 1,000-byte message and a 200-byte datagram every 10 ms, counting
 /// the messages accepted.
-fn pace(sender: Node, to: convesso_core::identity::Address, sent: Arc<AtomicU64>) {
+fn pace(sender: N, to: convesso_core::identity::Address, sent: Arc<AtomicU64>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         loop {
@@ -577,7 +660,7 @@ async fn a_stopped_reader_holds_back_only_its_own_peer() {
         .unwrap();
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(NodeEvent::Datagram { data, .. }) = s2_events.next().await
+            if let Some(ContextEvent::Datagram { data, .. }) = s2_events.next().await
                 && data == b"to the other"
             {
                 return;
@@ -603,38 +686,32 @@ async fn a_stopped_reader_holds_back_only_its_own_peer() {
 
 // --- 3.4 ---------------------------------------------------------------------------------
 
-/// Scenario: a full event stream stops only the reading. The application
-/// reads no event for 65 s while its peer sends it a datagram a second: the
-/// relay keep-alives go on, its sends complete, and afterwards every datagram
-/// is there, in order. (At that rate they wait in any socket buffer; a faster
-/// sender's would be dropped by the system, on the network side, as the spec
-/// intends.)
+/// Scenario: a full event stream stops nothing: while the application reads
+/// none of its context's events, the node keeps reading, its sends complete
+/// and its commands are answered; the datagrams beyond the stream's room are
+/// dropped and counted, and those it held arrive, in order.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_full_event_stream_stops_only_the_reading() {
+async fn a_full_event_stream_stops_nothing() {
     let relay = relay().await;
     let (r, mut r_events) = node(16, Some(&relay), 4, Delivery::Events).await;
     let (s, mut s_events) = node(17, Some(&relay), 64, Delivery::Events).await;
     reachable(&r).await;
     reachable(&s).await;
     hints(&r, &s).await;
-    let keepalives = r.stats().await.unwrap().keepalives_sent;
-    let (s2, r_address) = (s.clone(), r.address());
-    let sender = tokio::spawn(async move {
-        for i in 0..66u32 {
-            s2.send(r_address, i.to_le_bytes().to_vec()).await.unwrap();
-            sleep(Duration::from_secs(1)).await;
-        }
-    });
-    sleep(Duration::from_secs(66)).await;
+    for i in 0..30u32 {
+        s.send(r.address(), i.to_le_bytes().to_vec()).await.unwrap();
+        sleep(Duration::from_millis(20)).await;
+    }
+    sleep(Duration::from_millis(300)).await;
     let stats = timeout(Duration::from_millis(500), r.stats())
         .await
         .expect("commands go on")
         .unwrap();
-    assert!(stats.keepalives_sent > keepalives, "the keep-alives go on");
+    assert!(stats.datagrams_dropped >= 26, "{stats:?}");
     r.send(s.address(), b"meanwhile".to_vec()).await.unwrap();
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(NodeEvent::Datagram { data, .. }) = s_events.next().await
+            if let Some(ContextEvent::Datagram { data, .. }) = s_events.next().await
                 && data == b"meanwhile"
             {
                 return;
@@ -643,23 +720,25 @@ async fn a_full_event_stream_stops_only_the_reading() {
     })
     .await
     .expect("a send completes");
-    sender.await.unwrap();
-    let mut next = 0u32;
-    timeout(Duration::from_secs(20), async {
-        while next < 66 {
-            if let Some(NodeEvent::Datagram { data, .. }) = r_events.next().await {
-                assert_eq!(data, next.to_le_bytes(), "in order, none missing");
-                next += 1;
-            }
+    let mut got = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_millis(300), r_events.next()).await {
+        if let ContextEvent::Datagram { data, .. } = event {
+            got.push(data);
         }
-    })
-    .await
-    .expect("every datagram");
+    }
+    assert_eq!(
+        got,
+        (0..4u32)
+            .map(|i| i.to_le_bytes().to_vec())
+            .collect::<Vec<_>>(),
+        "the first ones, in order"
+    );
 }
 
 /// Scenario: an application that reads late sees the latest state. Its
-/// relay refuses it, and it reads no event while the node tries again and
-/// again, with its backoff: it then finds one relay-availability event.
+/// relay refuses it, and it reads none of the node's events while the node
+/// tries again and again, with its backoff: it then finds the first, which
+/// found room, and one more, the latest, rather than one per attempt.
 #[tokio::test]
 async fn an_application_that_reads_late_sees_the_latest_state() {
     let refusing = relay_with(RefuseAll).await;
@@ -678,7 +757,8 @@ async fn an_application_that_reads_late_sees_the_latest_state() {
     r.set_reachable(false).await.unwrap();
     sleep(Duration::from_millis(500)).await;
     let mut got = Vec::new();
-    while let Ok(Some(event)) = timeout(Duration::from_millis(300), r_events.next()).await {
+    let mut node_events = r.node_events.lock().await;
+    while let Ok(Some(event)) = timeout(Duration::from_millis(300), node_events.next()).await {
         got.push(event);
     }
     std::println!("{got:?}");
@@ -686,11 +766,17 @@ async fn an_application_that_reads_late_sees_the_latest_state() {
         .iter()
         .filter(|e| matches!(e, NodeEvent::RelayUnavailable { .. }))
         .count();
-    assert_eq!(unavailable, 1, "{got:?}");
+    assert_eq!(unavailable, 2, "{got:?}");
     // A peer that connects with a datagram, before its receiver opens, is
     // still announced.
+    let mut in_app = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_millis(300), r_events.next()).await {
+        in_app.push(event);
+    }
     assert!(
-        got.iter().any(|e| matches!(e, NodeEvent::Connected { .. })),
-        "{got:?}"
+        in_app
+            .iter()
+            .any(|e| matches!(e, ContextEvent::Connected { .. })),
+        "{in_app:?}"
     );
 }

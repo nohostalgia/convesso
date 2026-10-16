@@ -18,7 +18,9 @@ use convesso_embassy::net::{
     UDP_TX_PACKETS,
 };
 use convesso_embassy::rng::{RngFailed, SecureRng};
-use convesso_embassy::{EVENTS_LEN, NodeEvent, RelayLocation, Shared};
+use convesso_embassy::{
+    Access, ContextEvent, ContextOptions, ContextSlot, EVENTS_LEN, RelayLocation, Shared,
+};
 use critical_section::Mutex as CsMutex;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::tcp::TcpSocket;
@@ -140,6 +142,7 @@ static TCP_TX: StaticCell<[u8; TCP_LEN]> = StaticCell::new();
 static DATAGRAMS: StaticCell<Datagrams> = StaticCell::new();
 static GENERATOR: StaticCell<Generator> = StaticCell::new();
 static EVENTS: StaticCell<[u8; EVENTS_LEN]> = StaticCell::new();
+static APP: StaticCell<ContextSlot<'static, NoopRawMutex>> = StaticCell::new();
 static SHARED: StaticCell<Option<Shared<'static, NoopRawMutex, Mcu, Datagrams>>> =
     StaticCell::new();
 
@@ -187,38 +190,53 @@ async fn application(spawner: Spawner) {
     let started = convesso_embassy::start(
         identity,
         convesso_embassy::Config {
-            context: b"app",
             relay: Some(RelayLocation {
                 address: relay,
                 primary: black_box(core::net::SocketAddr::from(([192, 0, 2, 1], 7400))),
                 other: None,
             }),
-            credit: false,
         },
         datagrams,
         NetStream::new(tcp),
         NetInterfaces::new(stack),
         GENERATOR.init(Generator),
-        None,
-        EVENTS.init([0; EVENTS_LEN]),
+        // The node's own events carry no data.
+        &mut [],
         SHARED.init(None),
     );
-    let Ok((node, runner, mut events)) = started else {
+    let Ok((node, runner, _node_events)) = started else {
         return;
     };
     if let Ok(token) = driver(runner) {
         spawner.spawn(token);
     }
+    let opened = node
+        .context(
+            b"app",
+            ContextOptions {
+                access: Access::Everyone,
+                events: EVENTS.init([0; EVENTS_LEN]),
+                slot: APP.init(ContextSlot::new()),
+                #[cfg(feature = "stream")]
+                credit: false,
+                #[cfg(feature = "stream")]
+                max_message: None,
+            },
+        )
+        .await;
+    let Ok((app, mut events)) = opened else {
+        return;
+    };
     node.set_reachable(true).await;
-    let _ = node.send(&relay, &black_box([0u8; 16])).await;
-    let _ = node.send_message(&relay, &black_box([0u8; 64])).await;
+    let _ = app.send(&relay, &black_box([0u8; 16])).await;
+    let _ = app.send_message(&relay, &black_box([0u8; 64])).await;
     let mut buf = [0u8; 2048];
     match events.next(&mut buf).await {
-        NodeEvent::Datagram { peer, data, .. } => {
-            let _ = node.send_to_peer(peer, data).await;
+        Some(ContextEvent::Datagram { peer, data, .. }) => {
+            let _ = app.send_to_peer(peer, data).await;
         }
-        NodeEvent::Message { peer, data } => {
-            let _ = node.send_message_to_peer(peer, data).await;
+        Some(ContextEvent::Message { peer, data }) => {
+            let _ = app.send_message_to_peer(peer, data).await;
         }
         _ => {}
     }
