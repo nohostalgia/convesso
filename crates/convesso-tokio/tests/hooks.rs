@@ -20,7 +20,8 @@ use convesso_core::paths::CandidateKind;
 use convesso_relay::{Config as RelayConfig, Open, Relay};
 use convesso_tokio::entropy::OsEntropy;
 use convesso_tokio::{
-    Config, Events, Node, NodeError, NodeEvent, RelayLocation, SocketHandle, SocketHook, StartError,
+    Config, ContextEvent, ContextOptions, Events, Node, NodeError, RelayLocation, SocketHandle,
+    SocketHook, StartError,
 };
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
@@ -90,15 +91,17 @@ fn unused(handle: SocketHandle) -> bool {
 #[tokio::test]
 async fn two_nodes_agree_on_the_binding() {
     let (a, _a_events) = node(1, loopback()).await;
-    let (b, mut b_events) = node(2, loopback()).await;
+    let (b, _b_events) = node(2, loopback()).await;
+    let (a_app, _a_app_events) = a.context(b"app", ContextOptions::default()).await.unwrap();
+    let (b_app, mut b_events) = b.context(b"app", ContextOptions::default()).await.unwrap();
     let stranger = identity(3).peer_id();
     a.set_hint(b.address().peer_id(), b.local_addr())
         .await
         .unwrap();
-    a.send(b.address(), b"hello".to_vec()).await.unwrap();
+    a_app.send(b.address(), b"hello".to_vec()).await.unwrap();
     timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(NodeEvent::Datagram { .. }) = b_events.next().await {
+            if let Some(ContextEvent::Datagram { .. }) = b_events.next().await {
                 return;
             }
         }
@@ -106,11 +109,11 @@ async fn two_nodes_agree_on_the_binding() {
     .await
     .expect("a datagram within two seconds");
 
-    let at_a = a.channel_binding(b.address().peer_id()).await.unwrap();
-    let at_b = b.channel_binding(a.address().peer_id()).await.unwrap();
+    let at_a = a_app.channel_binding(b.address().peer_id()).await.unwrap();
+    let at_b = b_app.channel_binding(a.address().peer_id()).await.unwrap();
     assert!(at_a.is_some());
     assert_eq!(at_a, at_b);
-    assert_eq!(a.channel_binding(stranger).await.unwrap(), None);
+    assert_eq!(a_app.channel_binding(stranger).await.unwrap(), None);
 }
 
 // --- the candidates and the excluded prefixes ---------------------------------------

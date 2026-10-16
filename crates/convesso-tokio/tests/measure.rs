@@ -14,10 +14,13 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use convesso_core::identity::Identity;
+use convesso_core::identity::{Address, Identity};
 use convesso_relay::{Config as RelayConfig, Limits, Open, Relay};
 use convesso_tokio::entropy::OsEntropy;
-use convesso_tokio::{Config, Events, Node, NodeEvent, RelayLocation, Stats};
+use convesso_tokio::{
+    Config, Context, ContextEvent, ContextEvents, ContextOptions, Delivery, Events, Node,
+    NodeError, RelayLocation, Stats,
+};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 
@@ -52,23 +55,82 @@ async fn relay(limits: Limits) -> RelayLocation {
     }
 }
 
-async fn node(seed: u8, relay: &RelayLocation) -> (Node, Events) {
-    convesso_tokio::start(
+/// A node and its one context, `app`, with what the measurements use.
+struct N {
+    node: Node,
+    app: Context,
+    _events: Events,
+}
+
+impl N {
+    fn address(&self) -> Address {
+        self.node.address()
+    }
+
+    async fn set_reachable(&self, on: bool) -> Result<(), NodeError> {
+        self.node.set_reachable(on).await
+    }
+
+    async fn stats(&self) -> Result<Stats, NodeError> {
+        self.node.stats().await
+    }
+
+    async fn send(&self, to: Address, data: Vec<u8>) -> Result<(), NodeError> {
+        self.app.send(to, data).await
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.node.local_addr()
+    }
+
+    async fn set_hint(
+        &self,
+        peer: convesso_core::identity::PeerId,
+        at: SocketAddr,
+    ) -> Result<(), NodeError> {
+        self.node.set_hint(peer, at).await
+    }
+}
+
+async fn node(seed: u8, relay: &RelayLocation) -> (N, ContextEvents) {
+    node_with(seed, relay, Delivery::Events).await
+}
+
+async fn node_with(seed: u8, relay: &RelayLocation, delivery: Delivery) -> (N, ContextEvents) {
+    let (node, events) = convesso_tokio::start(
         Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             relay: Some(relay.clone()),
-            events: 65_536,
             ..Config::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let (app, app_events) = node
+        .context(
+            b"app",
+            ContextOptions {
+                delivery,
+                events: 65_536,
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    (
+        N {
+            node,
+            app,
+            _events: events,
+        },
+        app_events,
+    )
 }
 
-async fn next_datagram(events: &mut Events) -> Vec<u8> {
+async fn next_datagram(events: &mut ContextEvents) -> Vec<u8> {
     loop {
-        if let Some(NodeEvent::Datagram { data, .. }) = events.next().await {
+        if let Some(ContextEvent::Datagram { data, .. }) = events.next().await {
             return data;
         }
     }
@@ -156,25 +218,12 @@ async fn an_idle_hour_without_a_link() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "an hour of real time"]
 async fn an_idle_hour_after_messages_in_both_modes() {
-    use convesso_tokio::{Delivery, Received};
+    use convesso_tokio::Received;
 
     let relay = relay(Limits::default()).await;
     let start = |seed: u8, delivery: Delivery| {
         let relay = relay.clone();
-        async move {
-            convesso_tokio::start(
-                Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
-                Config {
-                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                    relay: Some(relay),
-                    events: 65_536,
-                    delivery,
-                    ..Config::default()
-                },
-            )
-            .await
-            .unwrap()
-        }
+        async move { node_with(seed, &relay, delivery).await }
     };
     let per_peer = Delivery::PerPeer {
         messages: 1 << 20,
@@ -187,13 +236,18 @@ async fn an_idle_hour_after_messages_in_both_modes() {
         receiver.set_reachable(true).await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
         let opened = match delivery {
-            Delivery::PerPeer { .. } => {
-                Some(receiver.receiver(sender.address().peer_id()).await.unwrap())
-            }
+            Delivery::PerPeer { .. } => Some(
+                receiver
+                    .app
+                    .receiver(sender.address().peer_id())
+                    .await
+                    .unwrap(),
+            ),
             Delivery::Events => None,
         };
         for i in 0..100u8 {
             sender
+                .app
                 .send_message(receiver.address(), vec![i; 1000])
                 .await
                 .unwrap();
@@ -209,7 +263,7 @@ async fn an_idle_hour_after_messages_in_both_modes() {
                     }
                 }
                 None => {
-                    if let Ok(Some(NodeEvent::Message { .. })) =
+                    if let Ok(Some(ContextEvent::Message { .. })) =
                         timeout(Duration::from_secs(10), receiver_events.next()).await
                     {
                         got += 1;

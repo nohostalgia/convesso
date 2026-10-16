@@ -17,21 +17,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use convesso_core::identity::Identity;
-use convesso_tokio::{Config, Events, Node, NodeEvent};
+use convesso_tokio::{Config, Context, ContextEvent, ContextEvents, ContextOptions, Node};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-async fn node(seed: u8) -> (Node, Events) {
-    convesso_tokio::start(
+async fn node(seed: u8) -> (Node, Context, ContextEvents) {
+    let (node, _events) = convesso_tokio::start(
         Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            events: 64,
             ..Config::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let (app, app_events) = node
+        .context(
+            b"app",
+            ContextOptions {
+                events: 64,
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    (node, app, app_events)
 }
 
 /// A proxy between two nodes that drops `percent` of the datagrams each way:
@@ -85,8 +95,8 @@ fn big_buffers() -> UdpSocket {
 }
 
 async fn goodput(percent: u64) -> (f64, Duration) {
-    let (a, _a_events) = node(31).await;
-    let (b, mut b_events) = node(32).await;
+    let (a, a_app, _a_events) = node(31).await;
+    let (b, _b_app, mut b_events) = node(32).await;
     let (facing_a, facing_b) = lossy_proxy(a.local_addr(), b.local_addr(), percent).await;
     a.set_hint(b.address().peer_id(), facing_a).await.unwrap();
     b.set_hint(a.address().peer_id(), facing_b).await.unwrap();
@@ -94,7 +104,7 @@ async fn goodput(percent: u64) -> (f64, Duration) {
     let size = 256 * 1024;
     let count = total / size;
     let start = Instant::now();
-    let (a2, to) = (a.clone(), b.address());
+    let (a2, to) = (a_app.clone(), b.address());
     tokio::spawn(async move {
         for i in 0..count {
             a2.send_message(to, vec![i as u8; size]).await.unwrap();
@@ -104,11 +114,11 @@ async fn goodput(percent: u64) -> (f64, Duration) {
     timeout(Duration::from_secs(600), async {
         while got < count {
             match b_events.next().await {
-                Some(NodeEvent::Message { data, .. }) => {
+                Some(ContextEvent::Message { data, .. }) => {
                     assert_eq!(data, vec![got as u8; size], "in order, whole");
                     got += 1;
                 }
-                Some(NodeEvent::ChannelReset { reason, .. }) => panic!("a reset: {reason:?}"),
+                Some(ContextEvent::ChannelReset { reason, .. }) => panic!("a reset: {reason:?}"),
                 Some(_) => {}
                 None => panic!("stopped"),
             }

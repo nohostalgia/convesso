@@ -88,6 +88,38 @@ fn the_microcontroller_configuration_is_fixed() {
     assert_eq!(peers.capacity(), Some(16));
 }
 
+convesso_core::profile! {
+    /// A device with two contexts and eight sessions.
+    Device: Mcu { contexts: 2, sessions: 8 }
+}
+
+/// Scenario: a profile derived from the reference changes only what it names.
+/// (That a name which is not a size fails to build is `profile!`'s
+/// `compile_fail` example.)
+#[test]
+fn a_derived_profile_changes_only_what_it_names() {
+    use convesso_core::storage::Sizes;
+
+    assert_eq!(
+        Device::SIZES,
+        Sizes {
+            contexts: 2,
+            sessions: 8,
+            ..Mcu::SIZES
+        }
+    );
+
+    let contexts: <Device as Config>::Contexts<u8, ()> = Default::default();
+    let sessions: <Device as Config>::Sessions<u8, ()> = Default::default();
+    let peers: <Device as Config>::Peers<u8, ()> = Default::default();
+    let pending: <Device as Config>::Pending<u8, ()> = Default::default();
+    assert_eq!(contexts.capacity(), Some(2));
+    assert_eq!(sessions.capacity(), Some(8));
+    assert_eq!(peers.capacity(), Some(16));
+    assert_eq!(pending.capacity(), Some(4));
+    assert_eq!(<Device as Config>::LOAD_RATE_PER_SECOND, 5);
+}
+
 /// Scenario: growable storage accepts beyond any fixed capacity, under the same
 /// trait the protocol logic is written against.
 #[cfg(feature = "alloc")]

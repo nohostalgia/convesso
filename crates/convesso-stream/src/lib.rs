@@ -48,6 +48,10 @@ mod channel;
 pub mod config;
 pub mod frame;
 
+// For `config!`, so that a crate using it need not name the core.
+#[doc(hidden)]
+pub use convesso_core as __core;
+
 use convesso_core::endpoint::FrameKind;
 use convesso_core::handshake::{Context, DialError, Entropy};
 use convesso_core::identity::{Address, PeerId};
@@ -123,9 +127,18 @@ pub enum Poll<'a> {
     Idle,
 }
 
+/// What one context's channels take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Limits {
+    max_message: usize,
+    credit: bool,
+}
+
 /// Every channel of an endpoint.
 pub struct Channels<C: StreamConfig> {
     table: C::Channels<Channel<C>>,
+    /// The contexts given limits of their own.
+    contexts: C::Contexts<Limits>,
     /// The frame handed out by the last poll, until the next call.
     emitted: Option<(Key, Emitted)>,
     /// Where the last poll stopped, so that every channel gets its turn.
@@ -147,6 +160,7 @@ impl<C: StreamConfig> Channels<C> {
     pub fn new() -> Self {
         Self {
             table: <C::Channels<Channel<C>> as Default>::default(),
+            contexts: <C::Contexts<Limits> as Default>::default(),
             emitted: None,
             cursor: None,
             credit: false,
@@ -165,6 +179,79 @@ impl<C: StreamConfig> Channels<C> {
         }
     }
 
+    /// Gives `context` limits of its own: a largest message, at most the
+    /// configuration's (`None`: the configuration's), and whether delivery
+    /// credit is on in it. Its channels, those made from now on and those
+    /// already there, advertise that largest message in their
+    /// acknowledgements, refuse a larger one from the application, and reset
+    /// a channel whose peer announces a larger one. A context given none takes
+    /// the configuration's largest message and the credit mode these channels
+    /// were made with.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::TooLarge`] for a largest message over the
+    /// configuration's, [`SendError::TableFull`] when the configuration's
+    /// contexts table is full, and [`SendError::ContextTooLong`].
+    pub fn set_context(
+        &mut self,
+        context: &[u8],
+        max_message: Option<usize>,
+        credit: bool,
+    ) -> Result<(), SendError> {
+        self.confirm();
+        let context = Context::new(context).map_err(|_| SendError::ContextTooLong)?;
+        let max_message = max_message.unwrap_or(C::MAX_MESSAGE);
+        if max_message > C::MAX_MESSAGE {
+            return Err(SendError::TooLarge {
+                size: max_message,
+                max: C::MAX_MESSAGE,
+            });
+        }
+        let limits = Limits {
+            max_message,
+            credit,
+        };
+        self.contexts
+            .insert(context, limits)
+            .map_err(|_| SendError::TableFull)?;
+        self.table.retain(|(_, in_context), channel| {
+            if *in_context == context {
+                channel.set_limits(credit, max_message);
+            }
+            true
+        });
+        Ok(())
+    }
+
+    /// Forgets the limits of `context`: channels made in it from now on take
+    /// the configuration's.
+    pub fn forget_context(&mut self, context: Context) {
+        let _ = self.contexts.remove(&context);
+    }
+
+    /// This side closed `context`, and with it every session in it: each of
+    /// its channels is reset, as on a close of its session, and its limits
+    /// are forgotten.
+    pub fn context_closed(&mut self, context: Context, code: u16) {
+        self.confirm();
+        self.table.retain(|(_, in_context), channel| {
+            if *in_context == context {
+                channel.reset(Reason::SessionClosed { code });
+            }
+            true
+        });
+        self.forget_context(context);
+    }
+
+    /// The limits of `context`'s channels.
+    fn limits(&self, context: &Context) -> Limits {
+        self.contexts.get(context).copied().unwrap_or(Limits {
+            max_message: C::MAX_MESSAGE,
+            credit: self.credit,
+        })
+    }
+
     /// The frame handed out last left: its channel's session has keys.
     fn confirm(&mut self) {
         if let Some((key, _)) = self.emitted.take()
@@ -177,8 +264,11 @@ impl<C: StreamConfig> Channels<C> {
     /// The channel of `key`, made if there is none: in a free slot, or in
     /// the slot of a channel that holds nothing but a past reset.
     fn channel(&mut self, key: Key) -> Result<&mut Channel<C>, SendError> {
+        let limits = self.limits(&key.1);
         if self.table.get(&key).is_none()
-            && let Err(full) = self.table.insert(key, Channel::new(self.credit))
+            && let Err(full) = self
+                .table
+                .insert(key, Channel::new(limits.credit, limits.max_message))
         {
             let mut spent = None;
             self.table.for_each(|k, channel| {
@@ -231,7 +321,8 @@ impl<C: StreamConfig> Channels<C> {
     }
 
     /// Adds `bytes` to the delivery credit of `peer`'s channel in `context`,
-    /// making the channel if there is none. Nothing with credit off.
+    /// making the channel if there is none. Nothing with credit off in that
+    /// context.
     ///
     /// # Errors
     ///
@@ -240,7 +331,7 @@ impl<C: StreamConfig> Channels<C> {
     pub fn grant(&mut self, peer: PeerId, context: &[u8], bytes: usize) -> Result<(), SendError> {
         self.confirm();
         let context = Context::new(context).map_err(|_| SendError::ContextTooLong)?;
-        if !self.credit {
+        if !self.limits(&context).credit {
             return Ok(());
         }
         self.channel((peer, context))?.grant(bytes);
@@ -347,6 +438,18 @@ impl<C: StreamConfig> Channels<C> {
     /// receive window closes and the sender waits, while acknowledgements,
     /// resets and every other output go on.
     pub fn poll(&mut self, now: Instant, deliver: bool, out: &mut [u8]) -> Poll<'_> {
+        self.poll_with(now, |_| deliver, out)
+    }
+
+    /// As [`Channels::poll`], with whether the driver can deliver asked per
+    /// context: a context whose reader has no room keeps its messages, and
+    /// every other goes on.
+    pub fn poll_with(
+        &mut self,
+        now: Instant,
+        mut deliver: impl FnMut(&Context) -> bool,
+        out: &mut [u8],
+    ) -> Poll<'_> {
         self.confirm();
         self.table.retain(|_, channel| {
             channel.tick(now);
@@ -357,7 +460,7 @@ impl<C: StreamConfig> Channels<C> {
         for pass in [true, false] {
             self.table.retain(|key, channel| {
                 if found.is_none() && (!pass || cursor.is_none_or(|c| *key > c)) {
-                    match channel.output(now, deliver, out) {
+                    match channel.output(now, deliver(&key.1), out) {
                         Output::Nothing => {}
                         output => found = Some((*key, output)),
                     }

@@ -254,8 +254,12 @@ impl<K: Ord, V, const LIMIT: usize> Table<K, V> for GrowableTable<K, V, LIMIT> {
 ///
 /// One trait rather than a const parameter on every type: an integrator names
 /// a configuration, usually one of the ready-made ones, rather than a list of
-/// numbers.
+/// numbers. To change only some sizes, [`profile!`](crate::profile) derives a
+/// configuration from [`Mcu`] or [`Server`], naming only those.
 pub trait Config {
+    /// Where the contexts the endpoint serves are kept, the relay's included.
+    /// Only the application fills it, never a peer.
+    type Contexts<K: Ord, V>: Table<K, V> + Default;
     /// Where open sessions are kept.
     type Sessions<K: Ord, V>: Table<K, V> + Default;
     /// Where known peers are kept.
@@ -292,56 +296,211 @@ pub trait Config {
     const LOAD_BURST: u32;
 }
 
-/// A microcontroller: 4 sessions, 16 known peers, 4 pending handshakes, 8
-/// recent ephemerals and 8 source rates, in fixed arrays; under load beyond 5
-/// first contacts a second.
+/// Every size of a configuration: how many entries each table holds, or for a
+/// growable one the most it grows to (`usize::MAX`: as memory allows).
+///
+/// A configuration derived with [`profile!`](crate::profile) starts from its
+/// base's and changes only the fields it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    /// Contexts served, the relay's included.
+    pub contexts: usize,
+    /// Open sessions.
+    pub sessions: usize,
+    /// Known peers.
+    pub peers: usize,
+    /// Pending handshakes.
+    pub pending: usize,
+    /// Recent ephemeral keys.
+    pub recent_ephemerals: usize,
+    /// Source rates under load.
+    pub source_rates: usize,
+    /// The anti-replay window, in 64-bit words: `(replay_words - 1) * 64`
+    /// counters.
+    pub replay_words: usize,
+    /// The datagrams a session holds without keys, in bytes.
+    pub queue_bytes: usize,
+    /// Dials in progress.
+    pub dials: usize,
+    /// Indices of sessions and dials.
+    pub indices: usize,
+    /// Direct address hints.
+    pub hints: usize,
+    /// Excluded IP prefixes.
+    pub excluded: usize,
+    /// First contacts a second before the responder is under load.
+    pub load_rate_per_second: u32,
+    /// First contacts that may arrive at once.
+    pub load_burst: u32,
+}
+
+/// Derives a configuration from [`Mcu`] or [`Server`], naming only the sizes
+/// that change; every other one is the base's ([`Sizes`] lists them).
+///
+/// ```
+/// convesso_core::profile! {
+///     /// A device with two contexts and eight sessions.
+///     pub Device: Mcu { contexts: 2, sessions: 8 }
+/// }
+/// use convesso_core::storage::Mcu;
+/// assert_eq!(Device::SIZES.contexts, 2);
+/// assert_eq!(Device::SIZES.peers, Mcu::SIZES.peers);
+/// ```
+///
+/// A name that is not a size fails to build:
+///
+/// ```compile_fail,E0560
+/// convesso_core::profile! { pub Device: Mcu { contxts: 2 } }
+/// ```
+#[macro_export]
+macro_rules! profile {
+    ($(#[$meta:meta])* $vis:vis $name:ident : Mcu { $($field:ident : $value:expr),* $(,)? }) => {
+        $(#[$meta])*
+        $vis struct $name;
+        impl $name {
+            /// This configuration's sizes.
+            $vis const SIZES: $crate::storage::Sizes = $crate::storage::Sizes {
+                $($field: $value,)*
+                ..$crate::storage::Mcu::SIZES
+            };
+        }
+        $crate::__fixed_config!($name);
+    };
+    ($(#[$meta:meta])* $vis:vis $name:ident : Server { $($field:ident : $value:expr),* $(,)? }) => {
+        $(#[$meta])*
+        $vis struct $name;
+        impl $name {
+            /// This configuration's sizes.
+            $vis const SIZES: $crate::storage::Sizes = $crate::storage::Sizes {
+                $($field: $value,)*
+                ..$crate::storage::Server::SIZES
+            };
+        }
+        $crate::__growable_config!($name);
+    };
+}
+
+/// The [`Config`] of a type with fixed-size tables, from its `SIZES`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __fixed_config {
+    ($name:ident) => {
+        impl $crate::storage::Config for $name {
+            type Contexts<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.contexts }>;
+            type Sessions<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.sessions }>;
+            type Peers<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.peers }>;
+            type Pending<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.pending }>;
+            type RecentEphemerals<K: Ord, V> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.recent_ephemerals }>;
+            type SourceRates<K: Ord, V> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.source_rates }>;
+            type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
+            type Queue = $crate::session::FixedQueue<{ $name::SIZES.queue_bytes }>;
+            type Dials<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.dials }>;
+            type Indices<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.indices }>;
+            type Hints<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.hints }>;
+            type Excluded<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.excluded }>;
+            const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
+            const LOAD_BURST: u32 = $name::SIZES.load_burst;
+        }
+    };
+}
+
+/// The [`Config`] of a type with growable tables, from its `SIZES`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __growable_config {
+    ($name:ident) => {
+        impl $crate::storage::Config for $name {
+            type Contexts<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.contexts }>;
+            type Sessions<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.sessions }>;
+            type Peers<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.peers }>;
+            type Pending<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.pending }>;
+            type RecentEphemerals<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.recent_ephemerals }>;
+            type SourceRates<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.source_rates }>;
+            type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
+            type Queue = $crate::session::GrowableQueue<{ $name::SIZES.queue_bytes }>;
+            type Dials<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.dials }>;
+            type Indices<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.indices }>;
+            type Hints<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.hints }>;
+            type Excluded<K: Ord, V> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.excluded }>;
+            const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
+            const LOAD_BURST: u32 = $name::SIZES.load_burst;
+        }
+    };
+}
+
+/// A microcontroller: 4 contexts, the relay's included; 4 sessions, 16 known
+/// peers, 4 pending handshakes, 8 recent ephemerals and 8 source rates, in
+/// fixed arrays; under load beyond 5 first contacts a second.
 ///
 /// The load rate is provisional: a responder runs four X25519 operations and a
 /// torsion check per first contact, tens of milliseconds on a 32-bit
 /// microcontroller. Stage 3 measures it on hardware.
 pub struct Mcu;
 
-impl Config for Mcu {
-    type Sessions<K: Ord, V> = FixedTable<K, V, 4>;
-    type Peers<K: Ord, V> = FixedTable<K, V, 16>;
-    type Pending<K: Ord, V> = FixedTable<K, V, 4>;
-    type RecentEphemerals<K: Ord, V> = FixedTable<K, V, 8>;
-    type SourceRates<K: Ord, V> = FixedTable<K, V, 8>;
-    /// 256 counters: a device that sends little never reorders more.
-    type ReplayWindow = crate::transport::Window<5>;
-    /// 1 KB: a waking sensor's reading leaves with its first handshake.
-    type Queue = crate::session::FixedQueue<1024>;
-    type Dials<K: Ord, V> = FixedTable<K, V, 2>;
-    type Indices<K: Ord, V> = FixedTable<K, V, 12>;
-    /// 4: a device that talks to a handful of peers.
-    type Hints<K: Ord, V> = FixedTable<K, V, 4>;
-    /// 4: an overlay's prefix and a few more.
-    type Excluded<K: Ord, V> = FixedTable<K, V, 4>;
-    const LOAD_RATE_PER_SECOND: u32 = 5;
-    const LOAD_BURST: u32 = 5;
+impl Mcu {
+    /// This configuration's sizes.
+    pub const SIZES: Sizes = Sizes {
+        contexts: 4,
+        sessions: 4,
+        peers: 16,
+        pending: 4,
+        recent_ephemerals: 8,
+        source_rates: 8,
+        // 256 counters: a device that sends little never reorders more.
+        replay_words: 5,
+        // 1 KB: a waking sensor's reading leaves with its first handshake.
+        queue_bytes: 1024,
+        dials: 2,
+        indices: 12,
+        // 4: a device that talks to a handful of peers.
+        hints: 4,
+        // 4: an overlay's prefix and a few more.
+        excluded: 4,
+        load_rate_per_second: 5,
+        load_burst: 5,
+    };
 }
 
-/// A server: tables that grow with what they hold; at most 4,096 pending
-/// handshakes, recent ephemerals and source rates; under load beyond 1,000
-/// first contacts a second. Only with `alloc`.
+crate::__fixed_config!(Mcu);
+
+/// A server: tables that grow with what they hold, contexts and sessions as
+/// memory allows; at most 4,096 pending handshakes, recent ephemerals and
+/// source rates; under load beyond 1,000 first contacts a second. Only with
+/// `alloc`.
 #[cfg(feature = "alloc")]
 pub struct Server;
 
 #[cfg(feature = "alloc")]
-impl Config for Server {
-    type Sessions<K: Ord, V> = GrowableTable<K, V>;
-    type Peers<K: Ord, V> = GrowableTable<K, V>;
-    type Pending<K: Ord, V> = GrowableTable<K, V, 4096>;
-    type RecentEphemerals<K: Ord, V> = GrowableTable<K, V, 4096>;
-    type SourceRates<K: Ord, V> = GrowableTable<K, V, 4096>;
-    /// 8,192 counters: high throughput over paths that reorder.
-    type ReplayWindow = crate::transport::Window<129>;
-    /// 64 KB, allocated only while a session reopens.
-    type Queue = crate::session::GrowableQueue<65536>;
-    type Dials<K: Ord, V> = GrowableTable<K, V, 4096>;
-    type Indices<K: Ord, V> = GrowableTable<K, V, 16384>;
-    type Hints<K: Ord, V> = GrowableTable<K, V, 4096>;
-    type Excluded<K: Ord, V> = GrowableTable<K, V, 16>;
-    const LOAD_RATE_PER_SECOND: u32 = 1000;
-    const LOAD_BURST: u32 = 1000;
+impl Server {
+    /// This configuration's sizes.
+    pub const SIZES: Sizes = Sizes {
+        contexts: usize::MAX,
+        sessions: usize::MAX,
+        peers: usize::MAX,
+        pending: 4096,
+        recent_ephemerals: 4096,
+        source_rates: 4096,
+        // 8,192 counters: high throughput over paths that reorder.
+        replay_words: 129,
+        // 64 KB, allocated only while a session reopens.
+        queue_bytes: 65536,
+        dials: 4096,
+        indices: 16384,
+        hints: 4096,
+        excluded: 16,
+        load_rate_per_second: 1000,
+        load_burst: 1000,
+    };
 }
+
+#[cfg(feature = "alloc")]
+crate::__growable_config!(Server);

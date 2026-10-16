@@ -4,9 +4,12 @@
 //! its configuration's buffers, and with delivery credit on never hands out a
 //! message its credit does not cover (`PROTOCOL.md §8`).
 //!
-//! The input's first byte turns credit on or off; the rest is a list of
-//! operations. Frames are built from fuzzed fields, so that most of them
-//! decode, or taken raw.
+//! Two contexts: `ctx`, with the configuration's limits, and `two`, given a
+//! largest message and a credit mode of its own; no message longer than its
+//! context's largest is handed out. The input's first byte turns credit on or
+//! off in each, the next two give `two`'s largest message; the rest is a list
+//! of operations, each on the context its high bit names. Frames are built
+//! from fuzzed fields, so that most of them decode, or taken raw.
 
 #![no_main]
 
@@ -68,26 +71,43 @@ fn peer() -> PeerId {
 
 fuzz_target!(|data: &[u8]| {
     let mut input = Input(data);
-    let credit = input.byte().unwrap_or(0) % 2 == 1;
+    let modes = input.byte().unwrap_or(0);
+    let credit = modes & 1 != 0;
+    let credit_two = modes & 2 != 0;
+    let max_two = usize::from(input.u16().unwrap_or(0)) % 2049;
     let mut channels: Channels<Mcu> = if credit {
         Channels::with_credit()
     } else {
         Channels::new()
     };
+    let max_two = if max_two == 0 { None } else { Some(max_two) };
+    channels
+        .set_context(b"two", max_two, credit_two)
+        .expect("within the configuration");
+    let names: [&[u8]; 2] = [b"ctx", b"two"];
+    let contexts = names.map(|name| Context::new(name).expect("short"));
+    // Each context's credit mode and largest message.
+    let limits = |c: &Context| {
+        if *c == contexts[1] {
+            (credit_two, max_two.unwrap_or(2048))
+        } else {
+            (credit, 2048)
+        }
+    };
     let mut entropy = Counter(1);
     let peer = peer();
-    let context = Context::new(b"ctx").expect("short");
     let incarnations = [[1u8; 8], [2u8; 8], [3u8; 8]];
     let mut now = 0u64;
     let mut out = [0u8; MAX_DATA_LEN];
     let mut frame = [0u8; MAX_DATA_LEN];
     while let Some(op) = input.byte() {
         let t = Instant::from_millis(now);
-        match op % 13 {
+        let (name, context) = (names[usize::from(op >> 7)], contexts[usize::from(op >> 7)]);
+        match op % 14 {
             0 => {
                 let len = usize::from(input.u16().unwrap_or(0)) % 3000;
                 let message = vec![op; len];
-                let _ = channels.send_message(peer, None, b"ctx", &message, t, &mut entropy);
+                let _ = channels.send_message(peer, None, name, &message, t, &mut entropy);
             }
             1 => {
                 let incarnation = incarnations[usize::from(input.byte().unwrap_or(0)) % 3];
@@ -130,13 +150,22 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             3 => now += u64::from(input.u16().unwrap_or(0)),
-            4 | 5 => {
-                let deliver = op % 13 == 4;
+            4 | 5 | 13 => {
+                // Deliver in every context, in none, or in `ctx` alone.
+                let deliver = |c: &Context| match op % 14 {
+                    4 => true,
+                    5 => false,
+                    _ => *c == contexts[0],
+                };
                 for _ in 0..64 {
-                    let before = channels.inspect(peer, context).and_then(|s| s.credit);
-                    match channels.poll(t, deliver, &mut out) {
+                    let before = contexts.map(|c| channels.inspect(peer, c).and_then(|s| s.credit));
+                    match channels.poll_with(t, deliver, &mut out) {
                         Poll::SendFrame { len, .. } => assert!(len <= MAX_DATA_LEN),
-                        Poll::Event(Event::Message { data, .. }) => {
+                        Poll::Event(Event::Message { data, context, .. }) => {
+                            assert!(deliver(&context), "delivered where it may not be");
+                            let (credit, max) = limits(&context);
+                            assert!(data.len() <= max, "longer than its context takes");
+                            let before = before[usize::from(context == contexts[1])];
                             assert_eq!(before.is_some(), credit);
                             if let Some(before) = before {
                                 assert!(before >= data.len() + ELEMENT_COST, "beyond the credit");
@@ -161,7 +190,7 @@ fuzz_target!(|data: &[u8]| {
             }
             10 => {
                 let bytes = input.u32().unwrap_or(0) as usize;
-                let _ = channels.grant(peer, b"ctx", bytes);
+                let _ = channels.grant(peer, name, bytes);
             }
             11 => channels.reset_here(peer, context, t),
             _ => {
@@ -170,8 +199,10 @@ fuzz_target!(|data: &[u8]| {
                 channels.handle_frame(peer, context, FrameKind::Ack, &raw, t);
             }
         }
-        if let Some(held) = channels.memory(peer, context) {
-            assert!(held <= BOUND, "{held} bytes held");
+        for context in contexts {
+            if let Some(held) = channels.memory(peer, context) {
+                assert!(held <= BOUND, "{held} bytes held");
+            }
         }
     }
 });

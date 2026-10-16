@@ -92,8 +92,8 @@ fuzz_target!(|data: &[u8]| {
     let now = Instant::from_millis(0);
     let relay_address = Address::parse(RELAY_ADDRESS).expect("valid");
     let mut relay: Endpoint<Mcu> =
-        Endpoint::new(identity(RELAY_SCALAR, RELAY_ADDRESS), &[relay::CONTEXT]).expect("context");
-    relay.accept_payload(relay::CONTEXT).expect("served");
+        Endpoint::new(identity(RELAY_SCALAR, RELAY_ADDRESS), &[]).expect("context");
+    relay.serve_relay_context().expect("served");
     let mut client: Endpoint<Mcu> =
         Endpoint::new(identity(CLIENT_SCALAR, CLIENT_ADDRESS), &[b"session"]).expect("context");
     client.pin_relay(relay_address, now).expect("pinned");

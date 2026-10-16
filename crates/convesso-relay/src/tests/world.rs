@@ -707,13 +707,24 @@ impl<P: Policy> World<P> {
 
     /// Client `i` sends `data` to client `to`, by the path the core chooses.
     pub(crate) fn send(&mut self, i: usize, to: usize, data: &[u8]) -> Result<(), SendError> {
+        self.send_in(i, to, SESSION, data)
+    }
+
+    /// [`Self::send`] in `context`.
+    pub(crate) fn send_in(
+        &mut self,
+        i: usize,
+        to: usize,
+        context: &[u8],
+        data: &[u8],
+    ) -> Result<(), SendError> {
         let address = self.clients[to].address();
         let now = self.instant();
         let client = &mut self.clients[i];
         let mut out = [0u8; 2048];
         let output = client.endpoint.send(
             Target::Address(&address),
-            SESSION,
+            context,
             data,
             RELAY_PATH_MAX,
             now,

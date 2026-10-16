@@ -228,6 +228,56 @@ fn an_idle_month_with_a_link_costs_only_keepalives() {
     );
 }
 
+/// What two clients send in an idle month after an exchange of datagrams in
+/// each of `contexts`, through the relay, client 1 keeping a link: the
+/// packets each sent, and client 1's keep-alives.
+fn an_idle_month_after_contexts(contexts: &[&[u8]]) -> (u64, u64, u64) {
+    let mut world = World::new(Open, Config::default(), 2);
+    for client in &mut world.clients {
+        for context in contexts {
+            if *context != SESSION {
+                client
+                    .endpoint
+                    .serve(context, convesso_core::handshake::Access::Policy)
+                    .unwrap();
+            }
+        }
+    }
+    world.open_link(1);
+    world.run_for(60_000);
+    for context in contexts {
+        world.send_in(0, 1, context, b"there").unwrap();
+        world.run_for(1000);
+        world.send_in(1, 0, context, b"and back").unwrap();
+        world.run_for(1000);
+    }
+    let got = world.clients[0].datagrams().len() + world.clients[1].datagrams().len();
+    assert_eq!(got, 2 * contexts.len(), "an exchange in each context");
+    // Past the keys' life: every session dormant.
+    world.run_for(200_000);
+    let start: Vec<_> = world.clients.iter().map(|c| c.sent).collect();
+    world.run_for(MONTH);
+    let end: Vec<_> = world.clients.iter().map(|c| c.sent).collect();
+    let packets = |i: usize| (end[i].udp + end[i].tcp - start[i].udp - start[i].tcp) as u64;
+    (
+        packets(0),
+        packets(1),
+        (end[1].keepalives - start[1].keepalives) as u64,
+    )
+}
+
+/// Scenario: an idle month with three contexts open costs what one costs:
+/// after an exchange in each, keep-alives only, one a minute, on the link of
+/// the client that keeps one; nothing from the other.
+#[test]
+fn an_idle_month_with_three_contexts_costs_what_one_costs() {
+    let one = an_idle_month_after_contexts(&[SESSION]);
+    let three = an_idle_month_after_contexts(&[SESSION, b"example/files/1", b"example/chat/1"]);
+    std::println!("an idle month: one context {one:?}, three {three:?}");
+    assert_eq!(three, one);
+    assert_eq!(three, (0, 0, 43_200), "keep-alives only, one a minute");
+}
+
 /// Scenario: an idle month without a link costs nothing: after one datagram
 /// through the relay over UDP, nothing is sent and no deadline is returned.
 #[test]

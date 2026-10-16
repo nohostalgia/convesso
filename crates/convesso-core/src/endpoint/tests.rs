@@ -11,6 +11,7 @@
 extern crate std;
 
 use std::collections::VecDeque;
+use std::string::ToString;
 use std::vec;
 use std::vec::Vec;
 
@@ -55,10 +56,22 @@ impl Entropy for TestEntropy {
 struct Policy {
     decision: Decision,
     asked: usize,
+    /// Peers refused with `REFUSED` whatever `decision` says.
+    refuse: Vec<PeerId>,
 }
+
+/// The code `Policy` refuses its `refuse` list with.
+const REFUSED: u16 = 0x0123;
+
 impl Admission for Policy {
-    fn admit(&mut self, _peer: &PeerId, _context: &[u8]) -> Decision {
+    fn admit(&mut self, peer: &PeerId, _context: &[u8]) -> Decision {
         self.asked += 1;
+        if self.refuse.contains(peer) {
+            return Decision::Refuse {
+                code: RefusalCode::application(REFUSED).unwrap(),
+                psk: None,
+            };
+        }
         self.decision
     }
     fn psk(&mut self, _peer: &PeerId, _context: &[u8]) -> Option<Psk> {
@@ -145,6 +158,7 @@ impl Node {
             policy: Policy {
                 decision: Decision::Accept { psk: None },
                 asked: 0,
+                refuse: Vec::new(),
             },
             entropy: TestEntropy(seed),
             source,
@@ -396,6 +410,35 @@ impl Net {
         if let Output::Transmit { len, .. } = output {
             self.a.sent.push(out[..len].to_vec());
             queue.push_back((true, out[..len].to_vec()));
+        }
+        self.settle_with(queue);
+    }
+
+    /// A, or B when `from_a` is false, connects to the other in `context`,
+    /// then the link settles.
+    fn connect_in(&mut self, from_a: bool, context: &[u8]) {
+        let now = self.t();
+        let (node, address) = if from_a {
+            (&mut self.a, self.b.address())
+        } else {
+            (&mut self.b, self.a.address())
+        };
+        let mut out = [0u8; 2048];
+        let output = node
+            .endpoint
+            .connect(
+                &address,
+                context,
+                now,
+                &mut node.policy,
+                &mut node.entropy,
+                &mut out,
+            )
+            .unwrap();
+        let mut queue = VecDeque::new();
+        if let Output::Transmit { len, .. } = output {
+            node.sent.push(out[..len].to_vec());
+            queue.push_back((from_a, out[..len].to_vec()));
         }
         self.settle_with(queue);
     }
@@ -2022,4 +2065,522 @@ fn per_datagram_cost_of_the_aead() {
         "seal alone: {:.2} us per 1,300-byte datagram",
         elapsed.as_secs_f64() * 1e6 / n as f64
     );
+}
+
+// --- contexts served at runtime -------------------------------------------------------
+
+/// Scenario: a context served while running admits from then on.
+#[test]
+fn a_context_served_while_running_admits_from_then_on() {
+    let mut net = Net::new();
+    net.connected();
+    let sent = net.b.sent.len();
+
+    // Not served yet: silence, and admission is not asked.
+    net.connect_in(true, b"late");
+    assert_eq!(net.b.sent.len(), sent);
+    assert_eq!(net.b.policy.asked, 1);
+    assert_eq!(net.b.endpoint.responder.pending_count(), 0);
+
+    net.b.endpoint.serve(b"late", Access::Policy).unwrap();
+    net.at(1);
+    net.connect_in(true, b"late");
+    let late = Ev::Connected(b"late".to_vec());
+    assert!(net.a.events.contains(&late));
+    assert!(net.b.events.contains(&late));
+    let now = net.t();
+    for context in [&b"session"[..], b"late"] {
+        assert!(net.b.endpoint.is_live(&net.a.peer_id(), context, now));
+    }
+}
+
+/// Scenario: one context more than the profile allows is refused.
+#[test]
+fn one_context_more_than_the_profile_allows_is_refused() {
+    let mut endpoint: Endpoint<Mcu> = Endpoint::new(identity(0), &[b"a", b"b", b"c"]).unwrap();
+    endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+
+    let refused = endpoint.serve(b"d", Access::Policy);
+    assert_eq!(
+        refused,
+        Err(ResponderError::TooManyContexts { capacity: 4 })
+    );
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("the contexts table is full")
+    );
+    assert_eq!(endpoint.contexts_served(), 4);
+    for context in [&b"a"[..], b"b", b"c", crate::relay::CONTEXT] {
+        assert!(endpoint.serves(context));
+    }
+    assert!(!endpoint.serves(b"d"));
+
+    // Pinning a relay takes a slot too.
+    let mut full: Endpoint<Mcu> = Endpoint::new(identity(0), &[b"a", b"b", b"c", b"d"]).unwrap();
+    assert_eq!(
+        full.pin_relay(*identity(4).address(), Instant::from_millis(0)),
+        Err(ResponderError::TooManyContexts { capacity: 4 })
+    );
+    assert!(full.relay().is_none());
+}
+
+/// Scenario: the relay context and a duplicate are refused.
+#[test]
+fn the_relay_context_and_a_duplicate_are_refused() {
+    let mut endpoint: Endpoint<Mcu> = Endpoint::new(identity(0), &[b"session"]).unwrap();
+    assert_eq!(
+        endpoint.serve(crate::relay::CONTEXT, Access::Policy),
+        Err(ResponderError::RelayContext)
+    );
+    assert_eq!(
+        endpoint.accept_payload(crate::relay::CONTEXT),
+        Err(ResponderError::RelayContext)
+    );
+    assert_eq!(
+        endpoint.serve(b"session", Access::Bound(identity(1).peer_id())),
+        Err(ResponderError::AlreadyServed)
+    );
+    assert_eq!(endpoint.contexts_served(), 1);
+    assert!(!endpoint.serves(crate::relay::CONTEXT));
+    assert_eq!(
+        endpoint
+            .responder
+            .access(&Context::new(b"session").unwrap()),
+        Some(Access::Policy)
+    );
+    assert!(matches!(
+        Endpoint::<Mcu>::new(identity(0), &[crate::relay::CONTEXT]),
+        Err(ResponderError::RelayContext)
+    ));
+}
+
+/// Scenario: an endpoint serving no context answers no one, and still dials
+/// in any context.
+#[test]
+fn an_endpoint_serving_no_context_answers_no_one() {
+    let mut net = Net::new();
+    net.b.endpoint = Endpoint::new(identity(0), &[]).unwrap();
+    let a_source = net.a.source;
+    let a = net.a.peer_id();
+    net.b
+        .endpoint
+        .set_hint(a, &a_source, Instant::from_millis(0))
+        .unwrap();
+
+    net.connect_in(true, b"session");
+    assert!(net.b.sent.is_empty());
+    assert!(net.b.events.is_empty());
+    assert_eq!(net.b.policy.asked, 0);
+    assert_eq!(net.b.endpoint.responder.pending_count(), 0);
+
+    net.at(1);
+    net.connect_in(false, b"other");
+    assert!(net.b.events.contains(&Ev::Connected(b"other".to_vec())));
+    assert!(net.b.endpoint.is_live(&a, b"other", net.t()));
+}
+
+/// Fifty contexts on the server profile, each answered.
+#[cfg(feature = "alloc")]
+#[test]
+fn fifty_contexts_on_the_server_profile() {
+    use crate::storage::Server;
+
+    let mut server: Endpoint<Server> = Endpoint::new(identity(0), &[]).unwrap();
+    let names: Vec<Vec<u8>> = (0..50)
+        .map(|i| std::format!("app/{i}/1").into_bytes())
+        .collect();
+    for name in &names {
+        server.serve(name, Access::Policy).unwrap();
+    }
+    assert_eq!(server.contexts_served(), 50);
+
+    let mut client: Endpoint<Mcu> = Endpoint::new(identity(1), &[]).unwrap();
+    let server_source = [10, 0, 0, 2, 0, 2];
+    let client_source = [10, 0, 0, 1, 0, 1];
+    let now = Instant::from_millis(0);
+    client
+        .set_hint(identity(0).peer_id(), &server_source, now)
+        .unwrap();
+    let mut policy = Policy {
+        decision: Decision::Accept { psk: None },
+        asked: 0,
+        refuse: Vec::new(),
+    };
+    let mut entropy = TestEntropy(5000);
+    for name in [&names[0], &names[49]] {
+        let mut out = [0u8; 2048];
+        let Ok(Output::Transmit { len, .. }) = client.connect(
+            identity(0).address(),
+            name,
+            now,
+            &mut policy,
+            &mut entropy,
+            &mut out,
+        ) else {
+            panic!("a first contact")
+        };
+        let mut packet = out[..len].to_vec();
+        let mut answer = [0u8; 2048];
+        let output = server.handle_packet(
+            &mut packet,
+            Source::Direct(&client_source),
+            now,
+            &mut policy,
+            &mut entropy,
+            &mut answer,
+        );
+        assert!(
+            matches!(
+                output,
+                Output::Transmit {
+                    len: RESPONSE_LEN,
+                    ..
+                }
+            ),
+            "answered in {}",
+            std::string::String::from_utf8_lossy(name)
+        );
+    }
+    assert_eq!(policy.asked, 2);
+}
+
+crate::profile! {
+    /// The microcontroller profile with two contexts and eight sessions.
+    Device: Mcu { contexts: 2, sessions: 8 }
+}
+
+/// Scenario: a profile derived from the reference changes only what it names:
+/// the endpoint built on it serves 2 contexts.
+#[test]
+fn an_endpoint_on_a_derived_profile_serves_its_contexts() {
+    let mut endpoint: Endpoint<Device> = Endpoint::new(identity(0), &[b"a"]).unwrap();
+    endpoint.serve(b"b", Access::Policy).unwrap();
+    assert_eq!(
+        endpoint.serve(b"c", Access::Policy),
+        Err(ResponderError::TooManyContexts { capacity: 2 })
+    );
+    assert_eq!(endpoint.sessions.capacity(), Some(8));
+    assert_eq!(endpoint.dials.capacity(), Some(2));
+}
+
+// --- access changes and closing contexts ----------------------------------------------
+
+/// Endpoints on one link, each reaching every other directly: node `i` has
+/// identity `i` and its own source.
+struct Mesh {
+    nodes: Vec<Node>,
+    now: u64,
+}
+
+impl Mesh {
+    fn new(count: usize) -> Self {
+        let source = |i: usize| {
+            let b = u8::try_from(i + 1).unwrap();
+            [10, 0, 0, b, 0, b]
+        };
+        let mut nodes: Vec<Node> = (0..count)
+            .map(|i| Node::new(i, source(i), 1000 * (i as u64 + 1)))
+            .collect();
+        for i in 0..count {
+            for j in 0..count {
+                if i != j {
+                    let (peer, from) = (nodes[j].peer_id(), nodes[j].source);
+                    nodes[i]
+                        .endpoint
+                        .set_hint(peer, &from, Instant::from_millis(0))
+                        .unwrap();
+                }
+            }
+        }
+        Self { nodes, now: 0 }
+    }
+
+    fn t(&self) -> Instant {
+        Instant::from_millis(self.now)
+    }
+
+    fn node_at(&self, to: &SourceKey) -> usize {
+        let bytes = to.as_direct().unwrap();
+        self.nodes
+            .iter()
+            .position(|n| n.source[..] == *bytes)
+            .unwrap()
+    }
+
+    /// Delivers and polls until nothing moves at the current instant. Each
+    /// queued packet is (from, to, bytes).
+    fn settle_with(&mut self, mut queue: VecDeque<(usize, usize, Vec<u8>)>) {
+        let now = self.t();
+        for _ in 0..1000 {
+            let mut moved = false;
+            for i in 0..self.nodes.len() {
+                loop {
+                    let mut out = [0u8; 2048];
+                    let node = &mut self.nodes[i];
+                    match node
+                        .endpoint
+                        .poll(now, &mut node.policy, &mut node.entropy, &mut out)
+                    {
+                        Poll::Transmit {
+                            to: To::Direct(to),
+                            len,
+                        } => {
+                            node.sent.push(out[..len].to_vec());
+                            let packet = out[..len].to_vec();
+                            let to = self.node_at(&to);
+                            queue.push_back((i, to, packet));
+                        }
+                        Poll::Event(event) => node.events.push(own(event)),
+                        Poll::Wait(_) | Poll::Idle => break,
+                        other => panic!("unexpected {other:?}"),
+                    }
+                    moved = true;
+                }
+            }
+            while let Some((from, to, packet)) = queue.pop_front() {
+                moved = true;
+                let mut buffer = packet;
+                let mut out = [0u8; 2048];
+                let source = self.nodes[from].source;
+                let node = &mut self.nodes[to];
+                match node.endpoint.handle_packet(
+                    &mut buffer,
+                    Source::Direct(&source),
+                    now,
+                    &mut node.policy,
+                    &mut node.entropy,
+                    &mut out,
+                ) {
+                    Output::Transmit { to: target, len } => {
+                        node.sent.push(out[..len].to_vec());
+                        let target = match target {
+                            To::Source => from,
+                            To::Direct(key) => self.node_at(&key),
+                            other => panic!("unexpected {other:?}"),
+                        };
+                        queue.push_back((to, target, out[..len].to_vec()));
+                    }
+                    Output::Event(event) => node.events.push(own(event)),
+                    Output::Nothing => {}
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the mesh never settled");
+    }
+
+    fn settle(&mut self) {
+        self.settle_with(VecDeque::new());
+    }
+
+    /// Node `from` connects to node `to` in `context`, then the mesh settles.
+    fn connect(&mut self, from: usize, to: usize, context: &[u8]) {
+        let now = self.t();
+        let address = self.nodes[to].address();
+        let node = &mut self.nodes[from];
+        let mut out = [0u8; 2048];
+        let output = node
+            .endpoint
+            .connect(
+                &address,
+                context,
+                now,
+                &mut node.policy,
+                &mut node.entropy,
+                &mut out,
+            )
+            .unwrap();
+        let mut queue = VecDeque::new();
+        if let Output::Transmit { to: target, len } = output {
+            node.sent.push(out[..len].to_vec());
+            let target = match target {
+                To::Direct(key) => self.node_at(&key),
+                other => panic!("unexpected {other:?}"),
+            };
+            queue.push_back((from, target, out[..len].to_vec()));
+        }
+        self.settle_with(queue);
+    }
+
+    fn live(&self, at: usize, with: usize, context: &[u8]) -> bool {
+        let peer = self.nodes[with].peer_id();
+        self.nodes[at].endpoint.is_live(&peer, context, self.t())
+    }
+
+    fn closed(&self, at: usize, context: &[u8]) -> Vec<(u16, bool)> {
+        self.nodes[at]
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Closed(c, code, by_peer) if c == context => Some((*code, *by_peer)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Scenario: a context no longer served meets silence.
+#[test]
+fn a_context_no_longer_served_meets_silence() {
+    let mut net = Net::new();
+    net.connected();
+    net.b
+        .endpoint
+        .set_access(b"session", None, 0x0200, &mut net.b.policy)
+        .unwrap();
+    net.settle();
+    // The session B accepted is closed, with an authenticated close.
+    assert!(
+        net.a
+            .events
+            .contains(&Ev::Closed(b"session".to_vec(), 0x0200, true))
+    );
+    assert!(!net.b.endpoint.serves(b"session"));
+
+    let (sent, asked) = (net.b.sent.len(), net.b.policy.asked);
+    net.at(1);
+    net.connect_in(true, b"session");
+    assert_eq!(net.b.sent.len(), sent);
+    assert_eq!(net.b.policy.asked, asked);
+    assert_eq!(net.b.endpoint.responder.pending_count(), 0);
+    assert!(
+        !net.b
+            .endpoint
+            .is_live(&net.a.peer_id(), b"session", net.t())
+    );
+}
+
+/// Scenario: narrowing access closes only the sessions no longer admitted.
+#[test]
+fn narrowing_access_closes_only_the_sessions_no_longer_admitted() {
+    // B is node 0; A, C and D are nodes 1, 2 and 3.
+    let mut mesh = Mesh::new(4);
+    mesh.connect(1, 0, b"session");
+    mesh.connect(2, 0, b"session");
+    mesh.connect(0, 3, b"session");
+    for peer in [1, 2, 3] {
+        assert!(mesh.live(0, peer, b"session"));
+    }
+
+    // The policy now admits A only: C and D would be refused.
+    let (c, d) = (mesh.nodes[2].peer_id(), mesh.nodes[3].peer_id());
+    let b = &mut mesh.nodes[0];
+    b.policy.refuse = vec![c, d];
+    b.endpoint
+        .set_access(b"session", Some(Access::Policy), 0x0200, &mut b.policy)
+        .unwrap();
+    mesh.settle();
+
+    assert_eq!(mesh.closed(2, b"session"), vec![(REFUSED, true)]);
+    assert!(!mesh.live(0, 2, b"session"));
+    // A was accepted and is admitted; D was dialled by B.
+    assert!(mesh.live(0, 1, b"session"));
+    assert!(mesh.live(0, 3, b"session"));
+    assert!(mesh.closed(1, b"session").is_empty());
+    assert!(mesh.closed(3, b"session").is_empty());
+}
+
+/// Scenario: closing a context leaves the others untouched.
+#[test]
+fn closing_a_context_leaves_the_others_untouched() {
+    // B is node 0; A and C are nodes 1 and 2.
+    let mut mesh = Mesh::new(3);
+    mesh.connect(1, 0, b"session");
+    mesh.connect(0, 2, b"session");
+    mesh.connect(1, 0, b"other");
+
+    mesh.nodes[0]
+        .endpoint
+        .close_context(b"session", 0x0201)
+        .unwrap();
+    mesh.settle();
+
+    assert_eq!(mesh.closed(1, b"session"), vec![(0x0201, true)]);
+    assert_eq!(mesh.closed(2, b"session"), vec![(0x0201, true)]);
+    assert_eq!(mesh.closed(0, b"session"), Vec::new());
+    assert!(!mesh.live(0, 1, b"session"));
+    assert!(!mesh.live(0, 2, b"session"));
+    assert!(mesh.live(0, 1, b"other"));
+    assert!(mesh.live(1, 0, b"other"));
+    assert!(!mesh.nodes[0].endpoint.serves(b"session"));
+    assert!(mesh.nodes[0].endpoint.serves(b"other"));
+    assert_eq!(
+        mesh.nodes[0]
+            .endpoint
+            .close_context(crate::relay::CONTEXT, 1),
+        Err(ResponderError::RelayContext)
+    );
+}
+
+/// A session reopened by the peer after dormancy is judged by a change of
+/// access; one reopened by this side is not.
+#[test]
+fn only_a_session_the_peer_reopened_is_judged() {
+    let somebody = identity(3).peer_id();
+    for b_reopens in [true, false] {
+        let mut net = Net::new();
+        net.connected();
+        // Dormant: past every key's life.
+        net.at(200);
+        assert!(
+            !net.b
+                .endpoint
+                .is_live(&net.a.peer_id(), b"session", net.t())
+        );
+        net.connect_in(!b_reopens, b"session");
+        assert!(
+            net.b
+                .endpoint
+                .is_live(&net.a.peer_id(), b"session", net.t())
+        );
+
+        net.b
+            .endpoint
+            .set_access(
+                b"session",
+                Some(Access::Bound(somebody)),
+                0x0202,
+                &mut net.b.policy,
+            )
+            .unwrap();
+        net.settle();
+        let closed = net
+            .a
+            .events
+            .contains(&Ev::Closed(b"session".to_vec(), 0x0202, true));
+        assert_eq!(closed, !b_reopens, "b_reopens: {b_reopens}");
+        assert_eq!(
+            net.b
+                .endpoint
+                .is_live(&net.a.peer_id(), b"session", net.t()),
+            b_reopens
+        );
+    }
+}
+
+/// A change of access discards the pending handshakes it would not admit.
+#[test]
+fn a_change_of_access_discards_pending_handshakes_it_would_not_admit() {
+    let mut net = Net::new();
+    // B answers, but its acceptance never reaches A: B holds it pending.
+    net.drop_to_a = true;
+    net.connect_in(true, b"session");
+    assert_eq!(net.b.endpoint.responder.pending_count(), 1);
+    net.b
+        .endpoint
+        .set_access(b"session", Some(Access::Policy), 0x0200, &mut net.b.policy)
+        .unwrap();
+    assert_eq!(net.b.endpoint.responder.pending_count(), 1);
+    net.b.policy.refuse = vec![net.a.peer_id()];
+    net.b
+        .endpoint
+        .set_access(b"session", Some(Access::Policy), 0x0200, &mut net.b.policy)
+        .unwrap();
+    assert_eq!(net.b.endpoint.responder.pending_count(), 0);
 }

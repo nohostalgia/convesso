@@ -15,7 +15,10 @@ use convesso_core::endpoint::RelayError;
 use convesso_core::handshake::{DialError, RefusalCode};
 use convesso_core::identity::Identity;
 use convesso_tokio::relay_config::{hex, parse, start};
-use convesso_tokio::{Config, Events, Node, NodeEvent, RelayLocation};
+use convesso_tokio::{
+    Config, Context, ContextEvent, ContextEvents, ContextOptions, Events, Node, NodeEvent,
+    RelayLocation,
+};
 use tokio::time::timeout;
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -29,8 +32,8 @@ fn toml_path(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-async fn node(seed: u8, relay: &RelayLocation) -> (Node, Events) {
-    convesso_tokio::start(
+async fn node(seed: u8, relay: &RelayLocation) -> (Node, Events, Context, ContextEvents) {
+    let (node, events) = convesso_tokio::start(
         Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -39,7 +42,12 @@ async fn node(seed: u8, relay: &RelayLocation) -> (Node, Events) {
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let (app, app_events) = node
+        .context(b"app", ContextOptions::default())
+        .await
+        .unwrap();
+    (node, events, app, app_events)
 }
 
 /// A relay from a file, on one loopback port for UDP and TCP.
@@ -199,16 +207,17 @@ fn a_limit_that_would_stop_the_relay_is_refused() {
 #[tokio::test]
 async fn the_binary_forwards_between_two_nodes() {
     let (relay, identity) = relay_from("", "forward").await;
-    let (a, _a_events) = node(31, &relay).await;
-    let (b, mut b_events) = node(32, &relay).await;
+    let (_a, _a_node, a_app, _a_events) = node(31, &relay).await;
+    let (b, _b_node, _b_app, mut b_events) = node(32, &relay).await;
     b.set_reachable(true).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    a.send(b.address(), b"through the binary".to_vec())
+    a_app
+        .send(b.address(), b"through the binary".to_vec())
         .await
         .unwrap();
     let got = timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(NodeEvent::Datagram { data, relayed, .. }) = b_events.next().await {
+            if let Some(ContextEvent::Datagram { data, relayed, .. }) = b_events.next().await {
                 return (data, relayed);
             }
         }
@@ -229,9 +238,10 @@ async fn an_allowlist_refuses_everyone_else() {
         hex(listed.address())
     );
     let (relay, identity) = relay_from(&extra, "allowlist").await;
-    let (outsider, mut outsider_events) = node(42, &relay).await;
-    let (member, _member_events) = node(41, &relay).await;
-    outsider
+    let (_outsider, mut outsider_events, outsider_app, _outsider_app_events) =
+        node(42, &relay).await;
+    let (member, _member_events, _member_app, _member_app_events) = node(41, &relay).await;
+    outsider_app
         .send(member.address(), b"let me in".to_vec())
         .await
         .unwrap();

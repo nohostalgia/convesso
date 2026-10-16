@@ -16,26 +16,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use convesso_core::identity::Identity;
-use convesso_tokio::{Config, Events, Node, NodeEvent};
+use convesso_tokio::{Config, Context, ContextEvent, ContextEvents, ContextOptions, Node};
 
-async fn node(seed: u8) -> (Node, Events) {
-    convesso_tokio::start(
+async fn node(seed: u8) -> (Node, Context, ContextEvents) {
+    let (node, _events) = convesso_tokio::start(
         Identity::from_ed25519_seed(&[seed; 32]).unwrap(),
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            events: 1024,
             ..Config::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let (app, app_events) = node
+        .context(
+            b"app",
+            ContextOptions {
+                events: 1024,
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    (node, app, app_events)
 }
 
 /// Sends for `seconds` from `senders` concurrent tasks; returns datagrams
 /// sent and received, per second.
 async fn throughput(senders: usize, seconds: u64) -> (f64, f64) {
-    let (a, _a_events) = node(41).await;
-    let (b, mut b_events) = node(42).await;
+    let (a, a_app, _a_events) = node(41).await;
+    let (b, _b_app, mut b_events) = node(42).await;
     a.set_hint(b.address().peer_id(), b.local_addr())
         .await
         .unwrap();
@@ -43,14 +53,14 @@ async fn throughput(senders: usize, seconds: u64) -> (f64, f64) {
         .await
         .unwrap();
     // The session first.
-    a.send(b.address(), vec![0; 10]).await.unwrap();
-    while !matches!(b_events.next().await, Some(NodeEvent::Datagram { .. })) {}
+    a_app.send(b.address(), vec![0; 10]).await.unwrap();
+    while !matches!(b_events.next().await, Some(ContextEvent::Datagram { .. })) {}
 
     let received = Arc::new(AtomicU64::new(0));
     let counter = received.clone();
     tokio::spawn(async move {
         while let Some(event) = b_events.next().await {
-            if matches!(event, NodeEvent::Datagram { .. }) {
+            if matches!(event, ContextEvent::Datagram { .. }) {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -59,7 +69,7 @@ async fn throughput(senders: usize, seconds: u64) -> (f64, f64) {
     let end = Instant::now() + Duration::from_secs(seconds);
     let mut tasks = Vec::new();
     for _ in 0..senders {
-        let (a, to, sent) = (a.clone(), b.address(), sent.clone());
+        let (a, to, sent) = (a_app.clone(), b.address(), sent.clone());
         tasks.push(tokio::spawn(async move {
             while Instant::now() < end {
                 if a.send(to, vec![7; 1400]).await.is_ok() {

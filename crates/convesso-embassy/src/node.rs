@@ -1,39 +1,47 @@
 //! The driver: a [`Runner`] that owns the relay link and drives the core, a
-//! [`Node`] handle for the application, and its [`Events`].
+//! [`Node`] handle for the application, its [`Events`], and a [`Context`]
+//! handle with its [`ContextEvents`] for each context the application opens.
 //!
 //! ```text
-//! Node::send        lock link_out -> lock inner -> core.send
+//! Context::send     lock link_out -> lock inner -> core.send
 //!                     -> UDP: the datagram socket, through &self
 //!                     -> TCP: framed into link_out, for the runner
 //! Runner::run       select(datagram in | link connect or read | core deadline | signal)
 //!                     lock inner -> core.handle / core.poll -> send, write the link
-//! Events::next      the oldest event; room for the runner to read again
+//! Events::next      the node's oldest event
+//! ContextEvents::next  the context's oldest event, from the integrator's slot
 //! ```
 //!
-//! The order of the locks (link_out, then inner) is the same everywhere, and
-//! the runner never waits for link_out while it holds inner: no deadlock. The
-//! runner reads from the network only while an event of the largest size
-//! fits, so a slow reader stops the reading, never drops an event.
+//! The order of the locks (link_out, then inner, then a context's slot) is the
+//! same everywhere, and the runner never waits for link_out while it holds
+//! inner: no deadlock. The runner never stops reading for the application: a
+//! datagram for a context whose queue has no room is dropped and counted; a
+//! context's messages wait in their channel until its queue has room.
 
+use core::cell::RefCell;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use convesso_core::dos::{Source, decode_ip, encode_ip};
 use convesso_core::endpoint::{Endpoint, Output, Poll, RelayPath, Target, To};
-use convesso_core::handshake::ChannelBinding;
-use convesso_core::handshake::{Admission, Context, Decision, Psk, ResponderError};
+use convesso_core::handshake::Context as Name;
+use convesso_core::handshake::{self, Admission, ChannelBinding, Decision, Psk, ResponderError};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::paths::{Candidate, PathInfo};
 use convesso_core::relay::Link;
 use convesso_core::relay::framing::{self, Deframed, Deframer, KEEPALIVE, MAX_FRAME, PREAMBLE};
-use convesso_core::storage::Config as Tables;
+use convesso_core::storage::{Config as Tables, Table};
 use convesso_core::time::Instant;
 use embassy_futures::select::{Either4, select, select4};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::mutex::{Mutex, MutexGuard};
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 
-use crate::events::{EventQueue, NodeError, NodeEvent, from_core};
+use crate::events::{
+    ContextEvent, ENTRIES, Event, EventQueue, HELD, NODE_ENTRIES, NODE_HELD, NodeError, NodeEvent,
+    from_core,
+};
 use crate::rng::{Checked, RngFailed, SecureRng};
 use crate::socket::{Datagrams, Interfaces, Streams, canonical};
 
@@ -45,10 +53,13 @@ pub const DIRECT_PATH_MAX: usize = 1452;
 /// around the largest packet. Also the largest event.
 pub(crate) const OUT_LEN: usize = 2048;
 
-/// The default size of the event buffer given to [`start`]: one event of the
-/// largest size and a thousand bytes of others. With less than `OUT_LEN`
-/// the runner would never read the datagram socket.
+/// A size for a context's event buffer: one event of the largest size and a
+/// thousand bytes of others.
 pub const EVENTS_LEN: usize = OUT_LEN + 1024;
+
+/// The code a context's sessions are closed with when its handle is dropped
+/// without [`Context::close_context`]: the core's default code.
+pub const DROPPED: u16 = 1;
 
 /// The most interface addresses reported to the core.
 const LOCAL_MAX: usize = 8;
@@ -67,18 +78,100 @@ pub struct RelayLocation {
     pub other: Option<SocketAddr>,
 }
 
-/// How to start the driver.
-#[derive(Debug, Clone, Copy)]
-pub struct Config<'c> {
-    /// The application's context.
-    pub context: &'c [u8],
+/// How to start the driver. It serves no context until the application opens
+/// one with [`Node::context`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Config {
     /// The relay to pin, if any.
     pub relay: Option<RelayLocation>,
+}
+
+/// Who may reach this node in a context.
+#[derive(Default)]
+pub enum Access<'d> {
+    /// Every peer.
+    #[default]
+    Everyone,
+    /// The peers this policy admits, asked for each first contact.
+    Admit(&'d mut dyn Admission),
+    /// This peer alone: a first contact from any other meets silence.
+    Bound(PeerId),
+    /// No one: the context is not served, and only dialled in.
+    DialOnly,
+}
+
+/// How to open a context. Every buffer is the integrator's.
+pub struct ContextOptions<'d, M: RawMutex> {
+    /// Who may reach this node in it.
+    pub access: Access<'d>,
+    /// Where its events wait for the application, datagrams' and messages'
+    /// data included: at least one largest datagram, or message, and some.
+    pub events: &'d mut [u8],
+    /// Its state, a `static` on a microcontroller: one per context open at
+    /// once.
+    pub slot: &'d ContextSlot<'d, M>,
     /// With the `stream` feature, delivery credit: a peer's messages are
-    /// handed out only as far as [`Node::grant`] allows, so that a peer the
+    /// handed out only as far as [`Context::grant`] allows, so that a peer the
     /// application takes slowly holds back only its own sender
-    /// (`DESIGN.md §8`). Without the feature, it changes nothing.
+    /// (`DESIGN.md §8`).
+    #[cfg(feature = "stream")]
     pub credit: bool,
+    /// Its largest message, at most the `Mcu` configuration's; that one when
+    /// unset (feature `stream`).
+    #[cfg(feature = "stream")]
+    pub max_message: Option<usize>,
+}
+
+/// A context's state, which its handle, its events and the runner share:
+/// given by the integrator when the context is opened.
+pub struct ContextSlot<'d, M: RawMutex> {
+    state: BlockingMutex<M, RefCell<Option<SlotState<'d>>>>,
+    /// An event was queued, or the context closed.
+    ready: Signal<M, ()>,
+    /// Room opened in one of its channels' send buffers (feature `stream`).
+    #[cfg(feature = "stream")]
+    writable: Signal<M, ()>,
+}
+
+struct SlotState<'d> {
+    events: EventQueue<'d, ENTRIES, HELD>,
+    /// The handle asked for the context to be closed, with this code.
+    close: Option<u16>,
+    /// The context is closed: its events end once read.
+    closed: bool,
+}
+
+impl<M: RawMutex> Default for ContextSlot<'_, M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'d, M: RawMutex> ContextSlot<'d, M> {
+    /// An empty slot.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: BlockingMutex::new(RefCell::new(None)),
+            ready: Signal::new(),
+            #[cfg(feature = "stream")]
+            writable: Signal::new(),
+        }
+    }
+
+    /// `f` on the state, if the slot is in use.
+    fn with<R>(&self, f: impl FnOnce(&mut SlotState<'d>) -> R) -> Option<R> {
+        self.state.lock(|state| state.borrow_mut().as_mut().map(f))
+    }
+
+    /// Queues an event; returns whether it was dropped for want of room.
+    fn push(&self, event: Event<'_>) -> bool {
+        let dropped = self
+            .with(|state| state.events.push_or_hold(event))
+            .unwrap_or(false);
+        self.ready.signal(());
+        dropped
+    }
 }
 
 /// Why the driver did not start.
@@ -113,6 +206,8 @@ pub struct Stats {
     pub link_frames_sent: u32,
     /// Keep-alives written on the relay link.
     pub keepalives_sent: u32,
+    /// Datagrams dropped for a context whose events had no room.
+    pub datagrams_dropped: u32,
 }
 
 impl Stats {
@@ -121,24 +216,6 @@ impl Stats {
             Ok(()) => self.datagrams_sent += 1,
             Err(_) => self.datagrams_not_sent += 1,
         }
-    }
-}
-
-/// The application's policy, or everyone.
-struct Policy<'d>(Option<&'d mut dyn Admission>);
-
-impl Admission for Policy<'_> {
-    fn admit(&mut self, peer: &PeerId, context: &[u8]) -> Decision {
-        match self.0.as_deref_mut() {
-            Some(policy) => policy.admit(peer, context),
-            None => Decision::Accept { psk: None },
-        }
-    }
-
-    fn psk(&mut self, peer: &PeerId, context: &[u8]) -> Option<Psk> {
-        self.0
-            .as_deref_mut()
-            .and_then(|policy| policy.psk(peer, context))
     }
 }
 
@@ -152,19 +229,60 @@ impl SecureRng for &mut dyn SecureRng {
 #[cfg(feature = "stream")]
 type StreamConfig = convesso_stream::config::Mcu;
 
+/// The largest message of the `Mcu` stream configuration.
+#[cfg(feature = "stream")]
+const MAX_MESSAGE: usize = <StreamConfig as convesso_stream::config::StreamConfig>::MAX_MESSAGE;
+
+/// An open context, as the driver keeps it.
+struct Open<'d, M: RawMutex> {
+    slot: &'d ContextSlot<'d, M>,
+    policy: Option<&'d mut dyn Admission>,
+    #[cfg(feature = "stream")]
+    max_message: usize,
+}
+
+/// The open contexts, in a table of the storage profile's.
+type Contexts<'d, M, T> = <T as Tables>::Contexts<Name, Open<'d, M>>;
+
+/// The core's one admission: each context's question goes to its own
+/// policy; a context without one admits everyone (its access may still bind
+/// it to one peer, which the core checks first).
+struct Policies<'a, 'd, M: RawMutex, T: Tables>(&'a mut Contexts<'d, M, T>);
+
+impl<'d, M: RawMutex, T: Tables> Policies<'_, 'd, M, T> {
+    fn of(&mut self, context: &[u8]) -> Option<&mut (dyn Admission + 'd)> {
+        let context = Name::new(context).ok()?;
+        self.0
+            .get_mut(&context)
+            .and_then(|open| open.policy.as_deref_mut())
+    }
+}
+
+impl<M: RawMutex, T: Tables> Admission for Policies<'_, '_, M, T> {
+    fn admit(&mut self, peer: &PeerId, context: &[u8]) -> Decision {
+        match self.of(context) {
+            Some(policy) => policy.admit(peer, context),
+            None => Decision::Accept { psk: None },
+        }
+    }
+
+    fn psk(&mut self, peer: &PeerId, context: &[u8]) -> Option<Psk> {
+        self.of(context)
+            .and_then(|policy| policy.psk(peer, context))
+    }
+}
+
 /// What the core and its buffers are, behind one lock.
-struct Inner<'d, T: Tables> {
+struct Inner<'d, M: RawMutex, T: Tables> {
     endpoint: Endpoint<T>,
-    context: Context,
-    policy: Policy<'d>,
+    contexts: Contexts<'d, M, T>,
     entropy: Checked<&'d mut dyn SecureRng>,
     out: [u8; OUT_LEN],
-    events: EventQueue<'d>,
+    /// The node's own events.
+    events: EventQueue<'d, NODE_ENTRIES, NODE_HELD>,
     relay: Option<RelayLocation>,
     /// The source of the packet handled last, for `To::Source`.
     last_from: Option<SocketAddr>,
-    /// The application said the network changed; the runner reports the
-    /// interfaces again.
     /// Whether the runner owes the core its interfaces again: the network
     /// changed, or excluded prefixes were replaced.
     report_interfaces: bool,
@@ -176,26 +294,107 @@ struct Inner<'d, T: Tables> {
     frame: [u8; convesso_stream::frame::MAX_DATA_LEN],
 }
 
+/// Calls the core with the contexts' policies: `$call` is a method of the
+/// endpoint taking the admission, the entropy and the output buffer last.
+macro_rules! with_policies {
+    ($inner:expr, $method:ident($($arg:expr),* $(,)?)) => {{
+        let inner = &mut *$inner;
+        inner.endpoint.$method(
+            $($arg,)*
+            &mut Policies::<M, T>(&mut inner.contexts),
+            &mut inner.entropy,
+            &mut inner.out,
+        )
+    }};
+}
+
+impl<'d, M: RawMutex, T: Tables> Inner<'d, M, T> {
+    /// Hands an event to the node's queue or to its context's; a datagram
+    /// that finds no room is dropped and counted, and an event of a context
+    /// no longer open is dropped.
+    fn deliver(&mut self, node_ready: &Signal<M, ()>, context: Option<Name>, event: Event<'_>) {
+        match context {
+            None => {
+                self.events.push_or_hold(event);
+                node_ready.signal(());
+            }
+            Some(context) => {
+                if let Some(open) = self.contexts.get(&context)
+                    && open.slot.push(event)
+                {
+                    self.stats.datagrams_dropped += 1;
+                }
+            }
+        }
+    }
+
+    /// Tells the channels what the core's event means for them: a session
+    /// closed, or a dial failed.
+    #[cfg(feature = "stream")]
+    fn tell_channels(&mut self, context: Option<Name>, event: &Event<'_>) {
+        let Some(context) = context else {
+            return;
+        };
+        match *event {
+            Event::Context(ContextEvent::Closed { peer, code, .. }) => {
+                self.channels.session_closed(peer, context, code);
+            }
+            Event::Context(ContextEvent::ReopenFailed { peer, error }) => {
+                self.channels.reopen_failed(peer, context, error);
+            }
+            _ => {}
+        }
+    }
+
+    /// Closes `context`: its sessions with `code`, its channels; its events
+    /// end once read.
+    fn close_context(&mut self, context: Name, code: u16) {
+        let Some(open) = self.contexts.remove(&context) else {
+            return;
+        };
+        let _ = self.endpoint.close_context(context.as_bytes(), code);
+        #[cfg(feature = "stream")]
+        {
+            self.channels.context_closed(context, code);
+            open.slot.writable.signal(());
+        }
+        open.slot.with(|state| state.closed = true);
+        open.slot.ready.signal(());
+    }
+
+    /// The first context whose handle asked for it to be closed.
+    fn close_asked(&self) -> Option<(Name, u16)> {
+        let mut asked = None;
+        self.contexts.for_each(|context, open| {
+            if asked.is_none()
+                && let Some(code) = open.slot.with(|state| state.close).flatten()
+            {
+                asked = Some((*context, code));
+            }
+        });
+        asked
+    }
+}
+
 /// A framed packet for the relay link, from the application's side.
 struct LinkOut {
     bytes: [u8; MAX_FRAME + 2],
     len: usize,
 }
 
-/// The state the runner, the handle and the events share. Lives in a slot
+/// The state the runner, the handles and the events share. Lives in a slot
 /// the integrator gives (a `static` on a microcontroller).
 pub struct Shared<'d, M: RawMutex, T: Tables, D: Datagrams> {
-    inner: Mutex<M, Inner<'d, T>>,
+    inner: Mutex<M, Inner<'d, M, T>>,
     link_out: Mutex<M, LinkOut>,
     datagrams: &'d D,
-    /// The handle asks the runner to look again.
+    /// A handle asks the runner to look again.
     wake: Signal<M, ()>,
+    /// An event of the node's was queued.
     events_ready: Signal<M, ()>,
+    /// The application read an event: room, perhaps, for a message.
     events_room: Signal<M, ()>,
     link_room: Signal<M, ()>,
-    /// Room opened in a message channel's send buffer (feature `stream`).
-    #[cfg(feature = "stream")]
-    writable: Signal<M, ()>,
 }
 
 /// How a packet the core output goes.
@@ -229,31 +428,19 @@ fn now() -> Instant {
     Instant::from_millis(embassy_time::Instant::now().as_millis())
 }
 
-/// Tells the channels what the core's event means for them: a session closed,
-/// or a dial failed.
-#[cfg(feature = "stream")]
-fn tell_channels<T: Tables>(inner: &mut Inner<'_, T>, event: &NodeEvent<'_>) {
-    let context = inner.context;
-    match *event {
-        NodeEvent::Closed { peer, code, .. } => inner.channels.session_closed(peer, context, code),
-        NodeEvent::ReopenFailed { peer, error } => {
-            inner.channels.reopen_failed(peer, context, error);
-        }
-        _ => {}
-    }
-}
-
 /// Starts the driver for `identity`: the handle, the runner to spawn, and the
-/// events. Every buffer is the integrator's: `events` holds the datagrams
-/// waiting for the application, `slot` the shared state.
+/// node's events. It serves no context until the application opens one with
+/// [`Node::context`]. Every buffer is the integrator's: `events` holds the
+/// node's events (they carry no data, so it may be empty), `slot` the shared
+/// state.
 ///
 /// # Errors
 ///
 /// [`StartError::Rng`] before anything else, when the generator cannot be
-/// read; [`StartError::Core`] when the core refuses the context or the relay.
+/// read; [`StartError::Core`] when the core refuses the relay.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the integrator's parts: identity, sockets, generator, policy, buffers"
+    reason = "the integrator's parts: identity, sockets, generator, buffers"
 )]
 #[allow(
     clippy::type_complexity,
@@ -261,12 +448,11 @@ fn tell_channels<T: Tables>(inner: &mut Inner<'_, T>, event: &NodeEvent<'_>) {
 )]
 pub fn start<'d, M, T, D, L, I>(
     identity: Identity,
-    config: Config<'_>,
+    config: Config,
     datagrams: &'d D,
     link: L,
     interfaces: I,
     rng: &'d mut dyn SecureRng,
-    policy: Option<&'d mut dyn Admission>,
     events: &'d mut [u8],
     slot: &'d mut Option<Shared<'d, M, T, D>>,
 ) -> Result<
@@ -285,9 +471,7 @@ where
     I: Interfaces,
 {
     let entropy = Checked::new(rng).map_err(StartError::Rng)?;
-    let context = Context::new(config.context)
-        .map_err(|error| StartError::Core(ResponderError::ContextTooLong(error)))?;
-    let mut endpoint = Endpoint::<T>::new(identity, &[config.context]).map_err(StartError::Core)?;
+    let mut endpoint = Endpoint::<T>::new(identity, &[]).map_err(StartError::Core)?;
     if let Some(relay) = config.relay {
         endpoint
             .pin_relay(relay.address, now())
@@ -298,8 +482,7 @@ where
     let shared = &*slot.insert(Shared {
         inner: Mutex::new(Inner {
             endpoint,
-            context,
-            policy: Policy(policy),
+            contexts: Default::default(),
             entropy,
             out: [0; OUT_LEN],
             events: EventQueue::new(events),
@@ -308,11 +491,7 @@ where
             report_interfaces: false,
             stats: Stats::default(),
             #[cfg(feature = "stream")]
-            channels: if config.credit {
-                convesso_stream::Channels::with_credit()
-            } else {
-                convesso_stream::Channels::new()
-            },
+            channels: convesso_stream::Channels::new(),
             #[cfg(feature = "stream")]
             frame: [0; convesso_stream::frame::MAX_DATA_LEN],
         }),
@@ -325,8 +504,6 @@ where
         events_ready: Signal::new(),
         events_room: Signal::new(),
         link_room: Signal::new(),
-        #[cfg(feature = "stream")]
-        writable: Signal::new(),
     });
     Ok((
         Node { shared },
@@ -364,7 +541,7 @@ fn local_addresses<I: Interfaces>(interfaces: &I, port: u16) -> Locals {
     Locals(out, count)
 }
 
-/// The application's handle on the driver: cheap to copy.
+/// The application's handle on the node: cheap to copy.
 pub struct Node<'d, M: RawMutex, T: Tables, D: Datagrams> {
     shared: &'d Shared<'d, M, T, D>,
 }
@@ -383,90 +560,103 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         *self.shared.inner.lock().await.endpoint.identity().address()
     }
 
-    /// Sends `data` to the peer at `to`, opening a session if needed.
+    /// Opens the context `name` while the node runs: serves it under the
+    /// options' access, and returns its handle and its events. The context
+    /// lives as long as the handle: dropping it closes the context.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Send`] with the core's named error.
-    pub async fn send(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
-        self.send_target(Target::Address(to), data).await
-    }
-
-    /// Sends `data` to `peer`, which must have a session with keys.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeError::Send`] with the core's named error.
-    pub async fn send_to_peer(&self, peer: PeerId, data: &[u8]) -> Result<(), NodeError> {
-        self.send_target(Target::Peer(peer), data).await
-    }
-
-    async fn send_target(&self, target: Target<'_>, data: &[u8]) -> Result<(), NodeError> {
-        let mut link_out = self.link_out().await;
+    /// [`NodeError::Context`] with the core's error for a name already open,
+    /// the relay context, or one context more than the storage profile
+    /// holds; `NodeError::Message` (feature `stream`) for a largest message
+    /// over the configuration's. The context is then not open.
+    pub async fn context(
+        &self,
+        name: &[u8],
+        options: ContextOptions<'d, M>,
+    ) -> Result<(Context<'d, M, T, D>, ContextEvents<'d, M, T, D>), NodeError> {
+        let context = Name::new(name)
+            .map_err(|error| NodeError::Context(ResponderError::ContextTooLong(error)))?;
+        if name == convesso_core::relay::CONTEXT {
+            return Err(NodeError::Context(ResponderError::RelayContext));
+        }
+        let ContextOptions {
+            access,
+            events,
+            slot,
+            #[cfg(feature = "stream")]
+            credit,
+            #[cfg(feature = "stream")]
+            max_message,
+        } = options;
         let mut guard = self.shared.inner.lock().await;
         let inner = &mut *guard;
-        let output = inner
-            .endpoint
-            .send(
-                target,
-                inner.context.as_bytes(),
-                data,
-                DIRECT_PATH_MAX,
-                now(),
-                &mut inner.policy,
-                &mut inner.entropy,
-                &mut inner.out,
-            )
-            .map_err(NodeError::Send)?;
-        match output {
-            Output::Transmit { to, len } => {
-                let packet = inner.out.get(..len).unwrap_or_default();
-                match plan(inner.relay.as_ref(), inner.last_from, to) {
-                    Plan::Udp(at) => {
-                        inner
-                            .stats
-                            .count(self.shared.datagrams.send_to(packet, at).await);
-                    }
-                    Plan::UdpAndTcp(at) => {
-                        inner
-                            .stats
-                            .count(self.shared.datagrams.send_to(packet, at).await);
-                        link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
-                    }
-                    Plan::Tcp => {
-                        link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
-                    }
-                    Plan::KeepAlive | Plan::Nothing => {}
-                }
-            }
-            Output::Event(event) => {
-                if let Some(event) = from_core(event) {
-                    inner.events.push_or_hold(event);
-                    self.shared.events_ready.signal(());
-                }
-            }
-            Output::Nothing => {}
+        if inner.contexts.get(&context).is_some() {
+            return Err(NodeError::Context(ResponderError::AlreadyServed));
         }
+        #[cfg(feature = "stream")]
+        let largest = {
+            let largest = max_message.unwrap_or(MAX_MESSAGE);
+            if largest > MAX_MESSAGE {
+                return Err(NodeError::Message(convesso_stream::SendError::TooLarge {
+                    size: largest,
+                    max: MAX_MESSAGE,
+                }));
+            }
+            largest
+        };
+        let (core, policy) = match access {
+            Access::Everyone => (Some(handshake::Access::Policy), None),
+            Access::Admit(policy) => (Some(handshake::Access::Policy), Some(policy)),
+            Access::Bound(peer) => (Some(handshake::Access::Bound(peer)), None),
+            Access::DialOnly => (None, None),
+        };
+        let open = Open {
+            slot,
+            policy,
+            #[cfg(feature = "stream")]
+            max_message: largest,
+        };
+        if let Err(full) = inner.contexts.insert(context, open) {
+            return Err(NodeError::Context(ResponderError::TooManyContexts {
+                capacity: full.capacity,
+            }));
+        }
+        if let Some(core) = core
+            && let Err(error) = inner.endpoint.serve(name, core)
+        {
+            let _ = inner.contexts.remove(&context);
+            return Err(NodeError::Context(error));
+        }
+        #[cfg(feature = "stream")]
+        if let Err(error) = inner.channels.set_context(name, max_message, credit) {
+            let _ = inner.contexts.remove(&context);
+            let _ = inner.endpoint.close_context(name, DROPPED);
+            return Err(NodeError::Message(error));
+        }
+        slot.state.lock(|state| {
+            *state.borrow_mut() = Some(SlotState {
+                events: EventQueue::new(events),
+                close: None,
+                closed: false,
+            });
+        });
         drop(guard);
-        drop(link_out);
-        self.shared.wake.signal(());
-        Ok(())
+        Ok((
+            Context {
+                shared: self.shared,
+                name: context,
+                slot,
+            },
+            ContextEvents {
+                shared: self.shared,
+                slot,
+            },
+        ))
     }
 
-    /// The link's outgoing slot, once it is free.
-    async fn link_out(&self) -> MutexGuard<'d, M, LinkOut> {
-        loop {
-            let link_out = self.shared.link_out.lock().await;
-            if link_out.len == 0 {
-                return link_out;
-            }
-            drop(link_out);
-            self.shared.link_room.wait().await;
-        }
-    }
-
-    /// Gives the core a direct address for `peer`: the first attempt of a
-    /// dial goes there.
+    /// Gives the core a direct address for `peer`, in every context: the
+    /// first attempt of a dial goes there.
     ///
     /// # Errors
     ///
@@ -491,47 +681,20 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         self.shared.wake.signal(());
     }
 
-    /// Closes the session with `peer`, sending one authenticated close.
-    pub async fn close(&self, peer: PeerId, code: u16) {
-        let mut link_out = self.link_out().await;
-        let mut guard = self.shared.inner.lock().await;
-        let inner = &mut *guard;
-        let context = inner.context;
-        if let Output::Transmit { to, len } =
-            inner
-                .endpoint
-                .close(peer, context.as_bytes(), code, now(), &mut inner.out)
-        {
-            let packet = inner.out.get(..len).unwrap_or_default();
-            match plan(inner.relay.as_ref(), inner.last_from, to) {
-                Plan::Udp(at) | Plan::UdpAndTcp(at) => {
-                    inner
-                        .stats
-                        .count(self.shared.datagrams.send_to(packet, at).await);
-                }
-                Plan::Tcp => {
-                    link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
-                }
-                Plan::KeepAlive | Plan::Nothing => {}
-            }
-        }
-        // The core raises no event for a close of this side's: the channel is
-        // reset here, as the peer's is on the close (DESIGN.md §8).
-        #[cfg(feature = "stream")]
-        inner.channels.session_closed(peer, context, code);
-        drop(guard);
-        drop(link_out);
-        self.shared.wake.signal(());
-    }
-
-    /// Revokes `peer`: closes every session with it.
+    /// Revokes `peer`: closes every session with it, in every context.
     pub async fn close_peer(&self, peer: PeerId, code: u16) {
         let mut guard = self.shared.inner.lock().await;
         let inner = &mut *guard;
         inner.endpoint.close_peer(peer, code);
-        // As in `close`.
+        // The core raises no event for a close of this side's: the channels
+        // are reset here, as the peer's are on the close (DESIGN.md §8).
         #[cfg(feature = "stream")]
-        inner.channels.session_closed(peer, inner.context, code);
+        {
+            let channels = &mut inner.channels;
+            inner.contexts.for_each(|context, _| {
+                channels.session_closed(peer, *context, code);
+            });
+        }
         drop(guard);
         self.shared.wake.signal(());
     }
@@ -544,12 +707,6 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         inner.endpoint.network_changed(now());
         drop(inner);
         self.shared.wake.signal(());
-    }
-
-    /// The path to `peer`, and how it got there; `None` without a session.
-    pub async fn path(&self, peer: PeerId) -> Option<PathInfo> {
-        let inner = self.shared.inner.lock().await;
-        inner.endpoint.path_info(&peer, inner.context.as_bytes())
     }
 
     /// Excludes the IP prefix `ip/len` from direct paths: no address in it is
@@ -584,17 +741,6 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
         Ok(())
     }
 
-    /// The channel binding of the session with `peer`: the hash of the
-    /// handshake that opened it, the same at both ends and kept across key
-    /// renewals (`PROTOCOL.md §5`). `None` without a session with
-    /// keys.
-    pub async fn channel_binding(&self, peer: PeerId) -> Option<ChannelBinding> {
-        let inner = self.shared.inner.lock().await;
-        inner
-            .endpoint
-            .channel_binding(&peer, inner.context.as_bytes())
-    }
-
     /// This node's candidates as peers are told them, written into `out`;
     /// returns how many.
     pub async fn candidates(&self, out: &mut [Candidate]) -> usize {
@@ -616,13 +762,247 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
             .relay_udp_proven(now())
     }
 
+    /// What the sockets carried, and what was dropped.
+    pub async fn stats(&self) -> Stats {
+        self.shared.inner.lock().await.stats
+    }
+}
+
+/// The node's own events, in order.
+pub struct Events<'d, M: RawMutex, T: Tables, D: Datagrams> {
+    shared: &'d Shared<'d, M, T, D>,
+}
+
+impl<M: RawMutex, T: Tables, D: Datagrams> Events<'_, M, T, D> {
+    /// The next event.
+    pub async fn next(&mut self) -> NodeEvent {
+        loop {
+            let popped = self.shared.inner.lock().await.events.pop(&mut []);
+            if let Some(Event::Node(event)) = popped {
+                return event;
+            }
+            self.shared.events_ready.wait().await;
+        }
+    }
+}
+
+/// A handle on one context of the node: every operation acts in it, and its
+/// [`ContextEvents`] carry its events alone. Dropping it closes the context,
+/// as [`Self::close_context`] does with [`DROPPED`].
+pub struct Context<'d, M: RawMutex, T: Tables, D: Datagrams> {
+    shared: &'d Shared<'d, M, T, D>,
+    name: Name,
+    slot: &'d ContextSlot<'d, M>,
+}
+
+impl<M: RawMutex, T: Tables, D: Datagrams> Drop for Context<'_, M, T, D> {
+    fn drop(&mut self) {
+        self.slot.with(|state| {
+            if !state.closed {
+                state.close.get_or_insert(DROPPED);
+            }
+        });
+        self.shared.wake.signal(());
+    }
+}
+
+impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
+    /// The context's name.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+
+    /// Closes the context: its sessions closed with `code`, its dials and
+    /// pending handshakes discarded, its slot freed.
+    pub fn close_context(self, code: u16) {
+        self.slot.with(|state| state.close = Some(code));
+    }
+
+    /// The lock on the core, while the context is open.
+    async fn open(&self) -> Result<MutexGuard<'d, M, Inner<'d, M, T>>, NodeError> {
+        let guard = self.shared.inner.lock().await;
+        if guard.contexts.get(&self.name).is_none() {
+            return Err(NodeError::ContextClosed);
+        }
+        Ok(guard)
+    }
+
+    /// Changes who may reach this node in the context. The sessions this side
+    /// accepted that the new access would not admit are closed: with a
+    /// policy's refusal code when it is a policy that refuses, with `code`
+    /// otherwise; and so are the pending handshakes. Sessions this side
+    /// dialled go on.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Context`] with the core's error when a dial-only context
+    /// cannot be served, or [`NodeError::ContextClosed`].
+    pub async fn set_access(&self, access: Access<'d>, code: u16) -> Result<(), NodeError> {
+        let mut guard = self.open().await?;
+        let inner = &mut *guard;
+        let (core, policy) = match access {
+            Access::Everyone => (Some(handshake::Access::Policy), None),
+            Access::Admit(policy) => (Some(handshake::Access::Policy), Some(policy)),
+            Access::Bound(peer) => (Some(handshake::Access::Bound(peer)), None),
+            Access::DialOnly => (None, None),
+        };
+        let previous = inner
+            .contexts
+            .get_mut(&self.name)
+            .and_then(|open| core::mem::replace(&mut open.policy, policy));
+        let result = inner
+            .endpoint
+            .set_access(
+                self.name.as_bytes(),
+                core,
+                code,
+                &mut Policies::<M, T>(&mut inner.contexts),
+            )
+            .map_err(NodeError::Context);
+        if result.is_err()
+            && let Some(open) = inner.contexts.get_mut(&self.name)
+        {
+            // Refused: the context keeps the access it had.
+            open.policy = previous;
+        }
+        drop(guard);
+        self.shared.wake.signal(());
+        result
+    }
+
+    /// Sends `data` to the peer at `to`, opening a session if needed.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Send`] with the core's named error, or
+    /// [`NodeError::ContextClosed`].
+    pub async fn send(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
+        self.send_target(Target::Address(to), data).await
+    }
+
+    /// Sends `data` to `peer`, which must have a session with keys.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`].
+    pub async fn send_to_peer(&self, peer: PeerId, data: &[u8]) -> Result<(), NodeError> {
+        self.send_target(Target::Peer(peer), data).await
+    }
+
+    async fn send_target(&self, target: Target<'_>, data: &[u8]) -> Result<(), NodeError> {
+        let mut link_out = self.link_out().await;
+        let mut guard = self.open().await?;
+        let inner = &mut *guard;
+        let output = with_policies!(
+            inner,
+            send(target, self.name.as_bytes(), data, DIRECT_PATH_MAX, now())
+        )
+        .map_err(NodeError::Send)?;
+        match output {
+            Output::Transmit { to, len } => {
+                let packet = inner.out.get(..len).unwrap_or_default();
+                match plan(inner.relay.as_ref(), inner.last_from, to) {
+                    Plan::Udp(at) => {
+                        inner
+                            .stats
+                            .count(self.shared.datagrams.send_to(packet, at).await);
+                    }
+                    Plan::UdpAndTcp(at) => {
+                        inner
+                            .stats
+                            .count(self.shared.datagrams.send_to(packet, at).await);
+                        link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
+                    }
+                    Plan::Tcp => {
+                        link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
+                    }
+                    Plan::KeepAlive | Plan::Nothing => {}
+                }
+            }
+            Output::Event(event) => {
+                if let Some((context, event)) = from_core(event) {
+                    inner.deliver(&self.shared.events_ready, context, event);
+                }
+            }
+            Output::Nothing => {}
+        }
+        drop(guard);
+        drop(link_out);
+        self.shared.wake.signal(());
+        Ok(())
+    }
+
+    /// The link's outgoing slot, once it is free.
+    async fn link_out(&self) -> MutexGuard<'d, M, LinkOut> {
+        loop {
+            let link_out = self.shared.link_out.lock().await;
+            if link_out.len == 0 {
+                return link_out;
+            }
+            drop(link_out);
+            self.shared.link_room.wait().await;
+        }
+    }
+
+    /// Closes the session with `peer`, sending one authenticated close.
+    pub async fn close(&self, peer: PeerId, code: u16) {
+        let mut link_out = self.link_out().await;
+        let Ok(mut guard) = self.open().await else {
+            return;
+        };
+        let inner = &mut *guard;
+        if let Output::Transmit { to, len } =
+            inner
+                .endpoint
+                .close(peer, self.name.as_bytes(), code, now(), &mut inner.out)
+        {
+            let packet = inner.out.get(..len).unwrap_or_default();
+            match plan(inner.relay.as_ref(), inner.last_from, to) {
+                Plan::Udp(at) | Plan::UdpAndTcp(at) => {
+                    inner
+                        .stats
+                        .count(self.shared.datagrams.send_to(packet, at).await);
+                }
+                Plan::Tcp => {
+                    link_out.len = framing::frame(packet, &mut link_out.bytes).unwrap_or(0);
+                }
+                Plan::KeepAlive | Plan::Nothing => {}
+            }
+        }
+        // The core raises no event for a close of this side's: the channel is
+        // reset here, as the peer's is on the close (DESIGN.md §8).
+        #[cfg(feature = "stream")]
+        inner.channels.session_closed(peer, self.name, code);
+        drop(guard);
+        drop(link_out);
+        self.shared.wake.signal(());
+    }
+
+    /// The path to `peer`, and how it got there; `None` without a session.
+    pub async fn path(&self, peer: PeerId) -> Option<PathInfo> {
+        let inner = self.shared.inner.lock().await;
+        inner.endpoint.path_info(&peer, self.name.as_bytes())
+    }
+
+    /// The channel binding of the session with `peer`: the hash of the
+    /// handshake that opened it, the same at both ends and kept across key
+    /// renewals (`PROTOCOL.md §5`). `None` without a session with
+    /// keys.
+    pub async fn channel_binding(&self, peer: PeerId) -> Option<ChannelBinding> {
+        let inner = self.shared.inner.lock().await;
+        inner.endpoint.channel_binding(&peer, self.name.as_bytes())
+    }
+
     /// Sends a reliable message to the peer at `to` (feature `stream`): it
     /// arrives whole, once and in order, or the channel is reset. Waits while
     /// the channel's send buffer is full.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Message`] for a message that can never be sent.
+    /// [`NodeError::Message`] for a message that can never be sent, larger
+    /// than the context's largest message included; or
+    /// [`NodeError::ContextClosed`].
     #[cfg(feature = "stream")]
     pub async fn send_message(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
         self.offer(to.peer_id(), Some(to), data).await
@@ -640,23 +1020,22 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
     }
 
     /// Lets `peer`'s channel hand out `bytes` more of its messages (feature
-    /// `stream`, with [`Config::credit`]): each message spends its length
-    /// plus [`convesso_stream::ELEMENT_COST`]. A channel starts with none,
-    /// and returns to none at its reset and at the session's close, so the
-    /// application grants again after those events. Nothing with credit off.
+    /// `stream`, with [`ContextOptions::credit`]): each message spends its
+    /// length plus [`convesso_stream::ELEMENT_COST`]. A channel starts with
+    /// none, and returns to none at its reset and at the session's close, so
+    /// the application grants again after those events. Nothing with credit
+    /// off.
     ///
     /// # Errors
     ///
     /// [`NodeError::Message`] with the table-full error when no channel slot
-    /// is free.
+    /// is free, or [`NodeError::ContextClosed`].
     #[cfg(feature = "stream")]
     pub async fn grant(&self, peer: PeerId, bytes: usize) -> Result<(), NodeError> {
-        let mut guard = self.shared.inner.lock().await;
-        let inner = &mut *guard;
-        let context = inner.context;
-        let result = inner
+        let mut guard = self.open().await?;
+        let result = guard
             .channels
-            .grant(peer, context.as_bytes(), bytes)
+            .grant(peer, self.name.as_bytes(), bytes)
             .map_err(NodeError::Message);
         drop(guard);
         // A message held for want of credit may go now.
@@ -673,13 +1052,12 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
     ) -> Result<(), NodeError> {
         loop {
             {
-                let mut guard = self.shared.inner.lock().await;
+                let mut guard = self.open().await?;
                 let inner = &mut *guard;
-                let context = inner.context;
                 match inner.channels.send_message(
                     peer,
                     address,
-                    context.as_bytes(),
+                    self.name.as_bytes(),
                     data,
                     now(),
                     &mut inner.entropy,
@@ -692,38 +1070,46 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
                     Err(error) => return Err(NodeError::Message(error)),
                 }
             }
-            self.shared.writable.wait().await;
+            self.slot.writable.wait().await;
         }
     }
-
-    /// What the sockets did not carry.
-    pub async fn stats(&self) -> Stats {
-        self.shared.inner.lock().await.stats
-    }
 }
 
-/// The application's events, in order.
-pub struct Events<'d, M: RawMutex, T: Tables, D: Datagrams> {
+/// A context's events, in order.
+pub struct ContextEvents<'d, M: RawMutex, T: Tables, D: Datagrams> {
     shared: &'d Shared<'d, M, T, D>,
+    slot: &'d ContextSlot<'d, M>,
 }
 
-impl<M: RawMutex, T: Tables, D: Datagrams> Events<'_, M, T, D> {
-    /// The next event. A datagram's data is copied into `buf`, cut to its
-    /// length: give a buffer as large as the largest datagram expected.
-    #[allow(
-        clippy::expect_used,
-        reason = "only this handle takes events, and it saw one waiting"
-    )]
-    pub async fn next<'b>(&mut self, buf: &'b mut [u8]) -> NodeEvent<'b> {
+impl<M: RawMutex, T: Tables, D: Datagrams> ContextEvents<'_, M, T, D> {
+    /// The next event, or `None` once the context is closed and every event
+    /// before the close was read. A datagram's or a message's data is copied
+    /// into `buf`, cut to its length: give a buffer as large as the largest
+    /// expected.
+    pub async fn next<'b>(&mut self, buf: &'b mut [u8]) -> Option<ContextEvent<'b>> {
         loop {
-            if !self.shared.inner.lock().await.events.is_empty() {
+            // Waiting: nothing queued and the context open.
+            let waiting = self
+                .slot
+                .with(|state| state.events.is_empty() && !state.closed)
+                .unwrap_or(false);
+            if !waiting {
                 break;
             }
-            self.shared.events_ready.wait().await;
+            self.slot.ready.wait().await;
         }
-        let event = self.shared.inner.lock().await.events.pop(buf);
+        let popped = self
+            .slot
+            .state
+            .lock(|state| match state.borrow_mut().as_mut() {
+                Some(state) => state.events.pop(buf),
+                None => None,
+            });
         self.shared.events_room.signal(());
-        event.expect("an event was waiting")
+        match popped {
+            Some(Event::Context(event)) => Some(event),
+            _ => None,
+        }
     }
 }
 
@@ -763,6 +1149,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
     /// Runs the driver. Never returns.
     pub async fn run(mut self) -> ! {
         loop {
+            self.close_asked().await;
             self.flush_link_out().await;
             self.deframe().await;
             self.report_network().await;
@@ -781,9 +1168,17 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         }
     }
 
-    /// Waits for the next thing to do.
+    /// Closes the contexts whose handles asked for it.
+    async fn close_asked(&mut self) {
+        let mut inner = self.shared.inner.lock().await;
+        while let Some((context, code)) = inner.close_asked() {
+            inner.close_context(context, code);
+        }
+    }
+
+    /// Waits for the next thing to do. The socket and the link are read
+    /// whatever the application reads.
     async fn wait(&mut self, deadline: Option<Instant>) -> Woken {
-        let room = self.shared.inner.lock().await.events.readable(OUT_LEN);
         let link_idle = self.link_pending.0 >= self.link_pending.1;
         let relay = self.shared.inner.lock().await.relay;
         let Self {
@@ -795,19 +1190,13 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             ..
         } = self;
         let datagrams = shared.datagrams;
-        let recv = async {
-            if room {
-                datagrams.recv_from(rx).await
-            } else {
-                core::future::pending().await
-            }
-        };
+        let recv = datagrams.recv_from(rx);
         let link_op = async {
             match (*link_state, relay) {
                 (LinkState::Connecting, Some(relay)) => {
                     Woken::Connected(link.connect(relay.primary).await)
                 }
-                (LinkState::Open, _) if room && link_idle => match link.read(link_rx).await {
+                (LinkState::Open, _) if link_idle => match link.read(link_rx).await {
                     Ok(0) | Err(_) => Woken::LinkFailed,
                     Ok(len) => Woken::LinkRead(len),
                 },
@@ -820,18 +1209,12 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                 None => core::future::pending().await,
             }
         };
-        let signal = async {
-            if room {
-                shared.wake.wait().await;
-            } else {
-                select(shared.wake.wait(), shared.events_room.wait()).await;
-            }
-        };
+        let signal = select(shared.wake.wait(), shared.events_room.wait());
         match select4(recv, link_op, timer, signal).await {
             Either4::First(result) => Woken::Datagram(result),
             Either4::Second(woken) => woken,
             Either4::Third(()) => Woken::Deadline,
-            Either4::Fourth(()) => Woken::Signal,
+            Either4::Fourth(_) => Woken::Signal,
         }
     }
 
@@ -846,23 +1229,16 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             .is_some_and(|relay| relay.primary == from || relay.other == Some(from));
         let packet = self.rx.get_mut(..len).unwrap_or_default();
         let output = if is_relay {
-            inner.endpoint.handle_relay_packet(
-                packet,
-                Link::Udp,
-                now(),
-                &mut inner.policy,
-                &mut inner.entropy,
-                &mut inner.out,
-            )
+            with_policies!(inner, handle_relay_packet(packet, Link::Udp, now()))
         } else {
             let (source, source_len) = encode_ip(from);
-            inner.endpoint.handle_packet(
-                packet,
-                Source::Direct(source.get(..source_len).unwrap_or_default()),
-                now(),
-                &mut inner.policy,
-                &mut inner.entropy,
-                &mut inner.out,
+            with_policies!(
+                inner,
+                handle_packet(
+                    packet,
+                    Source::Direct(source.get(..source_len).unwrap_or_default()),
+                    now()
+                )
             )
         };
         Self::execute(
@@ -880,7 +1256,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         shared: &'d Shared<'d, M, T, D>,
         link: &mut L,
         link_state: &mut LinkState,
-        inner: &mut Inner<'d, T>,
+        inner: &mut Inner<'d, M, T>,
         output: Output<'_>,
     ) {
         match output {
@@ -901,17 +1277,18 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     .channels
                     .handle_frame(peer, context, kind, data, now());
                 if connected {
-                    inner.events.push_or_hold(NodeEvent::Connected { peer });
-                    shared.events_ready.signal(());
+                    inner.deliver(
+                        &shared.events_ready,
+                        Some(context),
+                        Event::Context(ContextEvent::Connected { peer }),
+                    );
                 }
             }
             Output::Event(event) => {
-                if let Some(event) = from_core(event) {
+                if let Some((context, event)) = from_core(event) {
                     #[cfg(feature = "stream")]
-                    tell_channels(inner, &event);
-                    // Room for a packet's events was checked before reading.
-                    inner.events.push_or_hold(event);
-                    shared.events_ready.signal(());
+                    inner.tell_channels(context, &event);
+                    inner.deliver(&shared.events_ready, context, event);
                 }
             }
             Output::Nothing => {}
@@ -923,7 +1300,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         shared: &'d Shared<'d, M, T, D>,
         link: &mut L,
         link_state: &mut LinkState,
-        inner: &mut Inner<'d, T>,
+        inner: &mut Inner<'d, M, T>,
         plan: Plan,
         len: usize,
     ) {
@@ -977,8 +1354,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
     }
 
     /// Calls the channels until they have nothing due: each frame and each
-    /// dial to the core, each event to the queue. Returns their deadline, and
-    /// whether they did anything.
+    /// dial to the core, each event to its context. Returns their deadline,
+    /// and whether they did anything.
     #[cfg(feature = "stream")]
     async fn drain_stream(&mut self) -> (Option<Instant>, bool) {
         use convesso_stream::{Event as StreamEvent, Poll as StreamPoll};
@@ -986,12 +1363,18 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         loop {
             let mut guard = self.shared.inner.lock().await;
             let inner = &mut *guard;
-            // A message is handed out only with room for it: otherwise the
-            // channel keeps it, and its window closes.
-            let deliver = inner
-                .events
-                .deliverable(<StreamConfig as convesso_stream::config::StreamConfig>::MAX_MESSAGE);
-            let output = match inner.channels.poll(now(), deliver, &mut inner.frame) {
+            // A context's message is handed out only with room for it in its
+            // queue: otherwise its channel keeps it, and its window closes;
+            // the other contexts go on.
+            let contexts = &inner.contexts;
+            let deliver = |context: &Name| {
+                contexts.get(context).is_some_and(|open| {
+                    open.slot
+                        .with(|state| state.events.deliverable(open.max_message))
+                        .unwrap_or(false)
+                })
+            };
+            let output = match inner.channels.poll_with(now(), deliver, &mut inner.frame) {
                 StreamPoll::SendFrame {
                     peer,
                     context,
@@ -1005,7 +1388,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                         kind,
                         frame,
                         now(),
-                        &mut inner.policy,
+                        &mut Policies::<M, T>(&mut inner.contexts),
                         &mut inner.entropy,
                         &mut inner.out,
                     ) {
@@ -1022,27 +1405,37 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                         &address,
                         context.as_bytes(),
                         now(),
-                        &mut inner.policy,
+                        &mut Policies::<M, T>(&mut inner.contexts),
                         &mut inner.entropy,
                         &mut inner.out,
                     )
                     .ok(),
-                StreamPoll::Event(StreamEvent::Message { peer, data, .. }) => {
-                    inner.events.push(NodeEvent::Message { peer, data });
-                    self.shared.events_ready.signal(());
+                StreamPoll::Event(StreamEvent::Message {
+                    peer,
+                    context,
+                    data,
+                }) => {
+                    if let Some(open) = inner.contexts.get(&context) {
+                        open.slot
+                            .push(Event::Context(ContextEvent::Message { peer, data }));
+                    }
                     None
                 }
-                StreamPoll::Event(StreamEvent::Reset { peer, reason, .. }) => {
-                    inner
-                        .events
-                        .push_or_hold(NodeEvent::ChannelReset { peer, reason });
-                    drop(guard);
-                    self.shared.events_ready.signal(());
-                    worked = true;
-                    continue;
+                StreamPoll::Event(StreamEvent::Reset {
+                    peer,
+                    context,
+                    reason,
+                }) => {
+                    if let Some(open) = inner.contexts.get(&context) {
+                        open.slot
+                            .push(Event::Context(ContextEvent::ChannelReset { peer, reason }));
+                    }
+                    None
                 }
-                StreamPoll::Event(StreamEvent::Writable { .. }) => {
-                    self.shared.writable.signal(());
+                StreamPoll::Event(StreamEvent::Writable { context, .. }) => {
+                    if let Some(open) = inner.contexts.get(&context) {
+                        open.slot.writable.signal(());
+                    }
                     None
                 }
                 StreamPoll::Wait(at) => return (Some(at), worked),
@@ -1069,10 +1462,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         loop {
             let mut guard = self.shared.inner.lock().await;
             let inner = &mut *guard;
-            let poll =
-                inner
-                    .endpoint
-                    .poll(now(), &mut inner.policy, &mut inner.entropy, &mut inner.out);
+            let poll = with_policies!(inner, poll(now()));
             match poll {
                 Poll::Transmit { to, len } => {
                     let plan = plan(inner.relay.as_ref(), inner.last_from, to);
@@ -1087,12 +1477,10 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     .await;
                 }
                 Poll::Event(event) => {
-                    if let Some(event) = from_core(event) {
+                    if let Some((context, event)) = from_core(event) {
                         #[cfg(feature = "stream")]
-                        tell_channels(inner, &event);
-                        inner.events.push_or_hold(event);
-                        drop(guard);
-                        self.shared.events_ready.signal(());
+                        inner.tell_channels(context, &event);
+                        inner.deliver(&self.shared.events_ready, context, event);
                     }
                 }
                 Poll::OpenRelayLink => self.link_state = LinkState::Connecting,
@@ -1136,13 +1524,9 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             .relay_link_closed(now());
     }
 
-    /// Gives the core the link's packets read so far, while their events fit;
-    /// the rest waits in the read buffer until the application reads.
+    /// Gives the core the link's packets read so far.
     async fn deframe(&mut self) {
         while self.link_pending.0 < self.link_pending.1 {
-            if !self.shared.inner.lock().await.events.readable(OUT_LEN) {
-                break;
-            }
             let (start, end) = self.link_pending;
             let (used, result) = self
                 .deframer
@@ -1169,14 +1553,9 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     }
                     let mut guard = self.shared.inner.lock().await;
                     let inner = &mut *guard;
-                    let output = inner.endpoint.handle_relay_packet(
-                        self.rx.get_mut(..len).unwrap_or_default(),
-                        Link::Tcp,
-                        now(),
-                        &mut inner.policy,
-                        &mut inner.entropy,
-                        &mut inner.out,
-                    );
+                    let packet = self.rx.get_mut(..len).unwrap_or_default();
+                    let output =
+                        with_policies!(inner, handle_relay_packet(packet, Link::Tcp, now()));
                     Self::execute(
                         self.shared,
                         &mut self.link,

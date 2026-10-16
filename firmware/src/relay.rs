@@ -129,8 +129,8 @@ fn run() -> Option<()> {
     let (client_identity, client_address) = identity(CLIENT_SCALAR, CLIENT_ADDRESS)?;
     let (peer_identity, peer_address) = identity(PEER_SCALAR, PEER_ADDRESS)?;
     let now = Instant::from_millis(black_box(0));
-    let mut relay_ep = Endpoint::<Mcu>::new(relay_identity, &[relay::CONTEXT]).ok()?;
-    relay_ep.accept_payload(relay::CONTEXT).ok()?;
+    let mut relay_ep = Endpoint::<Mcu>::new(relay_identity, &[]).ok()?;
+    relay_ep.serve_relay_context().ok()?;
     let mut client = Endpoint::<Mcu>::new(client_identity, &[b"session"]).ok()?;
     client.pin_relay(relay_address, now).ok()?;
     let mut peer = Endpoint::<Mcu>::new(peer_identity, &[b"session"]).ok()?;
