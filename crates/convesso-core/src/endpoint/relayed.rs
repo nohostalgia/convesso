@@ -219,6 +219,9 @@ pub(crate) struct RelayClient {
     ask: Option<(Instant, usize)>,
     /// The question over the other family is owed now, after the first.
     ask_other_now: bool,
+    /// The network changed: once the relay registers this endpoint again,
+    /// each live session sends its peer one packet, on the new link.
+    tell_peers: bool,
 }
 
 impl RelayClient {
@@ -244,6 +247,7 @@ impl RelayClient {
             reported_v6: false,
             ask: None,
             ask_other_now: false,
+            tell_peers: false,
         }
     }
 
@@ -256,6 +260,7 @@ impl RelayClient {
         *self = Self {
             reachable: self.reachable,
             keepalive: self.keepalive,
+            tell_peers: self.tell_peers,
             close_due: link_up,
             link: if self.reachable {
                 LinkState::Waiting(Some(now))
@@ -859,13 +864,16 @@ impl<C: Config> Endpoint<C> {
         // and an attempt finds a direct path again. Without one, that source
         // is still the best guess. The relay's own session is left alone.
         //
-        // And each session with live keys sends one packet at once, its new
-        // list if one is owed, else a keep-alive: through the relay, the
-        // newest the peer has, it tells the peer to stop sending where this
-        // endpoint was (`PROTOCOL.md §7`), even when the application here has
-        // nothing to send. One packet a session for each change of network;
-        // nothing at rest, and a dormant session is not woken.
+        // And each session with live keys sends one packet, its new list if
+        // one is owed, else a keep-alive: through the relay, the newest the
+        // peer has, it tells the peer to stop sending where this endpoint was
+        // (`PROTOCOL.md §7`), even when the application here has nothing to
+        // send. An endpoint that keeps a link sends it once the relay has it
+        // again, on the new link (`tell_peers`); one without a link, at once,
+        // over UDP, the only path it has. One packet a session for each change
+        // of network; nothing at rest, and a dormant session is not woken.
         let relay_key = self.relay.as_ref().map(RelayClient::key);
+        let wait_for_link = self.relay.as_ref().is_some_and(|relay| relay.reachable);
         self.sessions.retain(|key, session| {
             if let Some(direct) = session.paths.direct.as_mut() {
                 direct.fresh_until = direct.fresh_until.min(now);
@@ -877,12 +885,23 @@ impl<C: Config> Endpoint<C> {
                 {
                     session.last_source = None;
                 }
-                if session.current.as_ref().is_some_and(|pair| pair.live(now)) {
+                if !wait_for_link && session.current.as_ref().is_some_and(|pair| pair.live(now)) {
                     session.confirm = true;
                 }
             }
             true
         });
+        if let Some(relay) = self.relay.as_mut() {
+            // UDP to the relay was proven from the old network: from the new
+            // one it may not work yet. Until it is proven again, the link
+            // carries what is for the relay (`PROTOCOL.md §6`), and the first
+            // packet after the change also goes over UDP, without waiting for
+            // the 10 s of the copies: where UDP works, the relay learns the new
+            // address at once, and does not depend on the link alone.
+            relay.udp_proven = None;
+            relay.last_probe = None;
+            relay.tell_peers |= wait_for_link;
+        }
         let Some(relay) = self.relay.as_mut().filter(|relay| relay.reachable) else {
             return;
         };
@@ -1786,10 +1805,24 @@ impl<C: Config> Endpoint<C> {
                     .flatten()?;
                 self.note_sent(to, now);
                 // Registered: peers reach this endpoint through the relay.
+                let mut tell = false;
                 if let Some(relay) = self.relay.as_mut() {
                     relay.registered = true;
                     relay.failures = 0;
                     relay.pending = Some(Ok(()));
+                    tell = core::mem::take(&mut relay.tell_peers);
+                }
+                // After a change of network, each live session tells its peer
+                // now, on the new link, behind the register.
+                if tell {
+                    self.sessions.retain(|session_key, session| {
+                        if *session_key != key
+                            && session.current.as_ref().is_some_and(|pair| pair.live(now))
+                        {
+                            session.confirm = true;
+                        }
+                        true
+                    });
                 }
                 return Some(Poll::Transmit { to, len });
             }

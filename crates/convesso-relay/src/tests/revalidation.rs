@@ -249,3 +249,90 @@ fn a_silent_peer_that_moved_is_found() {
     }
     assert_eq!(world.clients[1].datagrams().len(), before + 20);
 }
+
+/// B changes network: its NAT maps it anew, and the world's delay makes its
+/// relay session and link take a few hundred milliseconds to come back.
+fn change_network(world: &mut World<Open>, i: usize, udp_lost: bool) {
+    world.delay = 100;
+    for nat in &mut world.clients[i].nats {
+        *nat = Nat::new(Mapping::Dependent, Filtering::AddressAndPort);
+    }
+    world.clients[i].udp_blocked = udp_lost;
+    let now = world.instant();
+    world.clients[i].endpoint.network_changed(now);
+}
+
+/// Scenario: the packet that tells the peer waits for the new link. B, with
+/// a link and a direct session, changes network, and none of its UDP gets
+/// through, to the relay or to A. Its packet goes on the new link once the
+/// relay has it again, so A's datagrams take the relay and arrive.
+#[test]
+fn the_packet_that_tells_the_peer_waits_for_the_new_link() {
+    let mut world = direct_pair();
+    change_network(&mut world, 1, true);
+    world.run_for(2000);
+    assert!(
+        world.when(1, &Ev::RelayAvailable).is_some(),
+        "B registered again"
+    );
+    let before = world.clients[1].datagrams().len();
+    for i in 0..10u8 {
+        world.send(0, 1, &[i]).unwrap();
+        world.run_for(100);
+    }
+    world.run_for(500);
+    let got = &world.clients[1].datagrams()[before..];
+    assert_eq!(got.len(), 10, "every datagram after the change: {got:?}");
+    assert!(got.iter().all(|(_, relayed)| *relayed));
+}
+
+/// Scenario: a client without a link tells its peer at once. A keeps no link
+/// to the relay; it changes network, its UDP working, and its packet goes
+/// over UDP at once: B's datagrams take the relay and arrive.
+#[test]
+fn a_client_without_a_link_tells_its_peer_at_once() {
+    let mut world = direct_pair();
+    // A's data on the direct path: B's path is one A uses.
+    world.send(0, 1, b"direct").unwrap();
+    world.run_for(300);
+    assert_eq!(last_datagram(&world, 1), (b"direct".to_vec(), false));
+    change_network(&mut world, 0, false);
+    world.run_for(500);
+    let before = world.clients[0].datagrams().len();
+    for i in 0..10u8 {
+        world.send(1, 0, &[i]).unwrap();
+        world.run_for(100);
+    }
+    world.run_for(500);
+    assert_eq!(world.clients[0].datagrams().len(), before + 10);
+}
+
+/// Scenario: a change of network ends the proof of UDP: what B proved to the
+/// relay from its old network no longer counts, and its first packet for the
+/// relay after the change goes over both.
+#[test]
+fn a_change_of_network_ends_the_proof_of_udp() {
+    let mut world = direct_pair();
+    world.send_through_relay(1, 0, b"over UDP to the relay");
+    world.run_for(500);
+    let now = world.instant();
+    assert!(world.clients[1].endpoint.relay_udp_proven(now));
+    let before = world.clients[1].sent;
+    world.clients[1].endpoint.network_changed(now);
+    assert!(!world.clients[1].endpoint.relay_udp_proven(now));
+    // Once the relay has B again, B's first packet for it, the one that tells
+    // A, goes over the link and over UDP at once, whenever the last UDP copy
+    // went; the relay's answer over UDP proves UDP again.
+    world.run_for(1000);
+    let after = world.clients[1].sent;
+    assert!(
+        after.tcp > before.tcp,
+        "over the link: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.udp > before.udp,
+        "and over UDP: {before:?} -> {after:?}"
+    );
+    let now = world.instant();
+    assert!(world.clients[1].endpoint.relay_udp_proven(now));
+}
