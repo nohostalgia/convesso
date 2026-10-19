@@ -191,7 +191,9 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
   address, the path is checked the same way at once. A phone leaving Wi-Fi is then reached
   through the relay within about a second. A side whose own network changed stops trusting the
   addresses it heard its peers at, takes the relay until it hears them again, and sends each live
-  session one packet there at once, so that a peer is told even by a device that only receives.
+  session one packet there, so that a peer is told even by a device that only receives. That packet
+  waits for the relay to have the device again: sent while the link is being replaced, it would go
+  over a UDP that the new network may not carry yet.
 - **No port prediction.** When a NAT gives a different port to each destination, the session stays
   on the relay rather than trying to guess ports.
 - **An application can exclude address ranges,** such as those of its own tunnels, so that a path

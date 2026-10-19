@@ -278,7 +278,8 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
 - **UDP for traffic, TCP for reachability.** UDP counts as *proven* for 15 seconds after an
   authenticated packet arrived over it. Each side uses UDP while it is proven, and the TCP link
   otherwise. A client on TCP also sends one packet every 10 seconds over UDP, to find out when UDP
-  works again.
+  works again. A client whose network changes no longer counts UDP as proven, and its first packet
+  for the relay after the change goes over UDP as well as over the link.
 - **A wake in one datagram.** With no keys for the relay, a client sends a first contact whose
   payload is the forward. The relay does the same towards a resting client with a TCP link, whose
   address the client registered.
@@ -343,11 +344,12 @@ start together, so their probes cross and open both NATs. A probe is answered wi
   - when the peer's newest packet, under the current keys, arrives through the relay after its
     packets had come on the path: the peer is elsewhere, or no longer reaches this side directly.
     A late or replayed packet does not count, nor does one before the peer has used the path.
-- **A change of network is told at once.** After this endpoint's network changes, with a relay
-  pinned, each session with live keys sends its peer one packet through the relay: its new list
-  if one is owed, else a keep-alive. Arriving newest through the relay, it ends the peer's direct
-  path to where this endpoint was, even when the application here has nothing to send. A dormant
-  session sends nothing.
+- **A change of network is told.** After this endpoint's network changes, with a relay pinned,
+  each session with live keys sends its peer one packet through the relay: its new list if one is
+  owed, else a keep-alive. Arriving newest through the relay, it ends the peer's direct path to
+  where this endpoint was, even when the application here has nothing to send. An endpoint that
+  keeps a link sends it once the relay has registered it again, on the new link; one without a
+  link, at once. A dormant session sends nothing.
 - **A silent path is retried on use,** at most once every 30 seconds.
 - **A symmetric NAT is recognised** when a peer is seen at another port than the relay sees it
   at. No ports are guessed: that session stays on the relay.
