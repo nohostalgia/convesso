@@ -809,6 +809,10 @@ impl<C: Config> Endpoint<C> {
         let Some(session) = self.sessions.get_mut(&key) else {
             return Output::Nothing;
         };
+        let current = session
+            .current
+            .as_ref()
+            .is_some_and(|pair| pair.local_index == header.receiver_index);
         let pair = [session.current.as_mut(), session.previous.as_mut()]
             .into_iter()
             .flatten()
@@ -828,7 +832,15 @@ impl<C: Config> Endpoint<C> {
         };
         pair.window.accept(header.counter);
         pair.received += 1;
-        heard(session, opened.inner_type, source, path, newest, now);
+        heard(
+            session,
+            opened.inner_type,
+            source,
+            path,
+            newest && current,
+            newest,
+            now,
+        );
         session.last_used = now;
         self.last_opened = Some((key, newest));
         let relayed = matches!(source, Source::Relayed(_));
@@ -882,8 +894,9 @@ impl<C: Config> Endpoint<C> {
         let first = !session.ever_connected;
         session.ever_connected = true;
         session.accepted = true;
-        // The first packet of a pending pair: the newest it has.
-        heard(session, opened.inner_type, source, path, true, now);
+        // The first packet of a pending pair: the newest it has, and the
+        // pair is the session's current one from here.
+        heard(session, opened.inner_type, source, path, true, true, now);
         let local_index = pair.local_index;
         let freed = session.promote(pair, &binding);
         if let Some(index) = freed {
@@ -1857,11 +1870,21 @@ struct Arrival<'s> {
 /// otherwise take the session back to where nothing may reach the peer any
 /// more. A probe or an answer proves one way only, so it moves nothing but the
 /// freshness of the direct path it came on.
+///
+/// The newest packet of the current key pair arriving through the relay
+/// (`latest`) ends the freshness of a direct path the peer's packets came on:
+/// the peer sent it after everything that came on that path, so it is
+/// elsewhere, or no longer reaches this side directly, and the next packet
+/// takes the relay with one probe on the path (`PROTOCOL.md §7`). The newest
+/// of the previous pair does not: it is older than every packet of the current
+/// one. Nor does a path the peer has not sent on yet: it may not have taken it
+/// yet, and will once this side's packets arrive there.
 fn heard<W, Q>(
     session: &mut Session<W, Q>,
     inner_type: u8,
     source: Source<'_>,
     path: bool,
+    latest: bool,
     newest: bool,
     now: Instant,
 ) {
@@ -1871,6 +1894,13 @@ fn heard<W, Q>(
     let probing = matches!(inner_type, inner::PROBE | inner::ANSWER);
     if !probing && newest {
         session.last_source = source.key();
+    }
+    if !probing
+        && latest
+        && matches!(source, Source::Relayed(_))
+        && let Some(direct) = session.paths.direct.as_mut().filter(|d| d.carried)
+    {
+        direct.fresh_until = direct.fresh_until.min(now);
     }
     let Some(address) = source.key().and_then(|key| key.as_ip()) else {
         return;

@@ -299,7 +299,9 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
 1. the session's direct path, when it is proven and fresh (§7);
 2. the relay, with one probe on the direct path, when that path is proven but not fresh;
 3. where the peer's newest packet came from, directly or through the relay: a packet that
-   arrives after a newer one, late or reordered, does not move the session;
+   arrives after a newer one, late or reordered, does not move the session. After this
+   endpoint's network changes, a direct source heard before is no longer used while a relay is
+   pinned: the packets take the relay until the peer is heard again (§7);
 4. with nothing heard yet: a dial's first attempt goes at once to every address hint the
    application gave (up to 8 per peer), and its later attempts to the relay; with no relay, every
    attempt goes to every hint; everything else goes through the relay;
@@ -335,6 +337,17 @@ start together, so their probes cross and open both NATs. A probe is answered wi
 - **A direct path is fresh for 15 seconds** after an authenticated packet arrived on it. A packet
   sent later goes through the relay, and one probe goes on the direct path; its answer makes the
   path fresh again.
+- **A direct path is stale at once**, proven or taken from the peer's packets alike:
+  - when this endpoint's network changes;
+  - when the peer's new list no longer holds the path's address;
+  - when the peer's newest packet, under the current keys, arrives through the relay after its
+    packets had come on the path: the peer is elsewhere, or no longer reaches this side directly.
+    A late or replayed packet does not count, nor does one before the peer has used the path.
+- **A change of network is told at once.** After this endpoint's network changes, with a relay
+  pinned, each session with live keys sends its peer one packet through the relay: its new list
+  if one is owed, else a keep-alive. Arriving newest through the relay, it ends the peer's direct
+  path to where this endpoint was, even when the application here has nothing to send. A dormant
+  session sends nothing.
 - **A silent path is retried on use,** at most once every 30 seconds.
 - **A symmetric NAT is recognised** when a peer is seen at another port than the relay sees it
   at. No ports are guessed: that session stays on the relay.

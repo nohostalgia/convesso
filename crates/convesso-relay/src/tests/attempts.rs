@@ -229,3 +229,54 @@ fn a_restricted_cone_lets_a_symmetric_peer_through() {
     assert!(info(&world, 0, 1).own_symmetric);
     assert!(info(&world, 1, 0).peer_symmetric);
 }
+
+/// Scenario: a path taken from the peer's packets follows a peer that moved,
+/// as peerfectly found it: two devices on one LAN, the session dialled at a
+/// hint, its path taken from the packets and never probed. B leaves the LAN
+/// for another network; every datagram A sends after B's first packet from
+/// there arrives, through the relay, where A trusted B's LAN address for 15 s
+/// before.
+#[test]
+fn a_session_dialled_at_a_hint_follows_a_peer_that_left_the_lan() {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.direct = false;
+    world.behind(0, EIM.0, EIM.1);
+    world.behind(1, EIM.0, EIM.1);
+    world.same_lan(0, 1);
+    world.open_link(0);
+    world.open_link(1);
+    world.run_for(1000);
+    let lan = world.clients[1].lan;
+    let now = world.instant();
+    let peer = world.clients[1].peer_id();
+    let (bytes, len) = convesso_core::dos::encode_ip(lan);
+    world.clients[0]
+        .endpoint
+        .set_hints(peer, &[&bytes[..len]], now)
+        .unwrap();
+    for i in 0..10u8 {
+        world.send(0, 1, &[i]).unwrap();
+        world.run_for(50);
+        world.send(1, 0, &[i]).unwrap();
+        world.run_for(50);
+    }
+    assert_eq!(info(&world, 0, 1).path, PathKind::Direct(lan));
+
+    // B leaves the LAN: a new LAN address, and a new public one.
+    world.clients[1].lan = SocketAddr::from(([10, 99, 0, 2], lan.port()));
+    world.clients[1].lan_id = 99;
+    world.move_network(1, std::net::Ipv4Addr::new(203, 0, 113, 77));
+    world.send(1, 0, b"from mobile data").unwrap();
+    world.run_for(300);
+    let before = world.clients[1].datagrams().len();
+    for i in 0..10u8 {
+        world.send(0, 1, &[100 + i]).unwrap();
+        world.run_for(100);
+    }
+    assert_eq!(
+        world.clients[1].datagrams().len(),
+        before + 10,
+        "every datagram after the move arrived: {:?}",
+        path_changes(&world, 0)
+    );
+}

@@ -853,9 +853,33 @@ impl<C: Config> Endpoint<C> {
             relay.reported_v4 = false;
             relay.reported_v6 = false;
         }
-        self.sessions.retain(|_, session| {
+        // A peer last heard from a direct source may be out of reach from the
+        // new network: with a relay pinned, the next packets take the relay
+        // (`PROTOCOL.md §6`, rule 4), where the session exchanges candidates
+        // and an attempt finds a direct path again. Without one, that source
+        // is still the best guess. The relay's own session is left alone.
+        //
+        // And each session with live keys sends one packet at once, its new
+        // list if one is owed, else a keep-alive: through the relay, the
+        // newest the peer has, it tells the peer to stop sending where this
+        // endpoint was (`PROTOCOL.md §7`), even when the application here has
+        // nothing to send. One packet a session for each change of network;
+        // nothing at rest, and a dormant session is not woken.
+        let relay_key = self.relay.as_ref().map(RelayClient::key);
+        self.sessions.retain(|key, session| {
             if let Some(direct) = session.paths.direct.as_mut() {
                 direct.fresh_until = direct.fresh_until.min(now);
+            }
+            if relay_key.is_some_and(|relay| relay != *key) {
+                if session
+                    .last_source
+                    .is_some_and(|source| source.as_direct().is_some())
+                {
+                    session.last_source = None;
+                }
+                if session.current.as_ref().is_some_and(|pair| pair.live(now)) {
+                    session.confirm = true;
+                }
             }
             true
         });

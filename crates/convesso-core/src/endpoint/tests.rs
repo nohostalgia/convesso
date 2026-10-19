@@ -1800,14 +1800,20 @@ fn an_old_or_malformed_list_changes_nothing() {
     assert_eq!(listed(&net.b.endpoint, &a), [addr("192.0.2.1:9")]);
     assert_eq!(net.b.sent.len(), sent, "nothing in response");
 
-    // A higher generation replaces it, and needs no answer either.
+    // A higher generation replaces it, and needs no answer either. It holds
+    // the address A's packets come from, as a real list does: one without it
+    // would say A moved, and B would check its path (`a_new_list_without_the_
+    // path_s_address_ends_a_path_taken_from_packets`).
     let packet = crafted(
         &mut net,
         inner::CANDIDATES,
-        &candidates(6, &["192.0.2.6:9"]),
+        &candidates(6, &["192.0.2.6:9", "10.0.0.1:1"]),
     );
     net.settle_with(VecDeque::from([(true, packet)]));
-    assert_eq!(listed(&net.b.endpoint, &a), [addr("192.0.2.6:9")]);
+    assert_eq!(
+        listed(&net.b.endpoint, &a),
+        [addr("192.0.2.6:9"), addr("10.0.0.1:1")]
+    );
     assert_eq!(net.b.sent.len(), sent);
 }
 
@@ -3043,4 +3049,312 @@ fn pinning_the_same_relay_again_changes_nothing() {
             .any(|p| *p == "close" || *p == "open"),
         "the link stays ({before:?})"
     );
+}
+
+// --- a direct path follows a peer that moved ------------------------------------------
+
+/// B with a session with A on a fresh direct path, from A's address
+/// 10.0.0.1:1, and a relay pinned (never reached here): where B's packets go
+/// shows in their `To`. `validated`: whether B's probe of A was answered.
+/// A's packets then came on the path.
+fn direct_session(validated: bool) -> (Net, Key) {
+    direct_session_used(validated, true)
+}
+
+/// [`direct_session`], with A's packets on the path or not yet (`used`): a
+/// path not yet used must be validated, or there would be none.
+fn direct_session_used(validated: bool, used: bool) -> (Net, Key) {
+    let mut net = Net::new();
+    net.b
+        .endpoint
+        .pin_relay(*identity(4).address(), net.t())
+        .unwrap();
+    net.a_sends(b"hello").unwrap();
+    // A's list holds the address its packets come from; B's probes of it are
+    // lost when the path is to be taken from A's packets only.
+    net.drop_to_a = !validated;
+    let packet = crafted(&mut net, inner::CANDIDATES, &candidates(1, &["10.0.0.1:1"]));
+    net.settle_with(VecDeque::from([(true, packet)]));
+    net.drop_to_a = false;
+    let key = (net.a.peer_id(), ctx());
+    if used {
+        net.a_sends(b"direct").unwrap();
+    } else {
+        // Here everything goes directly, A's list included; on a network
+        // where A has no path to B yet, A's packets take the relay.
+        let session = net.b.endpoint.sessions.get_mut(&key).unwrap();
+        if let Some(direct) = session.paths.direct.as_mut() {
+            direct.carried = false;
+        }
+    }
+    let paths = &net.b.endpoint.sessions.get(&key).unwrap().paths;
+    assert!(paths.fresh(net.t()).is_some(), "a fresh direct path");
+    assert_eq!(paths.direct.unwrap().validated, validated);
+    assert_eq!(paths.direct.unwrap().carried, used);
+    (net, key)
+}
+
+/// Hands B `packet` from A as the relay delivers it.
+fn to_b_through_relay(net: &mut Net, packet: &[u8]) {
+    let now = net.t();
+    let a = net.a.peer_id();
+    let mut buffer = packet.to_vec();
+    let mut out = [0u8; 2048];
+    if let Output::Event(event) = net.b.endpoint.handle_packet(
+        &mut buffer,
+        Source::Relayed(a),
+        now,
+        &mut net.b.policy,
+        &mut net.b.entropy,
+        &mut out,
+    ) {
+        net.b.events.push(own(event));
+    }
+    // What B owes after it (an event held behind a transmit): its events
+    // kept, its packets, which go to a relay not reached here, dropped.
+    loop {
+        let mut out = [0u8; 2048];
+        match net
+            .b
+            .endpoint
+            .poll(now, &mut net.b.policy, &mut net.b.entropy, &mut out)
+        {
+            Poll::Event(event) => net.b.events.push(own(event)),
+            Poll::Transmit { .. } => {}
+            _ => break,
+        }
+    }
+}
+
+/// Where B's next datagram to A goes, and the direct packets B sends after it
+/// (a probe on the path): each with its bytes.
+fn b_sends(net: &mut Net) -> (To, Vec<(To, Vec<u8>)>) {
+    let now = net.t();
+    let peer = net.a.peer_id();
+    let mut out = [0u8; 2048];
+    let Ok(Output::Transmit { to, .. }) = net.b.endpoint.send(
+        Target::Peer(peer),
+        b"session",
+        b"data",
+        PATH,
+        now,
+        &mut net.b.policy,
+        &mut net.b.entropy,
+        &mut out,
+    ) else {
+        panic!("a datagram");
+    };
+    let mut after = Vec::new();
+    for _ in 0..16 {
+        let mut out = [0u8; 2048];
+        match net
+            .b
+            .endpoint
+            .poll(now, &mut net.b.policy, &mut net.b.entropy, &mut out)
+        {
+            Poll::Transmit { to, len } => after.push((to, out[..len].to_vec())),
+            Poll::Event(_) => {}
+            _ => break,
+        }
+    }
+    (to, after)
+}
+
+/// Scenario: the peer of a client that moved is not sent to at its old
+/// address: A's newest packet arrives through the relay, B's next datagram
+/// goes through the relay with one probe on the direct path, and once the
+/// probe is answered B is direct again.
+#[test]
+fn a_newer_packet_through_the_relay_ends_a_fresh_direct_path() {
+    let (mut net, _) = direct_session(true);
+    let packet = crafted(&mut net, inner::DATAGRAM, b"from elsewhere");
+    to_b_through_relay(&mut net, &packet);
+
+    let (to, after) = b_sends(&mut net);
+    assert!(matches!(to, To::Relay(_)), "{to:?}");
+    let probes: Vec<_> = after
+        .iter()
+        .filter(|(to, _)| *to == direct(&net.a.source))
+        .collect();
+    assert_eq!(probes.len(), 1, "one probe on the path: {after:?}");
+
+    // A still reaches B there: the probe's answer makes the path fresh.
+    let answer = net.deliver(false, &probes[0].1).expect("A answers");
+    net.deliver(true, &answer);
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// Scenario: a late relayed packet does not undo a direct path: one sent
+/// before a packet that came directly leaves the path fresh.
+#[test]
+fn a_late_relayed_packet_leaves_the_direct_path_fresh() {
+    let (mut net, _) = direct_session(true);
+    let late = crafted(&mut net, inner::DATAGRAM, b"sent first");
+    let newer = crafted(&mut net, inner::DATAGRAM, b"sent second");
+    net.deliver(true, &newer);
+    to_b_through_relay(&mut net, &late);
+    assert!(
+        net.b
+            .events
+            .iter()
+            .any(|e| matches!(e, Ev::Relayed(_, data, _) if data == b"sent first")),
+        "accepted, through the relay"
+    );
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// Scenario: a replayed relayed packet moves nothing: a copy of one that came
+/// directly is refused, and the path stays fresh.
+#[test]
+fn a_replayed_relayed_packet_moves_nothing() {
+    let (mut net, _) = direct_session(true);
+    let packet = crafted(&mut net, inner::DATAGRAM, b"once");
+    net.deliver(true, &packet);
+    let before = net.b_datagrams().len();
+    to_b_through_relay(&mut net, &packet);
+    assert_eq!(net.b_datagrams().len(), before, "refused");
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// The newest packet of the previous key pair, through the relay, after new
+/// keys: older than every packet of the current pair, it leaves the path
+/// fresh.
+#[test]
+fn a_relayed_packet_of_the_previous_keys_leaves_the_direct_path_fresh() {
+    let (mut net, key) = direct_session(true);
+    // Past REKEY_AFTER: new keys, and a packet under them, directly.
+    net.at(130);
+    net.a_sends(b"under new keys").unwrap();
+    let b_key = (net.b.peer_id(), ctx());
+    let session = net.a.endpoint.sessions.get_mut(&b_key).unwrap();
+    let pair = session.previous.as_mut().expect("the previous keys");
+    let mut out = [0u8; 2048];
+    let len = transport::seal(
+        &pair.send,
+        pair.remote_index,
+        pair.next_counter,
+        inner::DATAGRAM,
+        b"old keys",
+        &mut out,
+    )
+    .unwrap();
+    pair.next_counter += 1;
+    assert!(
+        net.b
+            .endpoint
+            .sessions
+            .get(&key)
+            .unwrap()
+            .paths
+            .fresh(net.t())
+            .is_some(),
+        "fresh under the new keys"
+    );
+    to_b_through_relay(&mut net, &out[..len]);
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// Scenario: a path taken from the peer's packets follows a peer that moved:
+/// never validated by a probe, it is stale as soon as A's newer list no
+/// longer holds its address.
+#[test]
+fn a_new_list_without_the_path_s_address_ends_a_path_taken_from_packets() {
+    let (mut net, _) = direct_session(false);
+    let packet = crafted(
+        &mut net,
+        inner::CANDIDATES,
+        &candidates(2, &["192.0.2.9:9"]),
+    );
+    // Delivered directly: only the list says A moved.
+    net.drop_to_a = true;
+    net.deliver(true, &packet);
+    let (to, _) = b_sends(&mut net);
+    assert!(matches!(to, To::Relay(_)), "{to:?}");
+}
+
+/// Scenario: a path the peer has not used yet stays direct: B validated it,
+/// A has sent nothing on it, and A's newest packet through the relay leaves it
+/// fresh; B's next datagram goes there, so that A takes it from B's packets.
+#[test]
+fn a_path_the_peer_has_not_used_yet_stays_direct() {
+    let (mut net, _) = direct_session_used(true, false);
+    let packet = crafted(&mut net, inner::DATAGRAM, b"still through the relay");
+    to_b_through_relay(&mut net, &packet);
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// Scenario: a session dialled at a hint follows a network change. Its peer
+/// last heard directly, no candidates exchanged: after the network changed,
+/// with a relay pinned, B's next datagram takes the relay.
+#[test]
+fn a_network_change_sends_a_session_heard_directly_through_the_relay() {
+    let mut net = Net::new();
+    net.b
+        .endpoint
+        .pin_relay(*identity(4).address(), net.t())
+        .unwrap();
+    net.a_sends(b"hello").unwrap();
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+    net.b.endpoint.network_changed(net.t());
+    let (to, _) = b_sends(&mut net);
+    assert!(matches!(to, To::Relay(_)), "{to:?}");
+}
+
+/// Without a relay, the source a session last heard from is still the best
+/// guess after a change of network: B keeps sending there.
+#[test]
+fn without_a_relay_a_network_change_keeps_the_last_source() {
+    let mut net = Net::new();
+    net.a_sends(b"hello").unwrap();
+    net.b.endpoint.network_changed(net.t());
+    let (to, _) = b_sends(&mut net);
+    assert_eq!(to, direct(&net.a.source));
+}
+
+/// Every packet B's poll gives at `now`, until it waits.
+fn b_polled(net: &mut Net) -> Vec<To> {
+    let now = net.t();
+    let mut sent = Vec::new();
+    for _ in 0..16 {
+        let mut out = [0u8; 2048];
+        match net
+            .b
+            .endpoint
+            .poll(now, &mut net.b.policy, &mut net.b.entropy, &mut out)
+        {
+            Poll::Transmit { to, .. } => sent.push(to),
+            Poll::Event(_) => {}
+            _ => break,
+        }
+    }
+    sent
+}
+
+/// A change of network sends one packet through the relay to each session
+/// with live keys, even with nothing to send: the peer learns from it that
+/// this endpoint moved.
+#[test]
+fn a_network_change_tells_each_live_session_through_the_relay() {
+    let (mut net, _) = direct_session(true);
+    let _ = b_polled(&mut net);
+    net.b.endpoint.network_changed(net.t());
+    let sent = b_polled(&mut net);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(matches!(sent[0], To::Relay(_)), "{sent:?}");
+}
+
+/// A dormant session is not woken by a change of network: nothing is sent.
+#[test]
+fn a_network_change_wakes_no_dormant_session() {
+    let (mut net, _) = direct_session(true);
+    net.at(200);
+    let _ = b_polled(&mut net);
+    net.b.endpoint.network_changed(net.t());
+    assert_eq!(b_polled(&mut net), Vec::new());
 }
