@@ -186,6 +186,12 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
 - **A direct path is trusted for 15 seconds after the last packet on it.** After a longer pause,
   the next packet goes through the relay, which still works, while one probe checks the direct
   path. If the path answers, the packets after it go directly again.
+- **A peer that moved is followed at once, not after 15 seconds.** When the peer's newest packet
+  comes through the relay after it had used the direct path, or its new list drops the path's
+  address, the path is checked the same way at once. A phone leaving Wi-Fi is then reached
+  through the relay within about a second. A side whose own network changed stops trusting the
+  addresses it heard its peers at, takes the relay until it hears them again, and sends each live
+  session one packet there at once, so that a peer is told even by a device that only receives.
 - **No port prediction.** When a NAT gives a different port to each destination, the session stays
   on the relay rather than trying to guess ports.
 - **An application can exclude address ranges,** such as those of its own tunnels, so that a path

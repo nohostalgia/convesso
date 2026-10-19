@@ -117,16 +117,24 @@ fn a_path_stale_but_still_open_comes_back_at_once() {
 }
 
 /// Scenario: a late relayed packet does not undo a direct path. A datagram
-/// that took the relay arrives after the session went direct: it is
+/// that took the relay arrives after one sent later went directly: it is
 /// accepted, and the session stays direct.
 #[test]
 fn a_late_relayed_packet_does_not_undo_a_direct_path() {
     let mut world = direct_pair();
     world.send_through_relay(1, 0, b"late, through the relay");
+    world.send(1, 0, b"sent after it, directly").unwrap();
     world.run_for(500);
-    assert_eq!(
-        last_datagram(&world, 0),
-        (b"late, through the relay".to_vec(), true)
+    let got = world.clients[0].datagrams();
+    let late = got
+        .iter()
+        .position(|d| *d == (b"late, through the relay".to_vec(), true));
+    let direct = got
+        .iter()
+        .position(|d| *d == (b"sent after it, directly".to_vec(), false));
+    assert!(
+        matches!((direct, late), (Some(d), Some(l)) if d < l),
+        "the relayed one last: {got:?}"
     );
     assert!(matches!(path(&world, 0), PathKind::Direct(_)));
     let relayed = world.clients[0].udp_log.len();
@@ -168,4 +176,76 @@ fn an_idle_month_with_a_direct_session_costs_nothing_more() {
     world.send(0, 1, b"direct again").unwrap();
     world.run_for(500);
     assert_eq!(last_datagram(&world, 1), (b"direct again".to_vec(), false));
+}
+
+/// Scenario: the peer of a client that moved is not sent to at its old
+/// address. B moves, and its packets reach A through the relay: from then on
+/// A sends B's old address one probe at most, and every datagram arrives,
+/// through the relay or at B's new address once an attempt finds it.
+#[test]
+fn the_peer_of_a_client_that_moved_is_not_sent_to_at_its_old_address() {
+    let mut world = direct_pair();
+    let old = world.clients[1].nat;
+    let before = world.sent_direct(0).iter().filter(|to| **to == old).count();
+    world.move_network(1, std::net::Ipv4Addr::new(203, 0, 113, 77));
+    world.send(1, 0, b"from elsewhere").unwrap();
+    world.run_for(300);
+    assert_eq!(last_datagram(&world, 0), (b"from elsewhere".to_vec(), true));
+
+    for i in 0..10u8 {
+        world.send(0, 1, &[i]).unwrap();
+        world.run_for(100);
+    }
+    let after = world.sent_direct(0).iter().filter(|to| **to == old).count();
+    assert!(after - before <= 1, "one probe to the old address at most");
+    let got = world.clients[1].datagrams();
+    for i in 0..10u8 {
+        assert!(
+            got.iter().any(|(data, _)| *data == [i]),
+            "datagram {i} arrived"
+        );
+    }
+}
+
+/// Scenario: a peer heard through the relay but still reachable directly is
+/// direct again after one probe. B sends one packet through the relay; A's
+/// next datagram takes the relay with one probe, whose answer brings A back
+/// to the direct path.
+#[test]
+fn a_peer_heard_through_the_relay_but_reachable_is_direct_again_after_one_probe() {
+    let mut world = direct_pair();
+    let probes_before = probes(&world, 0);
+    world.send_through_relay(1, 0, b"a bounce through the relay");
+    world.run_for(300);
+    world.send(0, 1, b"after it").unwrap();
+    world.run_for(300);
+    assert_eq!(last_datagram(&world, 1), (b"after it".to_vec(), true));
+    assert_eq!(probes(&world, 0) - probes_before, 1);
+    world.send(0, 1, b"direct again").unwrap();
+    world.run_for(300);
+    assert_eq!(last_datagram(&world, 1), (b"direct again".to_vec(), false));
+    assert!(matches!(path(&world, 0), PathKind::Direct(_)));
+}
+
+/// Scenario: a peer that moved and has nothing to send is found too. B's NAT
+/// forgets its flows and maps it anew, its interfaces unchanged, so its list
+/// is the same; B is told the network changed and sends nothing of its own.
+/// Its one packet through the relay tells A: every datagram A sends after it
+/// arrives.
+#[test]
+fn a_silent_peer_that_moved_is_found() {
+    let mut world = direct_pair();
+    for nat in &mut world.clients[1].nats {
+        *nat = Nat::new(Mapping::Dependent, Filtering::AddressAndPort);
+    }
+    world.run_for(1000);
+    let now = world.instant();
+    world.clients[1].endpoint.network_changed(now);
+    world.run_for(500);
+    let before = world.clients[1].datagrams().len();
+    for i in 0..20u8 {
+        world.send(0, 1, &[i]).unwrap();
+        world.run_for(100);
+    }
+    assert_eq!(world.clients[1].datagrams().len(), before + 20);
 }

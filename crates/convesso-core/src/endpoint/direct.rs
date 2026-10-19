@@ -576,14 +576,14 @@ impl<C: Config> Endpoint<C> {
         }
         paths.accepted = Some(received.generation);
         paths.exchanged = true;
-        // The peer no longer offers the address its validated path goes to:
-        // it moved, and the path is stale until checked.
+        // The peer no longer offers the address its path goes to, validated
+        // or taken from its packets: it moved, and the path is stale until
+        // checked.
         if let Some(direct) = paths.direct.as_mut().filter(|direct| {
-            direct.validated
-                && !list
-                    .as_slice()
-                    .iter()
-                    .any(|candidate| candidate.address == direct.address)
+            !list
+                .as_slice()
+                .iter()
+                .any(|candidate| candidate.address == direct.address)
         }) {
             direct.fresh_until = direct.fresh_until.min(now);
         }
@@ -678,11 +678,16 @@ impl<C: Config> Endpoint<C> {
                     || now >= direct.fresh_until
             });
             if better {
+                // The same path, validated now: what came on it still did.
+                let carried = paths
+                    .direct
+                    .is_some_and(|direct| direct.address == from && direct.carried);
                 paths.direct = Some(Direct {
                     address: from,
                     validated: true,
                     rank,
                     fresh_until,
+                    carried,
                 });
                 paths.check = None;
             }

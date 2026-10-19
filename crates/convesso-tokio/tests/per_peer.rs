@@ -582,12 +582,41 @@ fn counted(counts: &[AtomicU64; 2]) -> [u64; 2] {
 
 /// Scenario: a stopped reader holds back only its own peer. Two peers send
 /// messages and datagrams at a steady rate through a relay; the reader of
-/// one stops for 65 s. The other's rates stay within 10%, the relay
-/// keep-alives go on, a send to the other peer completes, the stopped peer's
-/// sends wait and its datagrams are dropped, and its receiver holds no more
-/// than its budget allows.
+/// one stops. For 5 s after the stopped peer's sends wait, the other's rates
+/// stay within 10%, the node answers its commands and its relay stays
+/// available; a send to the other peer completes, the stopped peer's
+/// datagrams are dropped, and its receiver holds no more than its budget
+/// allows. The relay keep-alives themselves, one a minute, are counted by
+/// the long version, run on demand.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_reader_holds_back_only_its_own_peer() {
+    // A wait that never ends fails here, in CI, rather than holding the job.
+    timeout(
+        Duration::from_secs(120),
+        stopped_reader(Duration::from_secs(5), false),
+    )
+    .await
+    .expect("the scenario ends within two minutes");
+}
+
+/// The same for 60 s, long enough for a relay keep-alive, which are counted.
+/// Run on demand: `cargo test -p convesso-tokio --all-features --test per_peer
+/// the_relay_keepalives_go_on -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "over a minute of real time, for one relay keep-alive"]
+async fn the_relay_keepalives_go_on_while_a_reader_is_stopped() {
+    timeout(
+        Duration::from_secs(300),
+        stopped_reader(Duration::from_secs(60), true),
+    )
+    .await
+    .expect("the scenario ends within five minutes");
+}
+
+/// The stopped-reader scenario, the other peer measured for `window` once the
+/// stopped peer's sends wait; the relay keep-alives counted when
+/// `keepalives`.
+async fn stopped_reader(window: Duration, keepalives: bool) {
     let relay = relay().await;
     let (r, _r_events) = node(13, Some(&relay), 64, PER_PEER).await;
     let (s1, _s1_events) = node(14, Some(&relay), 64, Delivery::Events).await;
@@ -623,7 +652,7 @@ async fn a_stopped_reader_holds_back_only_its_own_peer() {
     let before = rate(start, both, begun.elapsed().as_secs_f64());
 
     reading[0].store(false, Ordering::Relaxed);
-    let keepalives = r.stats().await.unwrap().keepalives_sent;
+    let keepalives_before = r.stats().await.unwrap().keepalives_sent;
     // The stopped peer's sends go on until R's budget, its channel's buffer
     // and S1's send buffer are full, and then wait.
     let mut s1_sent = sent[0].load(Ordering::Relaxed);
@@ -641,7 +670,7 @@ async fn a_stopped_reader_holds_back_only_its_own_peer() {
     .expect("the stopped peer's sends wait");
     let from = counted(&counts[1]);
     let begun = Instant::now();
-    sleep(Duration::from_secs(60)).await;
+    sleep(window).await;
     let after = rate(from, counted(&counts[1]), begun.elapsed().as_secs_f64());
     std::println!("the other peer: before {before:?}/s, while one is stopped {after:?}/s");
     for k in 0..2 {
@@ -649,7 +678,22 @@ async fn a_stopped_reader_holds_back_only_its_own_peer() {
         assert!((0.9..=1.1).contains(&ratio), "{after:?} against {before:?}");
     }
     let stats = r.stats().await.unwrap();
-    assert!(stats.keepalives_sent > keepalives, "the keep-alives go on");
+    if keepalives {
+        assert!(
+            stats.keepalives_sent > keepalives_before,
+            "the keep-alives go on"
+        );
+    }
+    // The relay never went unavailable: the link and its keep-alives were
+    // kept whatever the application read.
+    let mut node_events = r.node_events.lock().await;
+    while let Ok(Some(event)) = timeout(Duration::from_millis(100), node_events.next()).await {
+        assert!(
+            !matches!(event, NodeEvent::RelayUnavailable { .. }),
+            "{event:?}"
+        );
+    }
+    drop(node_events);
     assert!(stats.datagrams_dropped > 0, "the stopped peer's datagrams");
     assert_eq!(
         sent[0].load(Ordering::Relaxed),

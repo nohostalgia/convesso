@@ -389,6 +389,11 @@ pub(crate) struct Direct {
     /// Its preference: 0 for a local candidate, 1 IPv6, 2 IPv4.
     pub(crate) rank: u8,
     pub(crate) fresh_until: Instant,
+    /// Whether the peer's packets, other than probes and answers, came on
+    /// it: the peer uses it. Only then does a newer packet of the peer
+    /// through the relay say the peer left it; before, the peer may simply not
+    /// have taken it yet.
+    pub(crate) carried: bool,
 }
 
 /// What a session knows of its peer's candidates and of its direct path, and
@@ -469,6 +474,7 @@ impl PeerPaths {
         match self.direct.as_mut() {
             Some(direct) if direct.address == address => {
                 direct.fresh_until = fresh_until;
+                direct.carried = true;
                 self.check = None;
             }
             Some(direct) if now < direct.fresh_until => {}
@@ -478,6 +484,7 @@ impl PeerPaths {
                     validated: false,
                     rank: self.rank_of(address),
                     fresh_until,
+                    carried: true,
                 });
                 self.check = None;
             }
