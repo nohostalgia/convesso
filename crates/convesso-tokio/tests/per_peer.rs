@@ -26,6 +26,7 @@ use convesso_tokio::{
     Node, NodeError, NodeEvent, Received, Receiver, RelayLocation, SessionClosed, Stats,
 };
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 
 const PER_PEER: Delivery = Delivery::PerPeer {
@@ -529,7 +530,7 @@ async fn reads_pauses_and_drops_never_strand_a_message() {
 
 /// Sends a 1,000-byte message and a 200-byte datagram every 10 ms, counting
 /// the messages accepted.
-fn pace(sender: N, to: convesso_core::identity::Address, sent: Arc<AtomicU64>) {
+fn pace(sender: N, to: convesso_core::identity::Address, sent: Arc<AtomicU64>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         loop {
@@ -540,14 +541,18 @@ fn pace(sender: N, to: convesso_core::identity::Address, sent: Arc<AtomicU64>) {
             }
             sent.fetch_add(1, Ordering::Relaxed);
         }
-    });
+    })
 }
 
 /// Reads a receiver while `reading`, counting messages and datagrams.
-fn read(receiver: Arc<Receiver>, reading: Arc<AtomicBool>, counts: Arc<[AtomicU64; 2]>) {
+fn read(
+    receiver: Arc<Receiver>,
+    reading: Arc<AtomicBool>,
+    counts: Arc<[AtomicU64; 2]>,
+) -> [JoinHandle<()>; 2] {
     let datagrams = receiver.clone();
     let (reading2, counts2) = (reading.clone(), counts.clone());
-    tokio::spawn(async move {
+    let messages = tokio::spawn(async move {
         loop {
             if !reading.load(Ordering::Relaxed) {
                 sleep(Duration::from_millis(20)).await;
@@ -560,7 +565,7 @@ fn read(receiver: Arc<Receiver>, reading: Arc<AtomicBool>, counts: Arc<[AtomicU6
             }
         }
     });
-    tokio::spawn(async move {
+    let datagrams = tokio::spawn(async move {
         loop {
             if !reading2.load(Ordering::Relaxed) {
                 sleep(Duration::from_millis(20)).await;
@@ -571,6 +576,7 @@ fn read(receiver: Arc<Receiver>, reading: Arc<AtomicBool>, counts: Arc<[AtomicU6
             }
         }
     });
+    [messages, datagrams]
 }
 
 fn counted(counts: &[AtomicU64; 2]) -> [u64; 2] {
@@ -635,11 +641,19 @@ async fn stopped_reader(window: Duration, keepalives: bool) {
     ];
     let counts: [Arc<[AtomicU64; 2]>; 2] = [Arc::default(), Arc::default()];
     let sent = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+    // The scenario's own tasks, ended before it returns: left running, they
+    // would meet the runtime's shutdown, where every timer fires at once, and
+    // loop on their timeouts without ever yielding, holding the test.
+    let mut tasks = Vec::new();
     for i in 0..2 {
-        read(receivers[i].clone(), reading[i].clone(), counts[i].clone());
+        tasks.extend(read(
+            receivers[i].clone(),
+            reading[i].clone(),
+            counts[i].clone(),
+        ));
     }
-    pace(s1.clone(), r.address(), sent[0].clone());
-    pace(s2.clone(), r.address(), sent[1].clone());
+    tasks.push(pace(s1.clone(), r.address(), sent[0].clone()));
+    tasks.push(pace(s2.clone(), r.address(), sent[1].clone()));
 
     sleep(Duration::from_secs(2)).await;
     let start = counted(&counts[1]);
@@ -727,6 +741,10 @@ async fn stopped_reader(window: Duration, keepalives: bool) {
     std::println!("the stopped peer's receiver holds {messages} and {datagrams} bytes");
     assert!(messages <= budget && datagrams <= datagram_budget);
     assert!(budget - messages < 1000 + ELEMENT_COST, "a full budget");
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 // --- 3.4 ---------------------------------------------------------------------------------

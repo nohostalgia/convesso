@@ -39,9 +39,10 @@ use core::time::Duration;
 
 use super::{
     Address, Admission, Context, DialError, Endpoint, Entropy, Event, FrameKind, Hop, Instant, Key,
-    Output, PeerId, Poll, SendError, Source, To,
+    Output, Owner, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
+use crate::handshake::messages::{TYPE_INITIATION, TYPE_INITIATION_PAYLOAD};
 use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
@@ -585,6 +586,35 @@ enum Step {
 
 fn offset(base: usize, data: &[u8]) -> usize {
     (data.as_ptr() as usize).saturating_sub(base)
+}
+
+/// The dial whose attempt the relay frame `frame` forwards: a forward to a
+/// peer, carrying a version 1 first contact whose index `indices` gives to
+/// that peer's dial. The frames are the endpoint's own.
+fn attempt_of(indices: &impl Table<u32, Owner>, frame: &[u8]) -> Option<Key> {
+    let [frame_type::FORWARD, relay::KIND_PEER_ID, rest @ ..] = frame else {
+        return None;
+    };
+    let (peer, packet) = rest.split_at_checked(ROUTED_HEADER_LEN - 2)?;
+    // Version 1, a first contact, then the initiator's index.
+    let [
+        0x01,
+        TYPE_INITIATION | TYPE_INITIATION_PAYLOAD,
+        a,
+        b,
+        c,
+        d,
+        ..,
+    ] = *packet
+    else {
+        return None;
+    };
+    match indices.get(&u32::from_le_bytes([a, b, c, d]))? {
+        Owner::Dial(owner, context) if owner.as_bytes().as_slice() == peer => {
+            Some((*owner, *context))
+        }
+        _ => None,
+    }
 }
 
 impl<C: Config> Endpoint<C> {
@@ -1692,7 +1722,21 @@ impl<C: Config> Endpoint<C> {
         let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
         session.address = Some(address);
         session.last_used = now;
-        session.queue.push(frame).map_err(SendError::QueueFull)?;
+        let indices = &self.indices;
+        let session = self.sessions.get_mut(&key).ok_or(SendError::Capacity)?;
+        match attempt_of(indices, frame) {
+            // A dial's newer attempt takes the place of its earlier ones, so
+            // that the peer is not sent more attempts than it keeps; the one
+            // the relay session's first contacts carry stays, so that each of
+            // them carries the same bytes (`PROTOCOL.md §6`).
+            Some(dial) => session.queue.replace(
+                usize::from(session.carried),
+                |queued| attempt_of(indices, queued) == Some(dial),
+                frame,
+            ),
+            None => session.queue.push(frame),
+        }
+        .map_err(SendError::QueueFull)?;
         let pending = self.responder.pending_for(&key.0) > 0;
         if dialling || live || pending {
             return Ok(None);

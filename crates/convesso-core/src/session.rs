@@ -53,6 +53,22 @@ pub trait DatagramQueue: Default {
     /// Removes the oldest datagram.
     fn pop(&mut self);
 
+    /// Puts `datagram` where the first datagram after the first `skip` that
+    /// `old` matches was, and removes the other matches after the first
+    /// `skip`; appends it when none matches. The order of the rest is kept.
+    /// `old` may be asked more than once about a datagram.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueFull`] when the result would take the queue past
+    /// [`Self::LIMIT`]; the queue is then left as it was.
+    fn replace(
+        &mut self,
+        skip: usize,
+        old: impl FnMut(&[u8]) -> bool,
+        datagram: &[u8],
+    ) -> Result<(), QueueFull>;
+
     /// Removes every datagram.
     fn clear(&mut self);
 
@@ -80,13 +96,23 @@ impl<const N: usize> Default for FixedQueue<N> {
 
 impl<const N: usize> FixedQueue<N> {
     fn front_len(&self) -> Option<usize> {
+        self.len_at(0)
+    }
+
+    /// The length of the datagram stored at `at`, if one is.
+    fn len_at(&self, at: usize) -> Option<usize> {
         let len: [u8; 2] = self
             .buffer
-            .get(..2)
-            .filter(|_| self.used >= 2)?
+            .get(at..at + 2)
+            .filter(|_| self.used >= at + 2)?
             .try_into()
             .ok()?;
         Some(usize::from(u16::from_le_bytes(len)))
+    }
+
+    /// The datagram stored at `at`, behind its length.
+    fn datagram_at(&self, at: usize, len: usize) -> &[u8] {
+        self.buffer.get(at + 2..at + 2 + len).unwrap_or_default()
     }
 }
 
@@ -116,6 +142,57 @@ impl<const N: usize> DatagramQueue for FixedQueue<N> {
             self.buffer.copy_within(taken..self.used, 0);
             self.used -= taken;
         }
+    }
+
+    fn replace(
+        &mut self,
+        skip: usize,
+        mut old: impl FnMut(&[u8]) -> bool,
+        datagram: &[u8],
+    ) -> Result<(), QueueFull> {
+        let full = QueueFull { limit: N };
+        let len = u16::try_from(datagram.len()).map_err(|_| full)?;
+        let mut start = 0;
+        for _ in 0..skip {
+            match self.len_at(start) {
+                Some(len) => start += 2 + len,
+                None => break,
+            }
+        }
+        // What the matches take, to refuse before anything moves.
+        let mut matched = 0;
+        let mut at = start;
+        while let Some(len) = self.len_at(at) {
+            if old(self.datagram_at(at, len)) {
+                matched += 2 + len;
+            }
+            at += 2 + len;
+        }
+        let cost = 2 + datagram.len();
+        let used = self.used - matched + cost;
+        if used > N {
+            return Err(full);
+        }
+        // The matches compacted away, noting where the first was.
+        let (mut read, mut write, mut first) = (start, start, None);
+        while let Some(len) = self.len_at(read) {
+            let taken = 2 + len;
+            if old(self.datagram_at(read, len)) {
+                first.get_or_insert(write);
+            } else {
+                self.buffer.copy_within(read..read + taken, write);
+                write += taken;
+            }
+            read += taken;
+        }
+        let at = first.unwrap_or(write);
+        self.buffer.copy_within(at..write, at + cost);
+        let slot = self.buffer.get_mut(at..at + cost).ok_or(full)?;
+        let (head, body) = slot.split_at_mut(2);
+        head.copy_from_slice(&len.to_le_bytes());
+        body.copy_from_slice(datagram);
+        self.used = used;
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -158,6 +235,39 @@ impl<const LIMIT: usize> DatagramQueue for GrowableQueue<LIMIT> {
             // Give the memory back: a dormant session holds no queue.
             self.datagrams = alloc::collections::VecDeque::new();
         }
+    }
+
+    fn replace(
+        &mut self,
+        skip: usize,
+        mut old: impl FnMut(&[u8]) -> bool,
+        datagram: &[u8],
+    ) -> Result<(), QueueFull> {
+        let matched: usize = self
+            .datagrams
+            .iter()
+            .skip(skip)
+            .filter(|queued| old(queued))
+            .map(|queued| 2 + queued.len())
+            .sum();
+        let used = self.used - matched + 2 + datagram.len();
+        if used > LIMIT {
+            return Err(QueueFull { limit: LIMIT });
+        }
+        let mut first = None;
+        let mut i = skip;
+        while let Some(hit) = self.datagrams.get(i).map(|queued| old(queued)) {
+            if hit {
+                self.datagrams.remove(i);
+                first.get_or_insert(i);
+            } else {
+                i += 1;
+            }
+        }
+        let at = first.unwrap_or(self.datagrams.len());
+        self.datagrams.insert(at, datagram.to_vec());
+        self.used = used;
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -352,6 +462,8 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    extern crate std;
+
     use super::{DatagramQueue, FixedQueue, QueueFull};
 
     #[test]
@@ -369,5 +481,132 @@ mod tests {
         assert_eq!(queue.front(), Some(&b"ij"[..]));
         queue.clear();
         assert!(queue.is_empty());
+    }
+
+    /// A queue holding `items`, in order.
+    fn queue_of<Q: DatagramQueue>(items: &[&[u8]]) -> Q {
+        let mut queue = Q::default();
+        for item in items {
+            queue.push(item).unwrap();
+        }
+        queue
+    }
+
+    /// Everything in `queue`, in order, emptying it.
+    fn drain<Q: DatagramQueue>(queue: &mut Q) -> std::vec::Vec<std::vec::Vec<u8>> {
+        let mut items = std::vec::Vec::new();
+        while let Some(item) = queue.front() {
+            items.push(item.to_vec());
+            queue.pop();
+        }
+        items
+    }
+
+    /// `replace` on `items`, returning the queue's contents after.
+    fn replaced<Q: DatagramQueue>(
+        items: &[&[u8]],
+        skip: usize,
+        new: &[u8],
+    ) -> std::vec::Vec<std::vec::Vec<u8>> {
+        let mut queue: Q = queue_of(items);
+        queue
+            .replace(skip, |queued| queued.first() == Some(&b'x'), new)
+            .unwrap();
+        drain(&mut queue)
+    }
+
+    fn v(items: &[&[u8]]) -> std::vec::Vec<std::vec::Vec<u8>> {
+        items.iter().map(|item| item.to_vec()).collect()
+    }
+
+    /// The datagrams starting with `x` are the old ones.
+    fn replaces_in_place<Q: DatagramQueue>() {
+        // A match at the head, in the middle, at the tail.
+        assert_eq!(
+            replaced::<Q>(&[b"x1", b"a", b"b"], 0, b"x9"),
+            v(&[b"x9", b"a", b"b"])
+        );
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"x1", b"b"], 0, b"x9"),
+            v(&[b"a", b"x9", b"b"])
+        );
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"b", b"x1"], 0, b"x9"),
+            v(&[b"a", b"b", b"x9"])
+        );
+        // Several matches leave one entry, where the first was.
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"x1", b"b", b"x2", b"c", b"x3"], 0, b"x9"),
+            v(&[b"a", b"x9", b"b", b"c"])
+        );
+        // No match appends.
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"b"], 0, b"x9"),
+            v(&[b"a", b"b", b"x9"])
+        );
+        assert_eq!(replaced::<Q>(&[], 0, b"x9"), v(&[b"x9"]));
+        // A skipped head stays; the new one goes where the next match was.
+        assert_eq!(
+            replaced::<Q>(&[b"x0", b"a", b"x1", b"b", b"x2"], 1, b"x9"),
+            v(&[b"x0", b"a", b"x9", b"b"])
+        );
+        assert_eq!(
+            replaced::<Q>(&[b"x0", b"a"], 1, b"x9"),
+            v(&[b"x0", b"a", b"x9"])
+        );
+        assert_eq!(replaced::<Q>(&[b"x0"], 1, b"x9"), v(&[b"x0", b"x9"]));
+        assert_eq!(replaced::<Q>(&[], 1, b"x9"), v(&[b"x9"]));
+        // Longer and shorter than the one replaced.
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"x1", b"b"], 0, b"x123456"),
+            v(&[b"a", b"x123456", b"b"])
+        );
+        assert_eq!(
+            replaced::<Q>(&[b"a", b"x123456", b"b", b"x2"], 0, b"x"),
+            v(&[b"a", b"x", b"b"])
+        );
+        // The queue stays usable after.
+        let mut queue: Q = queue_of(&[b"x1", b"a"]);
+        queue
+            .replace(0, |q| q.first() == Some(&b'x'), b"x2")
+            .unwrap();
+        queue.push(b"b").unwrap();
+        assert_eq!(drain(&mut queue), v(&[b"x2", b"a", b"b"]));
+    }
+
+    /// A result past the bound is refused, and the queue is left as it was;
+    /// the bytes the matches free count.
+    fn replace_keeps_the_bound<Q: DatagramQueue>() {
+        // 16 bytes: (2 + 4) * 2 = 12 used.
+        let mut queue: Q = queue_of(&[b"aaaa", b"xbbb"]);
+        let old = |q: &[u8]| q.first() == Some(&b'x');
+        // Freeing 6 and taking 2 + 8 = 10 gives 16: fits.
+        queue.replace(0, old, b"x1234567").unwrap();
+        assert_eq!(drain(&mut queue), v(&[b"aaaa", b"x1234567"]));
+        let mut queue: Q = queue_of(&[b"aaaa", b"xbbb"]);
+        // 2 + 9 = 11 would give 17.
+        assert_eq!(
+            queue.replace(0, old, b"x12345678"),
+            Err(QueueFull { limit: Q::LIMIT })
+        );
+        // Skipping the match frees nothing: 12 + 6 = 18.
+        assert_eq!(
+            queue.replace(1, |q| q == b"aaaa", b"x123"),
+            Err(QueueFull { limit: Q::LIMIT })
+        );
+        assert_eq!(drain(&mut queue), v(&[b"aaaa", b"xbbb"]));
+    }
+
+    #[test]
+    fn a_fixed_queue_replaces_in_place() {
+        replaces_in_place::<FixedQueue<64>>();
+        replace_keeps_the_bound::<FixedQueue<16>>();
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn a_growable_queue_replaces_in_place() {
+        replaces_in_place::<super::GrowableQueue<64>>();
+        replace_keeps_the_bound::<super::GrowableQueue<16>>();
     }
 }
