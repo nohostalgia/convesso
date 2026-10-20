@@ -185,6 +185,93 @@ fn a_wake_is_one_datagram_of_302_bytes() {
     assert_eq!(&wake[..2], &[0x01, 0x05]);
 }
 
+/// A, with no link, sends B one datagram at time 0 while its first contacts
+/// to the relay are held back by `hold`; then the relay takes them. Returns
+/// the world after A's dial, with B's datagrams checked: the first, and a
+/// second sent once A is connected, both arrive.
+fn wake_against_a_late_relay(hold: impl FnOnce(&mut World<Open>)) -> World<Open> {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.open_link(1);
+    world.run_for(1000);
+    hold(&mut world);
+    world.send(0, 1, b"first").unwrap();
+    world.run_for(5000);
+    world.clients[0].handshakes_ignored = false;
+    world.run_for(10_000);
+    let b = world.clients[1].peer_id();
+    assert!(world.when(0, &Ev::Connected(b)).is_some(), "A connected");
+    world.send(0, 1, b"second").unwrap();
+    world.run_for(1000);
+    let received: Vec<Vec<u8>> = world.clients[1]
+        .datagrams()
+        .into_iter()
+        .map(|(data, _)| data)
+        .collect();
+    assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
+    world
+}
+
+/// The first contacts the relay forwarded to client `to`: how many, and how
+/// many distinct.
+fn first_contacts_to(world: &World<Open>, to: usize) -> (usize, usize) {
+    let to = *world.clients[to].peer_id().as_bytes();
+    let mut ephemerals: Vec<[u8; 32]> = world
+        .relay
+        .first_contacts_forwarded
+        .iter()
+        .filter(|(recipient, _)| *recipient == to)
+        .map(|(_, ephemeral)| *ephemeral)
+        .collect();
+    let all = ephemerals.len();
+    ephemerals.sort_unstable();
+    ephemerals.dedup();
+    (all, ephemerals.len())
+}
+
+/// Scenario: a late relay leaves the session working. The relay ignores A's
+/// first contacts for 5 s, while A's dial to B queues its attempts behind
+/// the relay session; B gets the attempt the wake carried and the newest,
+/// and A completes on keys B holds.
+#[test]
+fn a_late_relay_leaves_the_session_working() {
+    let world = wake_against_a_late_relay(|world| world.clients[0].handshakes_ignored = true);
+    let (_, distinct) = first_contacts_to(&world, 1);
+    assert!(distinct <= 2, "{distinct} distinct attempts");
+}
+
+/// Scenario: a slow relay that admits every first contact leaves the session
+/// working. Each retry of A's relay session reaches the relay 4 s late and is
+/// admitted; each carried the same attempt, so B sees at most two distinct
+/// attempts of A's dial.
+#[test]
+fn a_slow_relay_that_admits_every_first_contact_leaves_the_session_working() {
+    let world = wake_against_a_late_relay(|world| world.clients[0].first_contacts_delayed = 4000);
+    let (all, distinct) = first_contacts_to(&world, 1);
+    assert!(distinct <= 2, "{distinct} distinct attempts");
+    assert!(
+        all > distinct,
+        "the carried attempt forwarded more than once"
+    );
+}
+
+/// Scenario: a live relay session forwards every attempt. A's relay session
+/// has keys; B's link has died without the relay knowing yet, so B never
+/// answers: A's attempts at 0 and 1 s are both forwarded when they are made.
+#[test]
+fn a_live_relay_session_forwards_every_attempt() {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.direct = false;
+    world.open_link(0);
+    world.open_link(1);
+    world.run_for(1000);
+    world.clients[1].link_blackhole = true;
+    world.send(0, 1, b"unanswered").unwrap();
+    world.run_for(500);
+    assert_eq!(first_contacts_to(&world, 1), (1, 1), "the first, at once");
+    world.run_for(1000);
+    assert_eq!(first_contacts_to(&world, 1), (2, 2), "the second, at 1 s");
+}
+
 /// Scenario: a datagram too large for the relay is refused, naming the sizes.
 #[test]
 fn a_datagram_too_large_for_the_relay_is_refused() {

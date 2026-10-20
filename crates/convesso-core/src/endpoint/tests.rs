@@ -3409,3 +3409,196 @@ fn a_network_change_wakes_no_dormant_session() {
     net.b.endpoint.network_changed(net.t());
     assert_eq!(b_polled(&mut net), Vec::new());
 }
+
+// --- a dial's attempts waiting for the relay ---------------------------------
+
+/// A, with a relay pinned that it has no link to and no keys with: what it
+/// sends to peers waits in the relay session's queue.
+struct Waiting<C: Config> {
+    endpoint: Endpoint<C>,
+    policy: Policy,
+    entropy: TestEntropy,
+}
+
+impl<C: Config> Waiting<C> {
+    fn new(contexts: &[&[u8]]) -> Self {
+        let mut endpoint = Endpoint::new(identity(1), contexts).unwrap();
+        endpoint
+            .pin_relay(*identity(4).address(), Instant::from_millis(0))
+            .unwrap();
+        Self {
+            endpoint,
+            policy: Policy {
+                decision: Decision::Accept { psk: None },
+                asked: 0,
+                refuse: Vec::new(),
+            },
+            entropy: TestEntropy(9001),
+        }
+    }
+
+    /// A sends a datagram to `to` in `context` at `now`, then polls.
+    fn send(&mut self, to: usize, context: &[u8], now: u64) {
+        let mut out = [0u8; 2048];
+        self.endpoint
+            .send(
+                Target::Address(identity(to).address()),
+                context,
+                b"hello",
+                PATH,
+                Instant::from_millis(now),
+                &mut self.policy,
+                &mut self.entropy,
+                &mut out,
+            )
+            .unwrap();
+        self.poll(now);
+    }
+
+    /// Polls at `now` until nothing more is due.
+    fn poll(&mut self, now: u64) {
+        for _ in 0..64 {
+            let mut out = [0u8; 2048];
+            if matches!(
+                self.endpoint.poll(
+                    Instant::from_millis(now),
+                    &mut self.policy,
+                    &mut self.entropy,
+                    &mut out,
+                ),
+                Poll::Wait(_) | Poll::Idle
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn relay_session(&mut self) -> &mut SessionOf<C> {
+        let key = (
+            identity(4).peer_id(),
+            Context::new(crate::relay::CONTEXT).unwrap(),
+        );
+        self.endpoint.sessions.get_mut(&key).unwrap()
+    }
+
+    /// The relay session's queue, in order, left as it was.
+    fn queued(&mut self) -> Vec<Vec<u8>> {
+        let queue = &mut self.relay_session().queue;
+        let mut frames = Vec::new();
+        while let Some(frame) = queue.front() {
+            frames.push(frame.to_vec());
+            queue.pop();
+        }
+        for frame in &frames {
+            queue.push(frame).unwrap();
+        }
+        frames
+    }
+}
+
+/// What a queued relay frame is: a first contact forwarded to a peer, with
+/// its ephemeral key, or something else forwarded to a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    Attempt([u8; 32], [u8; 32]),
+    Other([u8; 32]),
+}
+
+fn queued(frame: &[u8]) -> Queued {
+    assert_eq!(frame[0], crate::relay::frame_type::FORWARD);
+    let peer: [u8; 32] = frame[2..34].try_into().unwrap();
+    match frame[34..36] {
+        [0x01, 0x01 | 0x05] => Queued::Attempt(peer, frame[40..72].try_into().unwrap()),
+        _ => Queued::Other(peer),
+    }
+}
+
+fn kinds(frames: &[Vec<u8>]) -> Vec<Queued> {
+    frames.iter().map(|frame| queued(frame)).collect()
+}
+
+/// Scenario: the queue keeps the carried attempt and the newest. A dial to B
+/// makes its attempts at 0, 1 and 3 s while the relay session has no keys:
+/// the attempt the relay session carries stays at the head, every first
+/// contact of the relay session carrying it, and only the newest of the
+/// others is behind it.
+#[test]
+fn the_queue_keeps_the_carried_attempt_and_the_newest() {
+    let mut a: Waiting<Mcu> = Waiting::new(&[b"session"]);
+    let b = *identity(2).peer_id().as_bytes();
+    a.send(2, b"session", 0);
+    let first = a.queued();
+    assert!(a.relay_session().carried, "the wake carries it");
+    assert!(matches!(kinds(&first)[..], [Queued::Attempt(peer, _)] if peer == b));
+
+    let mut seen = vec![kinds(&first)[0]];
+    for now in [1000, 3000] {
+        a.poll(now);
+        let frames = a.queued();
+        assert!(a.relay_session().carried);
+        assert_eq!(frames[0], first[0], "the carried head stays, at {now} ms");
+        let kinds = kinds(&frames);
+        assert_eq!(kinds.len(), 2, "{kinds:?} at {now} ms");
+        assert!(matches!(kinds[1], Queued::Attempt(peer, _) if peer == b));
+        assert!(!seen.contains(&kinds[1]), "a new attempt at {now} ms");
+        seen.push(kinds[1]);
+    }
+}
+
+/// Scenario: datagrams and other dials' attempts stay in the queue. Behind
+/// the carried head: a dial to C, a dial to B in another context, and a
+/// datagram for C. Each dial's new attempt takes its earlier one's place;
+/// the datagram, and the order, stay.
+#[test]
+fn datagrams_and_other_dials_attempts_stay_in_the_queue() {
+    use crate::storage::Server;
+
+    let mut a: Waiting<Server> = Waiting::new(&[b"session", b"other"]);
+    let (b, c) = (
+        *identity(2).peer_id().as_bytes(),
+        *identity(3).peer_id().as_bytes(),
+    );
+    a.send(2, b"session", 0);
+    a.send(3, b"session", 0);
+    a.send(2, b"other", 0);
+    // A datagram for C, as a session with keys through the relay queues it.
+    let mut datagram = vec![crate::relay::frame_type::FORWARD, 0x01];
+    datagram.extend_from_slice(&c);
+    datagram.extend_from_slice(&[0x01, 0x04, 0, 0, 0, 0]);
+    datagram.extend_from_slice(&[0; 40]);
+    a.relay_session().queue.push(&datagram).unwrap();
+    let before = kinds(&a.queued());
+    let [
+        head @ Queued::Attempt(..),
+        to_c @ Queued::Attempt(..),
+        other @ Queued::Attempt(..),
+        Queued::Other(_),
+    ] = before[..]
+    else {
+        panic!("{before:?}");
+    };
+
+    a.poll(1000);
+    let frames = a.queued();
+    let after = kinds(&frames);
+    assert_eq!(after.len(), 5, "{after:?}");
+    assert_eq!(after[0], head, "the carried head stays");
+    assert!(matches!(after[1], Queued::Attempt(peer, _) if peer == c) && after[1] != to_c);
+    assert!(matches!(after[2], Queued::Attempt(peer, _) if peer == b) && after[2] != other);
+    assert_eq!(frames[3], datagram, "the datagram stays, in its place");
+    assert!(matches!(after[4], Queued::Attempt(peer, _) if peer == b) && after[4] != head);
+}
+
+/// With no carried head, the newest attempt takes the earliest one's place,
+/// the head included.
+#[test]
+fn with_no_carried_head_the_newest_takes_the_heads_place() {
+    let mut a: Waiting<Mcu> = Waiting::new(&[b"session"]);
+    a.send(2, b"session", 0);
+    let first = kinds(&a.queued());
+    a.relay_session().carried = false;
+    a.poll(1000);
+    let after = kinds(&a.queued());
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(matches!(after[0], Queued::Attempt(..)) && after[0] != first[0]);
+}

@@ -422,6 +422,10 @@ pub struct Relay<P, E> {
     /// received from it: what the anti-amplification tests read.
     #[cfg(test)]
     unconfirmed: HashMap<Dest, (usize, usize)>,
+    /// Each first contact forwarded, as its recipient and its ephemeral key:
+    /// what the tests of a dial's attempts read.
+    #[cfg(test)]
+    first_contacts_forwarded: Vec<([u8; 32], [u8; 32])>,
 }
 
 fn is_first_contact(packet: &[u8]) -> bool {
@@ -462,6 +466,8 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             out: vec![0; MAX_OUT],
             #[cfg(test)]
             unconfirmed: HashMap::new(),
+            #[cfg(test)]
+            first_contacts_forwarded: Vec::new(),
             reported: false,
         })
     }
@@ -871,6 +877,12 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             )
         {
             return;
+        }
+        #[cfg(test)]
+        if is_first_contact(packet)
+            && let Some(ephemeral) = packet.get(6..38).and_then(|e| e.try_into().ok())
+        {
+            self.first_contacts_forwarded.push((recipient, ephemeral));
         }
         let peer = client.peer;
         let mut frame = vec![0u8; relay::ROUTED_HEADER_LEN + packet.len()];

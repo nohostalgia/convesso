@@ -285,6 +285,12 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
 - **A wake in one datagram.** With no keys for the relay, a client sends a first contact whose
   payload is the forward. The relay does the same towards a resting client with a TCP link, whose
   address the client registered.
+- **One attempt of a dial waits for the relay.** While the relay session opens, what follows the
+  wake waits in its queue, and a dial's newer attempt takes the place of its earlier ones there.
+  The attempt the wake carries stays, so every first contact of the relay session carries the same
+  bytes, and the peer drops the copies as replays. The peer thus gets at most two distinct attempts
+  of one dial, however late the relay answers: the carried one and the newest. Two is what it keeps
+  pending per peer, so the initiator never completes on keys the peer has dropped.
 - **Observed address.** The relay tells a client the address it sees it at, when that changes, and
   tells nobody else.
 - **Keep-alive.** A client keeping a TCP link sends one keep-alive when the link has been silent

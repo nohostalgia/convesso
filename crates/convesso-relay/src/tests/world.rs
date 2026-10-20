@@ -311,6 +311,10 @@ pub(crate) struct Client {
     /// The relay answers this client's keep-alives but never its handshakes:
     /// its first contacts to the relay are lost.
     pub(crate) handshakes_ignored: bool,
+    /// How much later than other packets this client's first contacts reach
+    /// the relay over UDP, in ms: a relay slow to take handshakes. Not on the
+    /// link, whose bytes stay in order.
+    pub(crate) first_contacts_delayed: u64,
     /// When the core asked for a link, in ms.
     pub(crate) opens: Vec<u64>,
     /// When the core asked to close the link, in ms.
@@ -480,6 +484,7 @@ impl<P: Policy> World<P> {
                 tcp_hangs: false,
                 link_blackhole: false,
                 handshakes_ignored: false,
+                first_contacts_delayed: 0,
                 opens: Vec::new(),
                 closes: Vec::new(),
                 keepalive_answers: 0,
@@ -998,15 +1003,22 @@ impl<P: Policy> World<P> {
 
     fn client_to_relay(&mut self, i: usize, path: RelayPath, packet: Vec<u8>) {
         let client = &mut self.clients[i];
-        if client.handshakes_ignored && crate::is_first_contact(&packet) {
+        let first_contact = crate::is_first_contact(&packet);
+        if client.handshakes_ignored && first_contact {
             return;
         }
+        let udp_delay = self.delay
+            + if first_contact {
+                client.first_contacts_delayed
+            } else {
+                0
+            };
         if matches!(path, RelayPath::UdpOther) {
             if let (Some(from), false) = (client.nat6, client.udp_blocked) {
                 client.sent.udp += 1;
                 client.sent.udp_bytes += packet.len();
                 self.put(
-                    self.delay,
+                    udp_delay,
                     Msg::RelayUdp {
                         from,
                         client: i,
@@ -1026,7 +1038,7 @@ impl<P: Policy> World<P> {
                     .flatten();
                 let from = other.unwrap_or(client.nat);
                 self.put(
-                    self.delay,
+                    udp_delay,
                     Msg::RelayUdp {
                         from,
                         client: i,
