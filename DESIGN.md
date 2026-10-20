@@ -136,6 +136,11 @@ An embedded device is given its identity when it is made, as a 64-byte record, a
 randomness from the chip's hardware generator. If the generator does not work, the driver does not
 start.
 
+The tokio driver takes the relay's host by name, and resolves it when the relay is needed: at each
+opening of the link, or for a packet to the relay with no address yet. A name that does not resolve
+never stops the node from starting or changing relay, so the LAN keeps working without DNS. The
+embedded driver resolves nothing: its integrator gives the relay's addresses.
+
 ## 6. The relay
 
 Two devices behind NATs often cannot reach each other at first. A relay helps them meet.
@@ -177,8 +182,11 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
 - **The relay first, then a direct path.** A session opens through the relay. The two sides
   exchange the addresses each might be reached at, and probe them at the same moment.
 - **An application that knows where a peer may be says so.** It may give up to 8 address hints per
-  peer, such as one per interface or family; a dial tries them all at once, then the relay, so a
-  wrong hint costs nothing but a packet.
+  peer, such as one per interface or family. Every attempt of a dial tries them all at once, as
+  they are then, so a hint learned during a dial is used straight away. The relay joins a quarter
+  of a second after the first attempt, and with the hints from the second. A wrong hint costs a
+  packet and those 250 ms. A peer that answers its hint on the LAN is reached without the relay
+  ever learning of the dial.
 - **A path is used only once it has been seen to work both ways:** an answer to a probe came back
   from that address.
 - **The best working path is preferred:** an address on the same local network, then IPv6, then

@@ -42,7 +42,7 @@ use super::{
     Output, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
-use crate::handshake::{Access, Decision, FIRST_CONTACT_LEN, Psk, ResponderError};
+use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
 use crate::storage::{Config, Table};
@@ -482,14 +482,28 @@ impl core::fmt::Display for HintTooLong {
 
 impl core::error::Error for HintTooLong {}
 
-/// A first contact still owed to the hints after the first: sent to the next
-/// one at each poll, before anything else (`PROTOCOL.md §6`).
+/// How long the relay waits behind the hints on a dial's first attempt: a peer
+/// that answers a hint within it is dialled without the relay, which then
+/// neither carries nor learns of the dial (`PROTOCOL.md §6`). It runs only
+/// while a dial is unanswered, and sends one first contact through the relay;
+/// nothing at rest. Without it, the relay would either carry every dial a hint
+/// would have opened, or wait for the next attempt, a second, behind a wrong
+/// hint.
+pub const RELAY_AFTER_HINTS: Duration = Duration::from_millis(250);
+
+/// A first contact still owed to the hints after the first, and to the relay:
+/// sent to the next hint at each poll, before anything else, then through the
+/// relay once due (`PROTOCOL.md §6`). It holds a first contact with its
+/// payload, so that a dial a send started reaches every hint too.
 pub(crate) struct Fan {
     peer: PeerId,
-    bytes: [u8; FIRST_CONTACT_LEN],
+    bytes: [u8; MAX_FIRST_CONTACT_LEN],
     len: usize,
     /// The hint it goes to next.
     next: usize,
+    /// When it goes through the relay, if it does: while the dial is still
+    /// unanswered then.
+    relay_at: Option<Instant>,
 }
 
 /// The path the rule chose. It lives on the stack for one routing step, and
@@ -673,8 +687,11 @@ impl<C: Config> Endpoint<C> {
     }
 
     /// Gives the core the direct addresses of `peer`, in the driver's encoding
-    /// of a direct source, replacing those it had; none forgets them. A dial's
-    /// first attempt goes to every one of them at once (`PROTOCOL.md §6`).
+    /// of a direct source, replacing those it had; none forgets them. Every
+    /// attempt of a dial goes to every one of them at once, with the relay
+    /// [`RELAY_AFTER_HINTS`] later on the first attempt and at once on the
+    /// others (`PROTOCOL.md §6`); a dial in flight tries them at once, with its
+    /// next attempt.
     /// Hints that do not fit make room by forgetting every hint of the peer
     /// whose hints were used least recently.
     ///
@@ -725,6 +742,14 @@ impl<C: Config> Endpoint<C> {
                 .hints
                 .insert((peer, index), Hint { address, used: now });
         }
+        // A dial to the peer in flight tries them at once, with its next
+        // attempt (`PROTOCOL.md §3`).
+        self.dials.retain(|(p, _), dial| {
+            if *p == peer {
+                dial.hurry(now);
+            }
+            true
+        });
         Ok(())
     }
 
@@ -743,6 +768,15 @@ impl<C: Config> Endpoint<C> {
             }
         }
         hints
+    }
+
+    /// Whether a dial to `peer` still awaits an answer.
+    fn dialling(&self, peer: &PeerId) -> bool {
+        let mut found = false;
+        self.dials.for_each(|(p, _), dial| {
+            found |= p == peer && dial.next_due().is_some();
+        });
+        found
     }
 
     /// A session with a peer is opening: this endpoint's public addresses are
@@ -1270,7 +1304,10 @@ impl<C: Config> Endpoint<C> {
                 attempt,
             } => match self.path_of(peer, last_source, attempt, now) {
                 Path::Direct(address) => Some((To::Direct(address), len)),
-                Path::Hints(hints) => self.fan_out(peer, &hints, len, out),
+                Path::Hints(hints) => {
+                    let relay_at = self.relay_copy_at(attempt, now);
+                    self.fan_out(peer, &hints, len, out, relay_at)
+                }
                 Path::RelaySession => Some((To::Relay(self.relay_path(now)), len)),
                 Path::Forward => self
                     .forward_in_place(peer, len, now, policy, entropy, out)
@@ -1307,7 +1344,7 @@ impl<C: Config> Endpoint<C> {
         let hints = self.usable_hints(&peer, now);
         let hinted = hints.iter().next().is_some();
         match (attempt, hinted, self.relay.is_some()) {
-            (Some(0), true, _) | (_, true, false) => Path::Hints(hints),
+            (Some(_), true, _) | (None, true, false) => Path::Hints(hints),
             (_, _, true) => Path::Forward,
             (_, false, false) => Path::None,
         }
@@ -1338,13 +1375,14 @@ impl<C: Config> Endpoint<C> {
         hints: &Hints,
         len: usize,
         out: &[u8],
+        relay_at: Option<Instant>,
     ) -> Option<(To, usize)> {
         let first = hints.iter().next()?;
-        if hints.1 > 1
+        if (hints.1 > 1 || relay_at.is_some())
             && let Some(packet) = out.get(..len)
-            && len <= FIRST_CONTACT_LEN
+            && len <= MAX_FIRST_CONTACT_LEN
         {
-            let mut bytes = [0u8; FIRST_CONTACT_LEN];
+            let mut bytes = [0u8; MAX_FIRST_CONTACT_LEN];
             if let Some(slot) = bytes.get_mut(..len) {
                 slot.copy_from_slice(packet);
             }
@@ -1354,29 +1392,91 @@ impl<C: Config> Endpoint<C> {
                 bytes,
                 len,
                 next: 1,
+                relay_at,
             };
             let _ = self.fans.insert(self.fan_seq, fan);
         }
         Some((To::Direct(first), len))
     }
 
+    /// When a dial attempt sent to the hints also goes through the relay: the
+    /// first [`RELAY_AFTER_HINTS`] later, the others at once; never with no
+    /// relay, or for a packet that is not a dial's attempt.
+    fn relay_copy_at(&self, attempt: Option<usize>, now: Instant) -> Option<Instant> {
+        self.relay.as_ref()?;
+        match attempt? {
+            0 => Some(now.saturating_add(RELAY_AFTER_HINTS)),
+            _ => Some(now),
+        }
+    }
+
+    /// The earliest instant a fan-out's relay copy is due, for the poll's
+    /// deadline.
+    pub(super) fn fan_deadline(&self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        self.fans.for_each(|_, fan| {
+            if let Some(at) = fan.relay_at {
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
+        });
+        next
+    }
+
     /// The next first contact owed to a hint, written in `out`: the oldest
     /// fan-out's, to its next hint. The hints are read again, so that one
     /// given meanwhile is used, and one forgotten is not.
-    pub(super) fn next_fan(&mut self, now: Instant, out: &mut [u8]) -> Option<(To, usize)> {
+    pub(super) fn next_fan(
+        &mut self,
+        now: Instant,
+        policy: &mut impl Admission,
+        entropy: &mut impl Entropy,
+        out: &mut [u8],
+    ) -> Option<(To, usize)> {
+        // Fan-outs waiting only for their relay copy, not due yet, are passed
+        // over this time.
+        let mut waiting: [Option<u32>; 4] = [None; 4];
+        let mut passed = 0;
         loop {
             let mut oldest: Option<u32> = None;
             self.fans.for_each(|seq, _| {
-                if oldest.is_none_or(|o| seq.wrapping_sub(o) > u32::MAX / 2) {
+                if !waiting.contains(&Some(*seq))
+                    && oldest.is_none_or(|o| seq.wrapping_sub(o) > u32::MAX / 2)
+                {
                     oldest = Some(*seq);
                 }
             });
             let seq = oldest?;
-            let (peer, next) = self.fans.get(&seq).map(|fan| (fan.peer, fan.next))?;
+            let (peer, next, relay_at) = self
+                .fans
+                .get(&seq)
+                .map(|fan| (fan.peer, fan.next, fan.relay_at))?;
             let hints = self.usable_hints(&peer, now);
             let Some(hint) = hints.iter().nth(next) else {
-                self.fans.remove(&seq);
-                continue;
+                // Every hint has it: the relay's copy, once due, while the
+                // dial awaits an answer.
+                match relay_at {
+                    Some(at) if now < at && self.dialling(&peer) => {
+                        if let Some(slot) = waiting.get_mut(passed) {
+                            *slot = Some(seq);
+                            passed += 1;
+                            continue;
+                        }
+                        return None;
+                    }
+                    Some(_) if self.dialling(&peer) => {
+                        let fan = self.fans.remove(&seq)?;
+                        let len = fan.len;
+                        out.get_mut(..len)?.copy_from_slice(fan.bytes.get(..len)?);
+                        return self
+                            .forward_in_place(peer, len, now, policy, entropy, out)
+                            .ok()
+                            .flatten();
+                    }
+                    _ => {
+                        self.fans.remove(&seq);
+                        continue;
+                    }
+                }
             };
             let fan = self.fans.get_mut(&seq)?;
             fan.next += 1;
@@ -1388,7 +1488,7 @@ impl<C: Config> Endpoint<C> {
                 }
                 _ => false,
             };
-            if fan.next >= hints.1 || !sent {
+            if (fan.next >= hints.1 && fan.relay_at.is_none()) || !sent {
                 self.fans.remove(&seq);
             }
             if sent {
@@ -1539,7 +1639,10 @@ impl<C: Config> Endpoint<C> {
                 attempt,
             } => match self.path_of(peer, last_source, attempt, now) {
                 Path::Direct(address) => Some((To::Direct(address), len)),
-                Path::Hints(hints) => self.fan_out(peer, &hints, len, out),
+                Path::Hints(hints) => {
+                    let relay_at = self.relay_copy_at(attempt, now);
+                    self.fan_out(peer, &hints, len, out, relay_at)
+                }
                 Path::RelaySession => Some((To::Relay(self.relay_path(now)), len)),
                 Path::Forward => {
                     let frame_len = self.wrap_forward(peer, len, out).ok()?;
@@ -1626,7 +1729,7 @@ impl<C: Config> Endpoint<C> {
     ) -> Poll {
         // A first contact owed to the next of a peer's hints goes before
         // anything else, so that every hint has it at once.
-        if let Some((to, len)) = self.next_fan(now, out) {
+        if let Some((to, len)) = self.next_fan(now, policy, entropy, out) {
             self.note_sent(to, now);
             return Poll::Transmit { to, len };
         }
