@@ -31,7 +31,7 @@ pub mod tls;
 pub use node::start_with_stream;
 pub use node::{
     Access, Config, Context, ContextEvent, ContextEvents, ContextOptions, DIRECT_PATH_MAX, DROPPED,
-    Delivery, Events, Node, NodeError, NodeEvent, RelayLocation, SocketHandle, SocketHook,
-    StartError, Stats, start, start_with,
+    Delivery, Events, Node, NodeError, NodeEvent, RelayLocation, Resolver, SocketHandle,
+    SocketHook, StartError, Stats, start, start_with,
 };
 pub use receiver::{ELEMENT_COST, Received, Receiver, SessionClosed};

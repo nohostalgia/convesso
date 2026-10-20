@@ -30,8 +30,8 @@ fn a_hinted_peer_is_dialled_directly() {
     assert!(world.clients[1].udp_log.is_empty(), "nothing to the relay");
 }
 
-/// Scenario: a hint that does not answer falls back to the relay: the dial's
-/// next attempt, one second later, goes through it, and the session opens
+/// Scenario: a hint that does not answer falls back to the relay: the same
+/// first contact goes through it 250 ms after the hint, and the session opens
 /// there.
 #[test]
 fn a_hint_that_does_not_answer_falls_back_to_the_relay() {
@@ -56,7 +56,9 @@ fn a_hint_that_does_not_answer_falls_back_to_the_relay() {
         "a dead hint costs {} ms before the relay answers",
         connected - start
     );
-    assert!(connected - start >= 1000 && connected - start <= 1000 + 4 * world.delay);
+    // The relay joins the first attempt 250 ms after the hint, not at the
+    // second attempt, a second in.
+    assert!(connected - start >= 250 && connected - start <= 250 + 4 * world.delay);
 }
 
 /// Scenario: a peer heard through the relay is answered through the relay,
@@ -168,5 +170,69 @@ fn hints_are_bounded() {
         endpoint
             .set_hints(identity(1).peer_id(), &[&[0; 33]], t(9))
             .is_err()
+    );
+}
+
+/// A client whose relay cannot be reached: it refuses the client's link, and
+/// never answers its handshakes.
+fn relay_out_of_reach(world: &mut World<Open>, i: usize) {
+    world.clients[i].tcp_refused = true;
+    world.clients[i].handshakes_ignored = true;
+}
+
+/// Scenario: a hint given mid-dial is used, as an integrator found it: two
+/// peers one hop apart, their relay out of reach, the peer's address learned
+/// 2 s into the dial. The next attempt goes to it at once, and the session
+/// opens then, not after the dial gives up at 15 s.
+#[test]
+fn a_hint_given_mid_dial_is_used() {
+    let mut world = World::new(Open, Config::default(), 2);
+    relay_out_of_reach(&mut world, 0);
+    let start = world.now;
+    world.send(0, 1, b"found you").unwrap();
+    world.run_for(2000);
+    assert!(world.clients[1].datagrams().is_empty(), "no way to B yet");
+    world.hint(0, 1);
+    world.run_for(500);
+    assert_eq!(
+        world.clients[1].datagrams(),
+        vec![(b"found you".to_vec(), false)]
+    );
+    let connected = world
+        .when(0, &Ev::Connected(world.clients[1].peer_id()))
+        .unwrap();
+    assert!(
+        connected - start < 2000 + 4 * world.delay.max(1),
+        "{}",
+        connected - start
+    );
+}
+
+/// Scenario: an unreachable relay does not take the hints' attempts: the
+/// first contact to the hint is lost, the relay is out of reach, and the next
+/// attempt, a second in, goes to the hint again and opens the session.
+#[test]
+fn an_unreachable_relay_does_not_take_the_hints_attempts() {
+    let mut world = World::new(Open, Config::default(), 2);
+    relay_out_of_reach(&mut world, 0);
+    world.hint(0, 1);
+    // The first attempt's packet to the hint is lost.
+    world.direct = false;
+    let start = world.now;
+    world.send(0, 1, b"second time lucky").unwrap();
+    world.run_for(500);
+    world.direct = true;
+    world.run_for(1500);
+    assert_eq!(
+        world.clients[1].datagrams(),
+        vec![(b"second time lucky".to_vec(), false)]
+    );
+    let connected = world
+        .when(0, &Ev::Connected(world.clients[1].peer_id()))
+        .unwrap();
+    assert!(
+        (1000..1500).contains(&(connected - start)),
+        "{}",
+        connected - start
     );
 }

@@ -19,6 +19,8 @@
 //! gives it again at each step, so that a retry carries it under a fresh
 //! ephemeral key without the dial holding a buffer.
 
+use core::time::Duration;
+
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroize;
 
@@ -163,6 +165,9 @@ pub struct Dial {
     sent: usize,
     over: bool,
     cookie: Option<(Cookie, Instant)>,
+    /// The next attempt is due at this instant instead of at its offset: the
+    /// peer was given new address hints (`PROTOCOL.md §3`).
+    hurry: Option<Instant>,
 }
 
 impl Dial {
@@ -223,6 +228,7 @@ impl Dial {
             sent: 0,
             over: false,
             cookie: None,
+            hurry: None,
         };
         let len = dial.send_attempt(identity, payload, now, entropy, out);
         Ok((dial, len))
@@ -255,7 +261,7 @@ impl Dial {
             return DialPoll::Failed(DialError::NoResponse);
         }
         if let Some(offset) = ATTEMPT_OFFSETS.get(self.sent) {
-            let due = self.started.saturating_add(*offset);
+            let due = self.attempt_due(*offset);
             if now >= due {
                 return match self.send_attempt(identity, payload, now, entropy, out) {
                     0 => DialPoll::Wait(give_up),
@@ -391,6 +397,7 @@ impl Dial {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> usize {
+        self.hurry = None;
         let fits =
             payload.len() <= MAX_PAYLOAD && out.len() >= super::FIRST_CONTACT_LEN + payload.len();
         let payload = if fits { payload } else { &[] };
@@ -473,9 +480,27 @@ impl Dial {
             return None;
         }
         let give_up = self.started.saturating_add(GIVE_UP_AFTER);
-        Some(ATTEMPT_OFFSETS.get(self.sent).map_or(give_up, |offset| {
-            self.started.saturating_add(*offset).min(give_up)
-        }))
+        Some(
+            ATTEMPT_OFFSETS
+                .get(self.sent)
+                .map_or(give_up, |offset| self.attempt_due(*offset).min(give_up)),
+        )
+    }
+
+    /// Sends the next attempt at `now` rather than at its offset: the peer has
+    /// new address hints, which the attempt will reach. The attempts after it
+    /// keep their offsets; a dial with its four attempts sent sends nothing
+    /// more.
+    pub(crate) fn hurry(&mut self, now: Instant) {
+        if !self.over && self.sent > 0 && self.sent < ATTEMPT_OFFSETS.len() {
+            self.hurry = Some(now);
+        }
+    }
+
+    /// When the attempt at `offset` is due: then, or sooner when hurried.
+    fn attempt_due(&self, offset: Duration) -> Instant {
+        let due = self.started.saturating_add(offset);
+        self.hurry.map_or(due, |hurry| hurry.min(due))
     }
 
     /// Whether one of this dial's attempts carried `mac1`: what a "version not

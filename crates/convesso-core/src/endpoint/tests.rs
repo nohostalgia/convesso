@@ -2807,8 +2807,8 @@ fn every_hint_is_tried_at_once() {
 }
 
 /// Scenario: a hint that does not answer falls back to the relay: the first
-/// attempt goes to every hint, the second, one second later, through the
-/// relay.
+/// attempt goes to every hint, and through the relay 250 ms later; the second,
+/// one second in, to every hint and through the relay together.
 #[test]
 fn a_dial_falls_back_from_every_hint_to_the_relay() {
     let mut a = Dialler::new(1);
@@ -2822,17 +2822,68 @@ fn a_dial_falls_back_from_every_hint_to_the_relay() {
         .unwrap();
     let (first_to, _) = a.connect(0, 0);
     assert_eq!(first_to, direct(&h1));
-    let at_once = a.drain(0);
-    assert_eq!(
-        at_once.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
-        vec![direct(&h2)]
-    );
-    let later = a.drain(1000);
-    assert!(!later.is_empty());
+    let to = |sent: Vec<(To, Vec<u8>)>| sent.into_iter().map(|(to, _)| to).collect::<Vec<_>>();
+    assert_eq!(to(a.drain(0)), vec![direct(&h2)]);
+    assert_eq!(to(a.drain(249)), Vec::new(), "the relay waits");
+    let relayed = to(a.drain(250));
+    assert_eq!(relayed.len(), 1, "{relayed:?}");
+    assert!(matches!(relayed[0], To::Relay(_)), "{relayed:?}");
+    // The second attempt goes to every hint again. Its copy for the relay
+    // waits here behind the relay session, which opens with the first copy
+    // and has no relay to answer it; the simulator, with one, sees it go.
+    let second = to(a.drain(1000));
     assert!(
-        later.iter().all(|(to, _)| matches!(to, To::Relay(_))),
-        "the second attempt goes through the relay: {later:?}"
+        second.contains(&direct(&h1)) && second.contains(&direct(&h2)),
+        "{second:?}"
     );
+}
+
+/// A dial whose peer has no hint goes through the relay alone, from its first
+/// attempt.
+#[test]
+fn a_dial_without_hints_goes_through_the_relay_alone() {
+    let mut a = Dialler::new(1);
+    a.endpoint
+        .pin_relay(*identity(4).address(), Instant::from_millis(0))
+        .unwrap();
+    let (first_to, _) = a.connect(0, 0);
+    assert!(matches!(first_to, To::Relay(_)), "{first_to:?}");
+    for at in [0, 250, 1000] {
+        assert!(
+            a.drain(at).iter().all(|(to, _)| matches!(to, To::Relay(_))),
+            "at {at} ms"
+        );
+    }
+}
+
+/// Scenario: new hints bring the next attempt forward: given at 2 s, they get
+/// the third attempt then; the fourth stays at 7 s, and no fifth comes.
+#[test]
+fn new_hints_bring_the_next_attempt_forward() {
+    let mut a = Dialler::new(1);
+    let b_peer = identity(0).peer_id();
+    let (h1, h2) = ([10, 0, 0, 7, 0, 1], [10, 0, 0, 8, 0, 1]);
+    a.endpoint
+        .set_hints(b_peer, &[h1], Instant::from_millis(0))
+        .unwrap();
+    let _ = a.connect(0, 0);
+    let _ = a.drain(0);
+    assert_eq!(a.drain(1000).len(), 1, "the second attempt, to h1");
+    a.endpoint
+        .set_hints(b_peer, &[h2], Instant::from_millis(2000))
+        .unwrap();
+    let at_two = a.drain(2000);
+    assert_eq!(
+        at_two.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
+        vec![direct(&h2)],
+        "the third attempt, now"
+    );
+    assert_eq!(a.drain(3000).len(), 0, "not again at 3 s");
+    assert_eq!(a.drain(7000).len(), 1, "the fourth at 7 s");
+    a.endpoint
+        .set_hints(b_peer, &[h1], Instant::from_millis(8000))
+        .unwrap();
+    assert_eq!(a.drain(8000).len(), 0, "no fifth attempt");
 }
 
 /// Scenario: without a relay every attempt goes to every hint, until the

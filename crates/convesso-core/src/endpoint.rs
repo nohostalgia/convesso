@@ -41,8 +41,8 @@ mod relayed;
 pub use direct::ExcludeError;
 pub use relayed::{
     ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintError, HintTooLong, KeepAliveTooShort,
-    LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RelayError, RelayPath,
-    UDP_PROBE_EVERY, UDP_PROVEN_FOR,
+    LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RELAY_AFTER_HINTS, RelayError,
+    RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
 };
 use relayed::{Answer, RelayClient};
 
@@ -1721,6 +1721,9 @@ impl<C: Config> Endpoint<C> {
             }
         });
         if let Some(due) = self.relay.as_ref().and_then(RelayClient::next_due) {
+            consider(due);
+        }
+        if let Some(due) = self.fan_deadline() {
             consider(due);
         }
         next

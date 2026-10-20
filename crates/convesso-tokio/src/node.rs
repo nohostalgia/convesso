@@ -32,7 +32,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant as Clock;
+use std::time::{Duration, Instant as Clock};
 
 use convesso_core::dos::Source;
 use convesso_core::endpoint::{
@@ -129,6 +129,28 @@ pub type SocketHandle = std::os::windows::io::RawSocket;
 /// stays out of the tunnel it carries. It must not block.
 pub type SocketHook = Arc<dyn Fn(SocketHandle) -> std::io::Result<()> + Send + Sync>;
 
+/// Resolves a relay's `host:port` to its addresses, in place of the system's
+/// resolver: for tests, which cannot make a name resolve late otherwise.
+#[doc(hidden)]
+pub type Resolver = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The relay's UDP addresses, as resolved: the one used, and one in the
+/// other family.
+type RelayAddresses = (SocketAddr, Option<SocketAddr>);
+
+/// The first wait before resolving the relay's host again, after a failure;
+/// it doubles up to [`RESOLVE_BACKOFF_CAP`].
+const RESOLVE_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait between two resolutions of the relay's host that failed:
+/// at most one query a minute while packets go to a relay whose name does not
+/// resolve, none at rest.
+const RESOLVE_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
 /// How to start a node. It serves no context until the application opens
 /// one with [`Node::context`].
 pub struct Config {
@@ -141,6 +163,9 @@ pub struct Config {
     pub events: usize,
     /// Given every socket the node opens, before it is used.
     pub socket_hook: Option<SocketHook>,
+    /// How the relay's host is resolved: the system's resolver when `None`.
+    #[doc(hidden)]
+    pub resolver: Option<Resolver>,
 }
 
 impl Default for Config {
@@ -150,6 +175,7 @@ impl Default for Config {
             relay: None,
             events: 64,
             socket_hook: None,
+            resolver: None,
         }
     }
 }
@@ -238,8 +264,6 @@ pub enum StartError {
     Bind(std::io::Error),
     /// The socket hook refused the UDP socket.
     Hook(std::io::Error),
-    /// The relay's host could not be resolved.
-    Resolve(std::io::Error),
     /// The relay asks for TLS, and this build has no feature `tls`.
     NoTls,
     /// The core refused the configuration.
@@ -252,7 +276,6 @@ impl std::fmt::Display for StartError {
             Self::Entropy(error) => error.fmt(f),
             Self::Bind(error) => write!(f, "binding the UDP socket: {error}"),
             Self::Hook(error) => write!(f, "the socket hook: {error}"),
-            Self::Resolve(error) => write!(f, "resolving the relay: {error}"),
             Self::NoTls => {
                 f.write_str("the relay asks for TLS, and this build has no feature `tls`")
             }
@@ -272,8 +295,6 @@ pub enum NodeError {
     Hint(HintError),
     /// The relay could not be pinned, with the core's named error.
     Relay(ResponderError),
-    /// The new relay's host could not be resolved.
-    Resolve(std::io::ErrorKind),
     /// The new relay asks for TLS, and this build has no feature `tls`.
     NoTls,
     /// The prefix could not be excluded, with the core's named error.
@@ -310,7 +331,6 @@ impl std::fmt::Display for NodeError {
             Self::Send(error) => error.fmt(f),
             Self::Hint(error) => error.fmt(f),
             Self::Relay(error) => write!(f, "the relay: {error}"),
-            Self::Resolve(kind) => write!(f, "resolving the relay's host: {kind}"),
             Self::NoTls => {
                 f.write_str("the relay asks for TLS, and this build has no feature `tls`")
             }
@@ -510,9 +530,8 @@ enum Command {
     SendMessage(Parked),
 }
 
-/// A relay and the UDP addresses its host resolved to: the one the node uses,
-/// and one in the other family.
-type Resolved = (RelayLocation, SocketAddr, Option<SocketAddr>);
+/// A relay and the UDP addresses its host resolved to, if it did.
+type Resolved = (RelayLocation, Option<RelayAddresses>);
 
 /// Wakes the task when the application reads an event stream while something
 /// waits for room in one.
@@ -540,6 +559,7 @@ pub struct Node {
     local: SocketAddr,
     address: Address,
     dual_stack: bool,
+    resolver: Option<Resolver>,
 }
 
 /// The node's own events, in order.
@@ -727,17 +747,17 @@ impl Node {
     /// # Errors
     ///
     /// [`NodeError::NoTls`] for TLS asked for without the feature,
-    /// [`NodeError::Resolve`] for a host that does not resolve,
     /// [`NodeError::Relay`] with the core's error, or [`NodeError::Stopped`];
-    /// the old relay then stays.
+    /// the old relay then stays. A host that does not resolve yet is no
+    /// error: it is resolved again when the relay is needed.
     pub async fn set_relay(&self, relay: Option<RelayLocation>) -> Result<(), NodeError> {
         let resolved = match relay {
             Some(relay) if !relay.supported() => return Err(NodeError::NoTls),
             Some(relay) => {
-                let (at, other) = resolve(&relay.host, self.dual_stack)
+                let addresses = resolve(self.resolver.as_ref(), &relay.host, self.dual_stack)
                     .await
-                    .map_err(|error| NodeError::Resolve(error.kind()))?;
-                Some((relay, at, other))
+                    .ok();
+                Some((relay, addresses))
             }
             None => None,
         };
@@ -1076,11 +1096,11 @@ async fn build<E: SystemEntropy, C: Profile>(
             endpoint
                 .pin_relay(relay.address, Instant::from_millis(0))
                 .map_err(StartError::Core)?;
-            Some(
-                resolve(&relay.host, dual_stack)
-                    .await
-                    .map_err(StartError::Resolve)?,
-            )
+            // A host that does not resolve yet is resolved again when the
+            // relay is needed: the node runs meanwhile, on its other paths.
+            resolve(config.resolver.as_ref(), &relay.host, dual_stack)
+                .await
+                .ok()
         }
         None => None,
     };
@@ -1104,6 +1124,10 @@ async fn build<E: SystemEntropy, C: Profile>(
         relay_other: relay_udp.and_then(|(_, other)| other),
         link: None,
         connecting: None,
+        resolver: config.resolver.clone(),
+        resolving: None,
+        resolve_backoff: RESOLVE_BACKOFF_FIRST,
+        resolve_not_before: None,
         events: events_tx,
         held: VecDeque::new(),
         room: room.clone(),
@@ -1134,6 +1158,7 @@ async fn build<E: SystemEntropy, C: Profile>(
             local,
             address,
             dual_stack,
+            resolver: config.resolver.take(),
         },
         Events { events, room },
     ))
@@ -1220,10 +1245,14 @@ const UDP_SEND_BUFFER: usize = 1 << 20;
 /// The relay's UDP addresses: the first the system resolves, which the node
 /// uses, and the first in the other family, if the socket can reach it.
 async fn resolve(
+    resolver: Option<&Resolver>,
     host: &str,
     dual_stack: bool,
-) -> std::io::Result<(SocketAddr, Option<SocketAddr>)> {
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host(host).await?.collect();
+) -> std::io::Result<RelayAddresses> {
+    let addresses: Vec<SocketAddr> = match resolver {
+        Some(resolver) => resolver(host.to_owned()).await?,
+        None => tokio::net::lookup_host(host).await?.collect(),
+    };
     pick(&addresses, dual_stack)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for the host"))
 }
@@ -1525,6 +1554,13 @@ struct Task<E, C: Profile> {
     relay_other: Option<SocketAddr>,
     link: Option<LinkIo>,
     connecting: Option<Connecting>,
+    resolver: Option<Resolver>,
+    /// Resolving the relay's host for its UDP address, which the node lacks.
+    resolving: Option<Resolving>,
+    /// The wait before the next resolution, after one that failed.
+    resolve_backoff: Duration,
+    /// No resolution starts before this instant.
+    resolve_not_before: Option<Instant>,
     /// The node's events, and those waiting aside for room, one per kind.
     events: mpsc::Sender<NodeEvent>,
     held: VecDeque<(NodeKind, NodeEvent)>,
@@ -1571,6 +1607,8 @@ enum Wake {
     Udp(std::io::Result<(usize, SocketAddr)>),
     Link(std::io::Result<usize>),
     Connected(std::io::Result<Linked>),
+    /// The relay's host resolved, or did not: the host asked, and the answer.
+    Resolved(String, std::io::Result<RelayAddresses>),
     Command(Option<Command>),
     /// A context's handle was dropped, or closed.
     CloseContext(Option<(Name, u16)>),
@@ -1658,6 +1696,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                     r = self.udp.recv_from(&mut self.rx) => Wake::Udp(r),
                     r = read_link(&mut self.link, &mut self.link_rx), if self.link.is_some() => Wake::Link(r),
                     r = poll_connecting(&mut self.connecting), if self.connecting.is_some() => Wake::Connected(r),
+                    (host, r) = poll_resolving(&mut self.resolving), if self.resolving.is_some() => Wake::Resolved(host, r),
                     c = self.commands.recv() => Wake::Command(c),
                     c = self.closes.recv() => Wake::CloseContext(c),
                     () = &mut sleep, if armed.is_some() => Wake::Deadline,
@@ -1675,6 +1714,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 }
                 Wake::Link(Ok(len)) => self.link_bytes(len).await,
                 Wake::Connected(result) => self.connected(result).await,
+                Wake::Resolved(host, result) => self.resolved(&host, result),
                 Wake::Command(None) => {
                     // The last handle is gone: the contexts it closed close
                     // first, their closes sent.
@@ -2556,14 +2596,19 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         if moved {
             self.connecting = None;
             self.link = None;
+            self.resolving = None;
+            self.resolve_backoff = RESOLVE_BACKOFF_FIRST;
+            self.resolve_not_before = None;
         }
         match relay {
-            Some((location, at, other)) => {
+            Some((location, addresses)) => {
                 if moved {
-                    self.relay_udp = Some(at);
-                    self.relay_other = other;
-                    self.endpoint
-                        .set_relay_families(at.is_ipv6(), other.is_some());
+                    self.relay_udp = addresses.map(|(at, _)| at);
+                    self.relay_other = addresses.and_then(|(_, other)| other);
+                    if let Some((at, other)) = addresses {
+                        self.endpoint
+                            .set_relay_families(at.is_ipv6(), other.is_some());
+                    }
                 }
                 self.relay = Some(location);
             }
@@ -2574,6 +2619,55 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             }
         }
         Ok(())
+    }
+
+    /// Starts resolving the relay's host, for a packet to it over UDP that has
+    /// no address to go to: unless a resolution runs, or the backoff after
+    /// one that failed has not elapsed. The packet itself is lost, as on any
+    /// network; the core sends again what needs it.
+    fn resolve_relay(&mut self) {
+        let now = self.now();
+        if self.resolving.is_some() || self.resolve_not_before.is_some_and(|at| now < at) {
+            return;
+        }
+        let Some(relay) = self.relay.clone() else {
+            return;
+        };
+        let resolver = self.resolver.clone();
+        let dual_stack = self.dual_stack;
+        self.resolving = Some(Box::pin(async move {
+            let result = resolve(resolver.as_ref(), &relay.host, dual_stack).await;
+            (relay.host, result)
+        }));
+    }
+
+    /// The relay's host resolved, or did not. An answer for a relay no longer
+    /// pinned is dropped.
+    fn resolved(&mut self, host: &str, result: std::io::Result<RelayAddresses>) {
+        self.resolving = None;
+        if self.relay.as_ref().is_none_or(|relay| relay.host != host) {
+            return;
+        }
+        match result {
+            Ok((at, other)) => {
+                self.resolve_backoff = RESOLVE_BACKOFF_FIRST;
+                self.resolve_not_before = None;
+                if self.relay_udp.is_none() {
+                    self.relay_udp = Some(at);
+                    self.relay_other = other;
+                    self.endpoint
+                        .set_relay_families(at.is_ipv6(), other.is_some());
+                }
+            }
+            Err(_) => {
+                let now = self.now();
+                self.resolve_not_before = Some(now.saturating_add(self.resolve_backoff));
+                self.resolve_backoff = self
+                    .resolve_backoff
+                    .saturating_mul(2)
+                    .min(RESOLVE_BACKOFF_CAP);
+            }
+        }
     }
 
     /// Reports the interfaces' addresses to the core.
@@ -2590,8 +2684,9 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
         };
         let dual_stack = self.dual_stack;
         let hook = self.hook.clone();
+        let resolver = self.resolver.clone();
         self.connecting = Some(Box::pin(async move {
-            let (at, other) = resolve(&relay.host, dual_stack).await?;
+            let (at, other) = resolve(resolver.as_ref(), &relay.host, dual_stack).await?;
             let socket = if at.is_ipv4() {
                 TcpSocket::new_v4()?
             } else {
@@ -2672,6 +2767,10 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 self.emit(context, event);
             }
             Owned::Transmit { to, len } => {
+                // A packet for the relay over UDP, with no address for it: the
+                // relay's host is resolved again, once this one is gone.
+                let resolve = matches!(to, To::Relay(path) if !matches!(path, RelayPath::Tcp))
+                    && self.relay_udp.is_none();
                 let Some(packet) = self.out.get(..len) else {
                     return;
                 };
@@ -2721,6 +2820,9 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                         self.stats.keepalives_sent += 1;
                         write_link(&mut self.link, &mut self.stats, &KEEPALIVE).await;
                     }
+                }
+                if resolve {
+                    self.resolve_relay();
                 }
             }
         }
@@ -2787,6 +2889,18 @@ async fn wrap(stream: TcpStream, relay: &RelayLocation) -> std::io::Result<Box<d
     }
     let _ = relay;
     Ok(Box::new(stream))
+}
+
+/// A resolution of the relay's host under way: the host, and its answer.
+type Resolving = Pin<Box<dyn Future<Output = (String, std::io::Result<RelayAddresses>)> + Send>>;
+
+async fn poll_resolving(
+    resolving: &mut Option<Resolving>,
+) -> (String, std::io::Result<RelayAddresses>) {
+    match resolving {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn poll_connecting(connecting: &mut Option<Connecting>) -> std::io::Result<Linked> {

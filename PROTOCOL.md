@@ -125,7 +125,9 @@ are the same length. Codes `0x0001` (capacity exhausted) and `0x0002` (busy) are
 - **The responder's result is pending** for 5 seconds. It becomes a session when the initiator's
   first transport packet arrives (§5), so a replayed first contact never displaces a session.
 - **Retries.** An initiator sends a new first contact, with a fresh ephemeral key, 1, 3 and 7
-  seconds after the first, and gives up at 15 seconds.
+  seconds after the first, and gives up at 15 seconds. When the application gives the peer new
+  address hints during a dial, the next of these is sent at once; never more than four, nor any
+  after 15 seconds.
 - **Channel binding.** Both sides expose the Noise handshake hash, 32 bytes, equal at both ends
   and different for every handshake.
 
@@ -303,9 +305,11 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
    arrives after a newer one, late or reordered, does not move the session. After this
    endpoint's network changes, a direct source heard before is no longer used while a relay is
    pinned: the packets take the relay until the peer is heard again (§7);
-4. with nothing heard yet: a dial's first attempt goes at once to every address hint the
-   application gave (up to 8 per peer), and its later attempts to the relay; with no relay, every
-   attempt goes to every hint; everything else goes through the relay;
+4. with nothing heard yet: every attempt of a dial goes at once to every address hint the
+   application gave (up to 8 per peer), as they are at that attempt. With a relay, the first
+   attempt also goes through it 250 milliseconds later, if no answer has come by then, and every
+   later attempt goes through it together with the hints. A peer with no hint is dialled through
+   the relay alone; everything else goes through the relay;
 5. with neither a hint nor a relay, the send fails with a "no path" error.
 
 An answer goes back the way the packet came.

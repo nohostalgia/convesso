@@ -6,25 +6,25 @@
 # diff, so the growth is seen in review.
 
 ["thumbv7em-none-eabihf"]
-flash = 90844
+flash = 92340
 ram = 0
 
 ["riscv32imc-unknown-none-elf"]
-flash = 117132
+flash = 118968
 ram = 0
 
 ["reference-embassy/thumbv7em-none-eabihf"]
-flash = 122352
-ram = 60320
+flash = 123584
+ram = 62792
 
 ["reference-embassy/riscv32imc-unknown-none-elf"]
-flash = 159348
-ram = 60308
+flash = 160268
+ram = 62780
 
 ["reference-stream/thumbv7em-none-eabihf"]
-flash = 145184
-ram = 85336
+flash = 146268
+ram = 87808
 
 ["reference-stream/riscv32imc-unknown-none-elf"]
-flash = 187700
-ram = 85324
+flash = 189736
+ram = 87796
