@@ -103,6 +103,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
+        # About 7 minutes: a test that hangs fails the job here, with its log,
+        # rather than holding it for GitHub's six hours.
+        timeout-minutes: 20
         run: cargo test --workspace --all-features
       - name: Dependency policy (advisories, minimum versions, sources)
         if: needs.changes.outputs.full == 'true' || needs.changes.outputs.deps == 'true'

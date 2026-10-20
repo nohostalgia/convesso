@@ -22,9 +22,9 @@ flash = 161212
 ram = 62780
 
 ["reference-stream/thumbv7em-none-eabihf"]
-flash = 146268
+flash = 147004
 ram = 87808
 
 ["reference-stream/riscv32imc-unknown-none-elf"]
-flash = 189736
+flash = 190624
 ram = 87796
