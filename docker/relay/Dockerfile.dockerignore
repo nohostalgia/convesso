@@ -2,6 +2,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!LICENSE
 !crates/
 !docker/relay/relay.toml
 crates/*/target

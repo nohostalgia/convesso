@@ -1,13 +1,12 @@
-# Dependency policy, checked with `cargo deny check advisories bans sources`.
+# Dependency policy, checked with `cargo deny check advisories bans licenses sources`.
 #
 # The cryptographic-crate rule of DESIGN.md §3 says each crate is held at
 # or above a minimum version that excludes its known advisories. `advisories`
 # refuses any crate with a published advisory; `bans.deny` states the minimums
 # explicitly, so a minimum survives even if an advisory were withdrawn.
 #
-# Licences are not checked yet: the project's own licence is still to be chosen.
-# When they are, the feature `tls` of convesso-tokio needs ISC beside MIT and
-# Apache-2.0: ring is Apache-2.0 AND ISC, rustls-webpki and untrusted are ISC.
+# `licenses` keeps every crate in the tree under a licence that lets convesso
+# ship under the AGPL-3.0-or-later.
 
 [graph]
 targets = [
@@ -23,6 +22,25 @@ all-features = true
 # thing that must block.
 unmaintained = "workspace"
 yanked = "deny"
+
+[licenses]
+# Licences compatible with shipping convesso under the AGPL-3.0-or-later, and
+# nothing that is not in the tree: a licence nobody uses is not on this list.
+# Most crates are dual-licensed, and one acceptable option is enough.
+allow = [
+    # smoltcp and managed, under the embedded driver.
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    # The dalek crates, subtle and if-addrs.
+    "BSD-3-Clause",
+    # ring (Apache-2.0 AND ISC), rustls and rustls-webpki: the feature `tls`.
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"

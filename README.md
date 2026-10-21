@@ -1,4 +1,7 @@
-# convesso
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.png">
+  <img alt="convesso" src=".github/assets/banner-light.png">
+</picture>
 
 Encrypted connections between two devices that know each other's public key.
 
@@ -15,7 +18,7 @@ The name is Italian for *convex*: a set where the straight line between any two 
 inside it.
 
 > **Status:** early. The protocol is version 1 and has not been audited yet; an external audit is
-> planned before 1.0. The crates are not published, and the licence is not chosen yet.
+> planned before 1.0. The crates are not published yet.
 
 ## The crates
 
@@ -92,3 +95,18 @@ under QEMU, checks flash and RAM against `footprint-budget.toml`, and runs every
 ## Security
 
 See [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the [CLA](CLA.md).
+
+## Licence
+
+convesso is free software under the [GNU Affero General Public License v3.0 or later](LICENSE).
+
+In plain words: use it, change it, and run it on your own devices and servers as much as you like.
+If you distribute a program built with convesso, or let other people use a modified version of it
+over a network, you have to offer them its source under the same licence.
+
+If that doesn't work for what you're building, a commercial licence is possible. Open a
+[discussion](https://github.com/nohostalgia/convesso/discussions) and say what you have in mind.

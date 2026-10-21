@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "The convesso driver for microcontrollers, on Embassy: sockets, timers and the chip's generator around the sans-IO core. No allocator."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [features]

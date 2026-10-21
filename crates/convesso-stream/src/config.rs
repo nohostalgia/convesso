@@ -182,9 +182,9 @@ impl Mcu {
 
 crate::__fixed_stream_config!(Mcu);
 
-/// The server configuration: messages up to 262,144 bytes (peerfectly's
-/// largest payload), buffers that grow to twice that per channel and are
-/// released when they empty. Only with the `alloc` feature.
+/// The server configuration: messages up to 262,144 bytes (256 KiB), buffers
+/// that grow to twice that per channel and are released when they empty. Only
+/// with the `alloc` feature.
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Server;

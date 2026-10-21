@@ -6,6 +6,8 @@ exclude = ["firmware", "fuzz"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/nohostalgia/convesso"
 
 # Chosen under the crate rule of DESIGN.md §3, declared once so that the
 # core and the vectors that check it use exactly the same versions and features.
