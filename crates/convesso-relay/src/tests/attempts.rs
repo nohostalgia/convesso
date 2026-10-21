@@ -231,7 +231,7 @@ fn a_restricted_cone_lets_a_symmetric_peer_through() {
 }
 
 /// Scenario: a path taken from the peer's packets follows a peer that moved,
-/// as peerfectly found it: two devices on one LAN, the session dialled at a
+/// as an integrator found it: two devices on one LAN, the session dialled at a
 /// hint, its path taken from the packets and never probed. B leaves the LAN
 /// for another network; every datagram A sends after B's first packet from
 /// there arrives, through the relay, where A trusted B's LAN address for 15 s

@@ -107,11 +107,39 @@ jobs:
         # rather than holding it for GitHub's six hours.
         timeout-minutes: 20
         run: cargo test --workspace --all-features
-      - name: Dependency policy (advisories, minimum versions, sources)
+      - name: Dependency policy (advisories, minimum versions, licences, sources)
         if: needs.changes.outputs.full == 'true' || needs.changes.outputs.deps == 'true'
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans sources
+          command: check advisories bans licenses sources
+
+  # No secret in the tree, nor in the commits a pull request adds: gitleaks, at
+  # a pinned image. A run by hand or by schedule walks the whole history.
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          # The history the commit scan walks.
+          fetch-depth: 0
+      - name: The tree as it stands
+        run: docker run --rm -v "$PWD:/repo" "$GITLEAKS" dir /repo --redact --no-banner
+      # A secret added in one commit and removed in the next is gone from the
+      # tree and still in the history.
+      - name: The commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ]; then
+            range="$HEAD"
+          else
+            range="$BASE..$HEAD"
+          fi
+          docker run --rm -v "$PWD:/repo" "$GITLEAKS" git /repo --log-opts="$range" --redact --no-banner
 
   # Embedded targets: the core builds without an allocator, a core that needs
   # one is refused, the primitives reproduce their vectors under QEMU, and the

@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "The convesso relay server: forwards opaque packets between authenticated keys. Sans-IO."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]

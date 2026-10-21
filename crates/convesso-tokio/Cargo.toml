@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "The convesso driver for tokio: sockets, timers and the OS generator around the sans-IO core, and the relay server."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [features]

@@ -14,10 +14,15 @@ COPY crates ./crates
 RUN cargo build --release --locked -p convesso-tokio --features relay-bin --bin convesso-relay
 
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.title="convesso-relay" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.source="https://github.com/nohostalgia/convesso"
 RUN useradd --system --uid 10001 --home-dir /data relay \
     && mkdir /data && chown relay /data
 COPY --from=build /src/target/release/convesso-relay /usr/local/bin/convesso-relay
 COPY docker/relay/relay.toml /etc/convesso/relay.toml
+# The licence travels with the binary.
+COPY LICENSE /usr/share/doc/convesso-relay/LICENSE
 USER relay
 VOLUME /data
 EXPOSE 7400/udp 7400/tcp

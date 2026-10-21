@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "The convesso protocol core: no_std, no allocator, sans-IO."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [features]

@@ -1,0 +1,10 @@
+# gitleaks, as the CI runs it: the default rules, less the test vectors.
+
+[extend]
+useDefault = true
+
+# The test vectors fix the bytes of PROTOCOL.md §9 from keys published on
+# purpose, so that anyone can reproduce them. They secure nothing.
+[[allowlists]]
+description = "the published test vectors"
+paths = ['''(^|/)crates/convesso-core/vectors/[^/]+\.json$''']

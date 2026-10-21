@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "The official test vectors of convesso's cryptographic primitives, runnable on every target."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]

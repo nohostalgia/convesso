@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "Optional reliable messages over convesso sessions: no_std, no allocator required, sans-IO."
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [features]
