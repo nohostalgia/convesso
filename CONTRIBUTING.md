@@ -75,7 +75,8 @@ string that looks like a secret and isn't takes an inline `gitleaks:allow` comme
 
 ## What a good pull request looks like here
 
-- **One change, explained.** Say in the title and description what changed and why.
+- **One change, explained.** Pull requests are squash-merged, so the title and description become
+  the commit message. Say what changed and why.
 - **Tests for behaviour.** If it changes what the library does, a test should fail without it.
 - **Comments say why.** The code around you explains the reasons for its decisions, and yours
   should too. A comment that leans on the design cites `DESIGN.md §N` or `PROTOCOL.md §N`, and
