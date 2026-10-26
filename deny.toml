@@ -50,6 +50,7 @@ deny = [
     { name = "blake2", version = "<0.8.1", reason = "RUSTSEC-2019-0019: HMAC-BLAKE2 computed with the wrong block size" },
     { name = "ed25519-dalek", version = "<2.0.0", reason = "RUSTSEC-2022-0093: the double public key signing function oracle" },
     { name = "snow", version = "<0.9.5", reason = "RUSTSEC-2024-0011: unauthenticated payloads could advance the nonce" },
+    { name = "ctutils", version = "<0.4.4", reason = "RUSTSEC-2026-0385: branches in mask generation, and in u128 comparisons on 32-bit targets" },
 ]
 
 [sources]

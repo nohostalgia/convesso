@@ -29,7 +29,7 @@ convesso-stream = { path = "../convesso-stream", version = "0.0.0", features = [
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"], optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 socket2 = "0.6.5"
-tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
 toml = { version = "1.1.8", optional = true }
 
@@ -39,7 +39,7 @@ toml = { version = "1.1.8", optional = true }
 # committed and nothing of TLS is built without the feature.
 ed25519-dalek.workspace = true
 convesso-embassy = { path = "../convesso-embassy", version = "0.0.0" }
-tokio = { version = "1.53.2", features = ["io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { version = "1.53.3", features = ["io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [[bin]]
 name = "convesso-relay"

@@ -45,7 +45,7 @@ embassy-time = { version = "0.5.1", features = ["std", "generic-queue-64"] }
 convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc"] }
 convesso-relay = { path = "../convesso-relay", version = "0.0.0" }
 proptest.workspace = true
-tokio = { version = "1.53.2", features = ["macros", "rt", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "rt", "time"] }
 embedded-io-async = "0.7.0"
 serde_json.workspace = true
 
