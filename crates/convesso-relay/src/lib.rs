@@ -33,8 +33,7 @@ use std::time::Duration;
 use convesso_core::dos::Source;
 use convesso_core::endpoint::{Endpoint, Event, Output, Poll, Target, To};
 use convesso_core::handshake::{
-    Admission, Decision, Entropy, RefusalCode, ResponderError, messages::TYPE_INITIATION,
-    messages::TYPE_INITIATION_PAYLOAD,
+    Admission, Decision, Entropy, RefusalCode, ResponderError, messages::is_first_contact_type,
 };
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::relay::framing::{self, Deframed, Deframer, PREAMBLE};
@@ -431,7 +430,7 @@ pub struct Relay<P, E> {
 fn is_first_contact(packet: &[u8]) -> bool {
     matches!(
         packet,
-        [0x01, TYPE_INITIATION | TYPE_INITIATION_PAYLOAD, ..]
+        [0x01, kind, ..] if is_first_contact_type(*kind)
     )
 }
 

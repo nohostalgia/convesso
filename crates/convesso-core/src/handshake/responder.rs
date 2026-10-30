@@ -104,6 +104,19 @@ pub struct Served {
 
 impl core::error::Error for ResponderError {}
 
+/// Where this side stands with the initiator of a first contact, in its
+/// context, as the endpoint knows it (`PROTOCOL.md §3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// No live keys: a renewal is answered `02 00 00`.
+    NoKeys,
+    /// Live keys: a renewal renews them.
+    LiveKeys,
+    /// This side's own opening to the peer crossed this one, and wins: the
+    /// first contact is met with silence, and the peer's dial yields.
+    Ignore,
+}
+
 /// What a responder does with a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponderOutput {
@@ -136,6 +149,7 @@ pub struct Pending {
     expires_at: Instant,
     accepted: u64,
     completed: Completed,
+    opens: bool,
 }
 
 impl Pending {
@@ -173,6 +187,14 @@ impl Pending {
     #[must_use]
     pub const fn channel_binding(&self) -> &ChannelBinding {
         &self.completed.handshake_hash
+    }
+
+    /// Whether the handshake opens a session, rather than renew one: as the
+    /// initiator said, or as this responder answered a renewal it had no
+    /// keys for (`02 00 00`).
+    #[must_use]
+    pub const fn opens(&self) -> bool {
+        self.opens
     }
 
     #[cfg(test)]
@@ -357,9 +379,33 @@ impl<C: Config> Responder<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> ResponderOutput {
+        let standing = |_: &PeerId, _: &Context, _: bool| Standing::NoKeys;
+        self.handle_with(packet, source, now, admission, standing, entropy, out)
+    }
+
+    /// [`Self::handle`], with `standing` saying where this side stands with
+    /// the initiator, in the context, for a renewal (`true`) or an opening: a
+    /// renewal of keys it does not hold is answered `02 00 00`, as opening a
+    /// session, and a first contact this side's own crossing opening wins
+    /// against meets silence (`PROTOCOL.md §3`). [`Self::handle`] stands
+    /// with no keys.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the sans-IO inputs of a first contact, and the endpoint's keys"
+    )]
+    pub fn handle_with(
+        &mut self,
+        packet: &[u8],
+        source: Source<'_>,
+        now: Instant,
+        admission: &mut impl Admission,
+        standing: impl FnMut(&PeerId, &Context, bool) -> Standing,
+        entropy: &mut impl Entropy,
+        out: &mut [u8],
+    ) -> ResponderOutput {
         match wire::classify(packet) {
             Classified::Version(Version::V1) => {
-                self.first_contact(packet, source, now, admission, entropy, out)
+                self.first_contact(packet, source, now, admission, standing, entropy, out)
             }
             Classified::Version(_) => {
                 match wire::answer_unknown_version(packet, &self.mac1_key, &[Version::V1], out) {
@@ -371,12 +417,17 @@ impl<C: Config> Responder<C> {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the sans-IO inputs of a first contact, and the endpoint's keys"
+    )]
     fn first_contact(
         &mut self,
         packet: &[u8],
         source: Source<'_>,
         now: Instant,
         admission: &mut impl Admission,
+        mut standing: impl FnMut(&PeerId, &Context, bool) -> Standing,
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> ResponderOutput {
@@ -391,6 +442,7 @@ impl<C: Config> Responder<C> {
                     Initiation {
                         initiator_index: first.initiator_index,
                         noise: first.noise,
+                        renewal: false,
                     }
                 }
                 _ => return Silent,
@@ -400,6 +452,7 @@ impl<C: Config> Responder<C> {
                 Ok(first) => Initiation {
                     initiator_index: first.initiator_index,
                     noise: first.noise,
+                    renewal: first.renewal,
                 },
                 Err(_) => return Silent,
             }
@@ -452,6 +505,10 @@ impl<C: Config> Responder<C> {
         {
             return Silent;
         }
+        let stands = standing(&peer, &context, first.renewal);
+        if stands == Standing::Ignore {
+            return Silent;
+        }
 
         self.expire(now);
         let (mut decision, psk) = match admission.admit(&peer, context.as_bytes()) {
@@ -467,6 +524,12 @@ impl<C: Config> Responder<C> {
                 None => decision = WireDecision::Refuse(RefusalCode::CAPACITY_EXHAUSTED),
             }
         }
+        // A renewal of keys this side does not hold opens a session, and the
+        // initiator is told so (`PROTOCOL.md §3`).
+        if decision == WireDecision::Accept && first.renewal && stands == Standing::NoKeys {
+            decision = WireDecision::AcceptAsNew;
+        }
+        let accepted = matches!(decision, WireDecision::Accept | WireDecision::AcceptAsNew);
 
         let mut ephemeral = [0u8; 32];
         entropy.fill(&mut ephemeral);
@@ -485,7 +548,7 @@ impl<C: Config> Responder<C> {
             return Silent;
         };
 
-        if decision == WireDecision::Accept {
+        if accepted {
             self.accepted = self.accepted.wrapping_add(1);
             let pending = Pending {
                 peer,
@@ -495,6 +558,7 @@ impl<C: Config> Responder<C> {
                 expires_at: now.saturating_add(PENDING_LIFETIME),
                 accepted: self.accepted,
                 completed,
+                opens: !first.renewal || decision == WireDecision::AcceptAsNew,
             };
             // Room was made above; an acceptance is never sent without its state.
             if self.pending.insert(responder_index, pending).is_err() {
@@ -502,7 +566,7 @@ impl<C: Config> Responder<C> {
             }
         }
         out.copy_from_slice(&response);
-        if decision == WireDecision::Accept && payload_len > 0 {
+        if accepted && payload_len > 0 {
             // The plaintext follows `e` and the encrypted `s`.
             let at = 32 + 48;
             let (Some(field), Some(payload)) = (
@@ -671,6 +735,16 @@ impl<C: Config> Responder<C> {
         count
     }
 
+    /// Whether a renewal from `peer` in `context` is pending: a handshake
+    /// that, once confirmed, keeps the session it renews.
+    pub(crate) fn renewal_pending(&self, peer: &PeerId, context: &Context) -> bool {
+        let mut found = false;
+        self.pending.for_each(|_, pending| {
+            found |= pending.peer == *peer && pending.context == *context && !pending.opens;
+        });
+        found
+    }
+
     /// Whether a handshake from `peer` in `context` is pending.
     #[must_use]
     pub fn pending_in(&self, peer: &PeerId, context: &Context) -> bool {
@@ -712,6 +786,7 @@ impl<C: Config> Responder<C> {
 struct Initiation<'a> {
     initiator_index: u32,
     noise: &'a [u8],
+    renewal: bool,
 }
 
 fn draw_index(entropy: &mut impl Entropy) -> u32 {

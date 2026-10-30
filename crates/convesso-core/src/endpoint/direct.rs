@@ -544,6 +544,8 @@ impl<C: Config> Endpoint<C> {
         if list.as_slice() != self.own.list.as_slice() {
             list.generation = self.own.list.generation.wrapping_add(1);
             self.own.list = list;
+            // Every live session owes the new list.
+            self.sessions.touch_all();
         }
     }
 

@@ -93,8 +93,27 @@ impl Node {
                 context,
                 kind,
                 data,
+                connected,
                 ..
-            } => self.channels.handle_frame(peer, context, kind, data, now),
+            } => {
+                if connected {
+                    self.channels
+                        .session_opened(peer, context, &mut self.entropy);
+                }
+                self.channels.handle_frame(peer, context, kind, data, now);
+            }
+            CoreEvent::Connected { peer, context }
+            | CoreEvent::Datagram {
+                peer,
+                context,
+                connected: true,
+                ..
+            } => self
+                .channels
+                .session_opened(peer, context, &mut self.entropy),
+            CoreEvent::Idle { peer, context } => {
+                self.channels.session_idle(peer, context, &mut self.entropy);
+            }
             CoreEvent::Closed {
                 peer,
                 context,

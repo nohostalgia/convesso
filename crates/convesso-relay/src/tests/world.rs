@@ -102,8 +102,22 @@ pub(crate) enum Ev {
     },
 }
 
-fn own(event: Event<'_>) -> Ev {
-    match event {
+/// The event, owned, and whether it opens a session: the stream layer is
+/// told before it handles a frame of it.
+fn own(event: Event<'_>) -> (Ev, bool) {
+    let opens = matches!(
+        event,
+        Event::Connected { .. }
+            | Event::Datagram {
+                connected: true,
+                ..
+            }
+            | Event::Frame {
+                connected: true,
+                ..
+            }
+    );
+    let event = match event {
         Event::Connected { peer, .. } => Ev::Connected(peer),
         Event::Idle { peer, .. } => Ev::Idle(peer),
         Event::Datagram {
@@ -136,7 +150,8 @@ fn own(event: Event<'_>) -> Ev {
         Event::RelayAvailable => Ev::RelayAvailable,
         Event::Payload { .. } => Ev::Payload,
         Event::PathChanged { peer, path, .. } => Ev::PathChanged(peer, path),
-    }
+    };
+    (event, opens)
 }
 
 /// What a client sent, by kind: what the idle tests count.
@@ -437,6 +452,10 @@ pub(crate) struct World<P: Policy> {
     /// Whether `chaos` and `loss` also strike direct packets between clients
     /// (a hinted path, addressed by index), not only UDP to and from the relay.
     pub(crate) lossy_direct: bool,
+    /// The one-way delay of a direct packet between clients addressed by
+    /// index, when it differs from every other hop's: a direct path faster
+    /// than the relay.
+    pub(crate) direct_delay: Option<u64>,
     /// Every direct IP packet a client sent: by whom, to where.
     direct_log: Vec<(usize, SocketAddr)>,
     /// Whether a NAT forwards a packet from its own LAN to its own public
@@ -469,6 +488,7 @@ impl<P: Policy> World<P> {
             direct_log: Vec::new(),
             loss: None,
             lossy_direct: false,
+            direct_delay: None,
             hairpin: false,
         };
         for i in 0..clients {
@@ -571,13 +591,23 @@ impl<P: Policy> World<P> {
         self.wire.insert((self.now + delay, self.seq), msg);
     }
 
-    fn record(&mut self, i: usize, event: Ev) {
+    fn record(&mut self, i: usize, (event, opens): (Ev, bool)) {
         let now = self.now;
         let instant = self.instant();
         let client = &mut self.clients[i];
         if let Some(stream) = client.stream.as_mut() {
             let context = Context::new(SESSION).unwrap();
+            // A session's end, or a new one: the channel's incarnations
+            // retire, as the drivers tell them.
+            if let (
+                true,
+                Ev::Connected(peer) | Ev::Datagram { peer, .. } | Ev::Frame { peer, .. },
+            ) = (opens, &event)
+            {
+                stream.session_opened(*peer, context, &mut client.entropy);
+            }
             match &event {
+                Ev::Idle(peer) => stream.session_idle(*peer, context, &mut client.entropy),
                 Ev::Frame {
                     peer, kind, data, ..
                 } => stream.handle_frame(*peer, context, *kind, data, instant),
@@ -837,7 +867,7 @@ impl<P: Policy> World<P> {
                     let to = usize::from(bytes[0]);
                     if self.direct {
                         self.put(
-                            self.delay,
+                            self.direct_delay.unwrap_or(self.delay),
                             Msg::Direct {
                                 to,
                                 from: i,
@@ -1300,7 +1330,7 @@ impl<P: Policy> World<P> {
                 } = output
                 {
                     self.put(
-                        self.delay,
+                        self.direct_delay.unwrap_or(self.delay),
                         Msg::Direct {
                             to: from,
                             from: to,
@@ -1479,7 +1509,7 @@ impl<P: Policy> World<P> {
 /// An output, owning its event.
 pub(crate) enum Step {
     Transmit { to: To, len: usize },
-    Event(Ev),
+    Event((Ev, bool)),
     Nothing,
 }
 

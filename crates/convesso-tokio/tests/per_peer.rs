@@ -251,8 +251,9 @@ async fn a_message_budget_too_small_is_refused_when_the_context_opens() {
 // --- 3.2 ---------------------------------------------------------------------------------
 
 /// Scenario: a receiver yields the reset and the close in order: three
-/// messages, the reset of a peer that restarted, its fourth message, then the
-/// close made by this side, and the close again afterwards.
+/// messages, the reset of a peer that restarted in the middle of a fourth, its
+/// fifth message, then the close made by this side, and the close again
+/// afterwards.
 #[tokio::test]
 async fn a_receiver_yields_the_reset_and_the_close_in_order() {
     let (r, _r_events) = node(1, None, 64, PER_PEER).await;
@@ -265,12 +266,18 @@ async fn a_receiver_yields_the_reset_and_the_close_in_order() {
     hints(&r, &s).await;
     let s_peer = s.address().peer_id();
     let receiver = r.receiver(s_peer).await.unwrap();
-    for m in [b"one".as_slice(), b"two", b"three"] {
-        s.send_message(r.address(), m.to_vec()).await.unwrap();
+    // R reads nothing yet: its credit takes the first message, and the
+    // second waits whole in the channel. Behind it, the channel's 512 KiB
+    // take the third whole, and never all of the fourth.
+    let sent: Vec<Vec<u8>> = [250_000, 200_000, 100_000, 250_000]
+        .into_iter()
+        .zip(1u8..)
+        .map(|(len, i)| vec![i; len])
+        .collect();
+    for m in &sent {
+        s.send_message(r.address(), m.clone()).await.unwrap();
     }
-    for m in [b"one".as_slice(), b"two", b"three"] {
-        assert_eq!(message(&receiver).await, m);
-    }
+    sleep(Duration::from_millis(1000)).await;
     // S restarts: the same key, a new process, a new incarnation. The old
     // one ends without closing anything, as a process killed does.
     process.shutdown_background();
@@ -278,12 +285,15 @@ async fn a_receiver_yields_the_reset_and_the_close_in_order() {
     std::mem::forget((s, s_events));
     let (s, _s_events) = node(2, None, 64, Delivery::Events).await;
     hints(&r, &s).await;
-    s.send_message(r.address(), b"four".to_vec()).await.unwrap();
+    s.send_message(r.address(), b"five".to_vec()).await.unwrap();
+    for m in &sent[..3] {
+        assert_eq!(&message(&receiver).await, m);
+    }
     assert_eq!(
         next(&receiver, Duration::from_secs(5)).await,
         Received::Reset(Reason::PeerRestarted)
     );
-    assert_eq!(message(&receiver).await, b"four");
+    assert_eq!(message(&receiver).await, b"five");
     r.close(s_peer, 9).await.unwrap();
     let closed = Received::Closed(SessionClosed {
         code: 9,

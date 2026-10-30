@@ -42,7 +42,7 @@ use super::{
     Output, Owner, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
-use crate::handshake::messages::{TYPE_INITIATION, TYPE_INITIATION_PAYLOAD};
+use crate::handshake::messages::is_first_contact_type;
 use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
@@ -614,18 +614,12 @@ fn attempt_of(indices: &impl Table<u32, Owner>, frame: &[u8]) -> Option<Key> {
     };
     let (peer, packet) = rest.split_at_checked(ROUTED_HEADER_LEN - 2)?;
     // Version 1, a first contact, then the initiator's index.
-    let [
-        0x01,
-        TYPE_INITIATION | TYPE_INITIATION_PAYLOAD,
-        a,
-        b,
-        c,
-        d,
-        ..,
-    ] = *packet
-    else {
+    let [0x01, kind, a, b, c, d, ..] = *packet else {
         return None;
     };
+    if !is_first_contact_type(kind) {
+        return None;
+    }
     match indices.get(&u32::from_le_bytes([a, b, c, d]))? {
         Owner::Dial(owner, context) if owner.as_bytes().as_slice() == peer => {
             Some((*owner, *context))
@@ -1773,7 +1767,7 @@ impl<C: Config> Endpoint<C> {
         let Some((key, address)) = self.relay.as_ref().map(|r| (r.key(), r.address)) else {
             return Err(SendError::NoRelay);
         };
-        let len = self.start_dial(key, &address, None, now, policy, entropy, out)?;
+        let len = self.start_dial(key, &address, None, false, now, policy, entropy, out)?;
         let path = path.unwrap_or_else(|| self.relay_path(now));
         Ok((To::Relay(path), len))
     }

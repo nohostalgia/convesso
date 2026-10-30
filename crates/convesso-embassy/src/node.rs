@@ -358,6 +358,35 @@ impl<'d, M: RawMutex, T: Tables> Inner<'d, M, T> {
         }
     }
 
+    /// Tells the channels of a session's end, or of a new one, before the
+    /// core's event is translated: their incarnations retire
+    /// (`PROTOCOL.md §8`).
+    #[cfg(feature = "stream")]
+    fn tell_channels_of_sessions(&mut self, event: &convesso_core::endpoint::Event<'_>) {
+        use convesso_core::endpoint::Event as Core;
+        match *event {
+            Core::Connected { peer, context }
+            | Core::Datagram {
+                peer,
+                context,
+                connected: true,
+                ..
+            }
+            | Core::Frame {
+                peer,
+                context,
+                connected: true,
+                ..
+            } => self
+                .channels
+                .session_opened(peer, context, &mut self.entropy),
+            Core::Idle { peer, context } => {
+                self.channels.session_idle(peer, context, &mut self.entropy);
+            }
+            _ => {}
+        }
+    }
+
     /// Closes `context`: its sessions with `code`, its channels; its events
     /// end once read.
     fn close_context(&mut self, context: Name, code: u16) {
@@ -1076,6 +1105,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
                 }
             }
             Output::Event(event) => {
+                #[cfg(feature = "stream")]
+                inner.tell_channels_of_sessions(&event);
                 if let Some((context, event)) = from_core(event) {
                     inner.deliver(&self.shared.events_ready, context, event);
                 }
@@ -1428,6 +1459,11 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                 connected,
                 ..
             }) => {
+                if connected {
+                    inner
+                        .channels
+                        .session_opened(peer, context, &mut inner.entropy);
+                }
                 inner
                     .channels
                     .handle_frame(peer, context, kind, data, now());
@@ -1440,6 +1476,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                 }
             }
             Output::Event(event) => {
+                #[cfg(feature = "stream")]
+                inner.tell_channels_of_sessions(&event);
                 if let Some((context, event)) = from_core(event) {
                     #[cfg(feature = "stream")]
                     inner.tell_channels(context, &event);
@@ -1632,6 +1670,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     .await;
                 }
                 Poll::Event(event) => {
+                    #[cfg(feature = "stream")]
+                    inner.tell_channels_of_sessions(&event);
                     if let Some((context, event)) = from_core(event) {
                         #[cfg(feature = "stream")]
                         inner.tell_channels(context, &event);

@@ -200,6 +200,17 @@ pub(crate) enum Output {
     Nothing,
 }
 
+/// What a receive side holds of its incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Nothing,
+    /// Whole messages, or fragments that complete them, waiting for the
+    /// reader.
+    Whole,
+    /// A message that can never complete.
+    Incomplete,
+}
+
 /// One channel.
 pub(crate) struct Channel<C: StreamConfig> {
     address: Option<Address>,
@@ -273,6 +284,9 @@ pub(crate) struct Channel<C: StreamConfig> {
     given_up: Option<Incarnation>,
     event: Option<Reason>,
     ever_reset: bool,
+
+    /// Its entry in the index of deadlines.
+    pub(crate) indexed: Option<Instant>,
 }
 
 impl<C: StreamConfig> Channel<C> {
@@ -334,6 +348,7 @@ impl<C: StreamConfig> Channel<C> {
             given_up: None,
             event: None,
             ever_reset: false,
+            indexed: None,
         }
     }
 
@@ -766,7 +781,15 @@ impl<C: StreamConfig> Channel<C> {
                 return;
             }
             if self.receive_incarnation.is_some() {
-                self.reset(Reason::PeerRestarted);
+                match self.held() {
+                    // A message of the older one can never complete: lost.
+                    Held::Incomplete => self.reset(Reason::PeerRestarted),
+                    // Whole messages wait for the reader: the new one waits
+                    // behind them, unacknowledged, and is sent again.
+                    Held::Whole => return,
+                    // Nothing lost: the new incarnation takes over.
+                    Held::Nothing => self.retire_receive(),
+                }
             }
             self.receive_incarnation = Some(data.incarnation);
             self.rcv_next = 0;
@@ -1000,13 +1023,38 @@ impl<C: StreamConfig> Channel<C> {
         }
     }
 
+    /// The cumulative point to acknowledge, and the bytes held in order up to
+    /// it beyond `rcv_next`: behind a whole message that waits for its
+    /// reader, the fragments that follow it in order are held early, and
+    /// they were received all the same.
+    fn cumulative(&self) -> (u32, usize) {
+        let mut cumulative = self.rcv_next;
+        let mut held = 0;
+        for i in 0..self.early.len() {
+            match self.early.get(i) {
+                Some(stored) if stored.seq == cumulative => {
+                    cumulative = cumulative.wrapping_add(1);
+                    held += usize::from(stored.len);
+                }
+                _ => break,
+            }
+        }
+        (cumulative, held)
+    }
+
     fn ack(&mut self, out: &mut [u8]) -> Option<usize> {
         let incarnation = self.receive_incarnation?;
-        let window = u32::try_from(self.free()).unwrap_or(u32::MAX);
+        let (cumulative, held) = self.cumulative();
+        // The window counts from the cumulative point: what the arena holds
+        // up to it is taken, and what it holds beyond is inside the window.
+        // The sender counts every byte it sent beyond that point against the
+        // window, held here or not, as TCP does.
+        let window = self.arena.capacity() - self.asm_len - held;
+        let window = u32::try_from(window).unwrap_or(u32::MAX);
         let mut ack = Ack::new(
             incarnation,
             false,
-            self.rcv_next,
+            cumulative,
             window,
             u32::try_from(self.max_message).unwrap_or(u32::MAX),
         );
@@ -1015,9 +1063,7 @@ impl<C: StreamConfig> Channel<C> {
             let Some(stored) = self.early.get(i) else {
                 continue;
             };
-            // In order, held while a whole message waits to be delivered:
-            // not beyond the cumulative point, so not a range.
-            if !after(stored.seq, self.rcv_next) {
+            if !after(stored.seq, cumulative) {
                 continue;
             }
             match range.as_mut() {
@@ -1044,6 +1090,94 @@ impl<C: StreamConfig> Channel<C> {
         self.ack_now = false;
         self.ack_deadline = None;
         Some(len)
+    }
+
+    // --- a session's end ----------------------------------------------------------------
+
+    /// What the receive side holds of its incarnation.
+    fn held(&self) -> Held {
+        let pending = self.ready.is_some() || self.asm_length.is_some() || self.early.len() > 0;
+        if !pending {
+            return Held::Nothing;
+        }
+        // Held messages complete only through the next in-order fragment,
+        // already here; with none, what is assembled never completes.
+        let continues = self
+            .early
+            .get(0)
+            .is_some_and(|first| first.seq == self.rcv_next);
+        if self.ready.is_none() && !continues {
+            Held::Incomplete
+        } else {
+            Held::Whole
+        }
+    }
+
+    /// Retires the receive incarnation, nothing of it being held: a START of
+    /// another is then taken without a reset (`PROTOCOL.md §8`).
+    fn retire_receive(&mut self) {
+        self.retire(self.receive_incarnation);
+        self.receive_incarnation = None;
+        self.rcv_next = 0;
+        self.unacked = 0;
+        self.ack_now = false;
+        self.ack_deadline = None;
+        self.advertised_closed = false;
+    }
+
+    /// The channel's session went idle, or a new session replaced it: an
+    /// incarnation with nothing outstanding retires, so that the next
+    /// message each way opens a new one. The send side retires when nothing
+    /// it sent waits for an acknowledgement, between two messages; messages
+    /// queued and not yet sent go to a new incarnation. The receive side
+    /// retires when it holds nothing and owes no acknowledgement.
+    pub(crate) fn session_ended(&mut self, entropy: &mut impl Entropy) {
+        if self.send_incarnation.is_some() && self.in_flight.len() == 0 && self.next_off == 0 {
+            self.retire(self.send_incarnation);
+            self.send_incarnation = None;
+            self.acked_any = false;
+            self.popped = 0;
+            self.una = 0;
+            self.next_seq = 0;
+            self.next_msg = 0;
+            self.next_abs = 0;
+            self.recovery_until = None;
+            self.rto_deadline = None;
+            self.loss_deadline = None;
+            self.probe_deadline = None;
+            self.probe_now = false;
+            self.peer_window = INITIAL_PEER_WINDOW;
+            self.peer_max = None;
+            if self.lengths.len() > 0 {
+                let mut incarnation = [0u8; frame::INCARNATION_LEN];
+                entropy.fill(&mut incarnation);
+                self.send_incarnation = Some(incarnation);
+            }
+        }
+        if self.receive_incarnation.is_some()
+            && self.held() == Held::Nothing
+            && self.unacked == 0
+            && !self.ack_now
+        {
+            self.retire_receive();
+        }
+    }
+
+    /// Whether the channel holds nothing at all: no incarnation, nothing
+    /// queued, held, owed or to report, and no credit granted. Such a channel
+    /// is forgotten when its session goes idle.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.send_incarnation.is_none()
+            && self.lengths.len() == 0
+            && self.in_flight.len() == 0
+            && self.receive_incarnation.is_none()
+            && self.held() == Held::Nothing
+            && self.event.is_none()
+            && self.reset_answer.is_none()
+            && !self.writable
+            && !self.dial_due
+            && self.keys_retry.is_none()
+            && self.credit.unwrap_or(0) == 0
     }
 
     // --- resets -------------------------------------------------------------------------
@@ -1297,6 +1431,11 @@ impl<C: StreamConfig> Channel<C> {
                 .get_or_insert(now.saturating_add(self.probe_backoff));
         }
         Output::Nothing
+    }
+
+    /// Whether a whole message waits here to be handed out.
+    pub(crate) const fn holds_message(&self) -> bool {
+        self.ready.is_some()
     }
 
     /// Whether the credit covers a message of `length` bytes, whole.

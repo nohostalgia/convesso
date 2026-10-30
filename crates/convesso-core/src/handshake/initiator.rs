@@ -100,6 +100,7 @@ pub struct Established {
     remote_index: u32,
     context: Context,
     completed: Completed,
+    opens: bool,
 }
 
 impl Established {
@@ -131,6 +132,14 @@ impl Established {
     #[must_use]
     pub const fn channel_binding(&self) -> &ChannelBinding {
         &self.completed.handshake_hash
+    }
+
+    /// Whether the handshake opens a session, rather than renew it: always
+    /// for an opening, and for a renewal the responder accepted as a new
+    /// session (`02 00 00`), having no keys to renew.
+    #[must_use]
+    pub const fn opens(&self) -> bool {
+        self.opens
     }
 
     #[cfg(test)]
@@ -168,6 +177,9 @@ pub struct Dial {
     /// The next attempt is due at this instant instead of at its offset: the
     /// peer was given new address hints (`PROTOCOL.md §3`).
     hurry: Option<Instant>,
+    /// Whether it renews keys the initiator holds: its first contacts are of
+    /// type `0x06`, and carry no payload.
+    renewal: bool,
 }
 
 impl Dial {
@@ -215,6 +227,51 @@ impl Dial {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Result<(Self, usize), DialError> {
+        Self::begin(
+            identity, remote, context, psk, payload, false, now, entropy, out,
+        )
+    }
+
+    /// Starts a dial that renews keys the initiator still holds for `remote`
+    /// in `context`: its first contacts are renewals (type `0x06`), and carry
+    /// no payload (`PROTOCOL.md §3`). As [`Self::start`] otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    pub fn renew(
+        identity: &Identity,
+        remote: &Address,
+        context: &[u8],
+        psk: Option<Psk>,
+        now: Instant,
+        entropy: &mut impl Entropy,
+        out: &mut [u8],
+    ) -> Result<(Self, usize), DialError> {
+        Self::begin(identity, remote, context, psk, &[], true, now, entropy, out)
+    }
+
+    /// Whether this dial renews keys the initiator holds.
+    #[must_use]
+    pub const fn is_renewal(&self) -> bool {
+        self.renewal
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the sans-IO inputs of a dial, its payload and its kind"
+    )]
+    fn begin(
+        identity: &Identity,
+        remote: &Address,
+        context: &[u8],
+        psk: Option<Psk>,
+        payload: &[u8],
+        renewal: bool,
+        now: Instant,
+        entropy: &mut impl Entropy,
+        out: &mut [u8],
+    ) -> Result<(Self, usize), DialError> {
         if payload.len() > MAX_PAYLOAD || out.len() < super::FIRST_CONTACT_LEN + payload.len() {
             return Err(DialError::PayloadTooLong);
         }
@@ -229,6 +286,7 @@ impl Dial {
             over: false,
             cookie: None,
             hurry: None,
+            renewal,
         };
         let len = dial.send_attempt(identity, payload, now, entropy, out);
         Ok((dial, len))
@@ -313,24 +371,26 @@ impl Dial {
         let Some(plaintext) = buffer.get(32..32 + len) else {
             return DialEvent::Ignored;
         };
-        match messages::decode_decision(plaintext) {
-            Ok(WireDecision::Accept) => {
-                let established = Established {
-                    peer: self.remote.peer_id(),
-                    local_index: attempt.index,
-                    remote_index: response.responder_index,
-                    context: self.context,
-                    completed,
-                };
-                self.finish();
-                DialEvent::Established(established)
-            }
+        // `02 00 00` answers only a renewal; to an opening it is malformed.
+        let opens = match messages::decode_decision(plaintext) {
+            Ok(WireDecision::Accept) => !self.renewal,
+            Ok(WireDecision::AcceptAsNew) if self.renewal => true,
             Ok(WireDecision::Refuse(code)) => {
                 self.finish();
-                DialEvent::Failed(DialError::Refused(code))
+                return DialEvent::Failed(DialError::Refused(code));
             }
-            Err(_) => DialEvent::Ignored,
-        }
+            Ok(WireDecision::AcceptAsNew) | Err(_) => return DialEvent::Ignored,
+        };
+        let established = Established {
+            peer: self.remote.peer_id(),
+            local_index: attempt.index,
+            remote_index: response.responder_index,
+            context: self.context,
+            completed,
+            opens,
+        };
+        self.finish();
+        DialEvent::Established(established)
     }
 
     /// Keeps the cookie a genuine cookie reply carries. Sends nothing: the next
@@ -397,6 +457,8 @@ impl Dial {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> usize {
+        // A renewal carries no payload, whatever the retry is handed.
+        let payload = if self.renewal { &[][..] } else { payload };
         self.hurry = None;
         let fits =
             payload.len() <= MAX_PAYLOAD && out.len() >= super::FIRST_CONTACT_LEN + payload.len();
@@ -435,7 +497,14 @@ impl Dial {
         };
         let cookie = self.cookie_at(now).copied();
         let Some(len) = noise_out.get(..noise_len).and_then(|noise| {
-            messages::write_first_contact_into(out, index, noise, &self.mac1_key, cookie.as_ref())
+            messages::write_first_contact_into(
+                out,
+                index,
+                noise,
+                self.renewal,
+                &self.mac1_key,
+                cookie.as_ref(),
+            )
         }) else {
             return 0;
         };

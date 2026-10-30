@@ -18,6 +18,8 @@ alloc = ["convesso-core/alloc"]
 convesso-core = { path = "../convesso-core", version = "0.0.0" }
 
 [dev-dependencies]
+# Seeded identities for the tests with many peers.
+convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["ed25519-seed"] }
 proptest.workspace = true
 serde_json.workspace = true
 

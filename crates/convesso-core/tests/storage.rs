@@ -177,6 +177,7 @@ proptest! {
                 Op::Remove(k) => prop_assert_eq!(table.remove(&k), model.remove(&k)),
             }
             prop_assert_eq!(table.len(), model.len());
+            prop_assert_eq!(table.first(), model.first_key_value());
             for k in 0u8..8 {
                 prop_assert_eq!(table.get(&k), model.get(&k));
             }
@@ -222,4 +223,31 @@ fn a_growable_table_with_a_limit_refuses_at_the_limit() {
     assert_eq!(table.insert(2, ()), Ok(Some(())));
     let pending: <convesso_core::storage::Server as Config>::Pending<u8, ()> = Default::default();
     assert_eq!(pending.capacity(), Some(4096));
+}
+
+/// The smallest key whatever the order of insertion, and the next one once it
+/// is removed: what an index ordered by time holds next.
+fn first_follows_the_keys(table: &mut impl Table<u32, char>) {
+    assert_eq!(table.first(), None);
+    for (key, value) in [(30, 'c'), (10, 'a'), (20, 'b')] {
+        table.insert(key, value).unwrap();
+    }
+    assert_eq!(table.first(), Some((&10, &'a')));
+    table.remove(&10);
+    assert_eq!(table.first(), Some((&20, &'b')));
+    table.insert(5, 'z').unwrap();
+    assert_eq!(table.first(), Some((&5, &'z')));
+    table.retain(|_, _| false);
+    assert_eq!(table.first(), None);
+}
+
+#[test]
+fn a_fixed_table_gives_its_smallest_key() {
+    first_follows_the_keys(&mut FixedTable::<u32, char, 4>::new());
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn a_growable_table_gives_its_smallest_key() {
+    first_follows_the_keys(&mut convesso_core::storage::GrowableTable::<u32, char>::new());
 }

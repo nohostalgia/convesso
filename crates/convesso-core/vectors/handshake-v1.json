@@ -124,6 +124,38 @@
       "responder_index": 10,
       "responder_key": 1,
       "response": "01020a00000009000000ffc951aa6f2fa03096d1d1b579735b2f6f84019fe2f617aa65ff3d68705f2527b2b7efbb19ba7221b34203412a011064791dc6"
+    },
+    {
+      "channel_binding": "85b607046a4b2afcdb85991e94aa7b1bc1bb3a1eb93aeb034752ae641694004a",
+      "context": "73657373696f6e",
+      "decision": "000000",
+      "first_contact": "010624232221dccf9fc001b345c77474e76e1021bde04f7ea0ed8ee61f7f6f1a4e47a5af2f54d42a8c940dce64dc13ef8bd34ed3a4c270abec8767d3b0d559d141210f4c136ffc912f5615bcd56f6ead315aa6a5a3678b4dc8ed0432d7161b6ccf9ec3c9bdf74c0743d03ef9b3687c1028320e6b8e3000000000000000000000000000000000",
+      "initiator_ephemeral": "5656565656565656565656565656565656565656565656565656565656565656",
+      "initiator_index": 555885348,
+      "initiator_key": 1,
+      "name": "a renewal of live keys",
+      "psk": null,
+      "renewal": true,
+      "responder_ephemeral": "7878787878787878787878787878787878787878787878787878787878787878",
+      "responder_index": 825373492,
+      "responder_key": 0,
+      "response": "010234333231242322219b4ad50baf0346faa5d828c9b2482804ee9c0a3527429a7a92a1d5aa4db3b6268ad56d0ffad1a95c401d08ff5e3e897611d3fc"
+    },
+    {
+      "channel_binding": "255a5ccd42a8f5db984cf92eeb3f01487ebb6293d3439016a1678e9900c6dc59",
+      "context": "73657373696f6e",
+      "decision": "020000",
+      "first_contact": "010644434241b9632a3fe4da05300b60ec6dfb16cc4487d4228bca59ad40d653137d08f9a865b08a0ca9109f859a07b2032dc5ba4143184bd56411dc72968600da2b9298e705720da497c74b1d41411cc1356f1ddd262f64e6f427cc9f068826275b4489e5f9ffee63717679d4cb4bb64805f81dde1400000000000000000000000000000000",
+      "initiator_ephemeral": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a",
+      "initiator_index": 1094861636,
+      "initiator_key": 2,
+      "name": "a renewal without keys, accepted as a new session",
+      "psk": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "renewal": true,
+      "responder_ephemeral": "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc",
+      "responder_index": 1364349780,
+      "responder_key": 3,
+      "response": "010254535251444342416af594e4f200c893ac227fcd40f3e8778f95507a3a5826e05246e3ac7c2d991f24ab242f455ea8927bb2fca73918a8c5631308"
     }
   ]
 }

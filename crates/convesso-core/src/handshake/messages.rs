@@ -25,6 +25,19 @@ pub const TYPE_INITIATION: u8 = 0x01;
 pub const TYPE_RESPONSE: u8 = 0x02;
 /// Byte 1 of a first contact with a payload.
 pub const TYPE_INITIATION_PAYLOAD: u8 = 0x05;
+/// Byte 1 of a first contact that renews keys the initiator still holds: the
+/// 134 bytes of [`TYPE_INITIATION`], with no payload.
+pub const TYPE_RENEWAL: u8 = 0x06;
+
+/// Whether byte 1 of a version 1 packet names a first contact: an opening,
+/// one with a payload, or a renewal.
+#[must_use]
+pub const fn is_first_contact_type(kind: u8) -> bool {
+    matches!(
+        kind,
+        TYPE_INITIATION | TYPE_INITIATION_PAYLOAD | TYPE_RENEWAL
+    )
+}
 
 /// The Noise part of a first contact: `e`, `s` encrypted, empty payload encrypted.
 pub const INITIATION_NOISE_LEN: usize = 32 + 48 + 16;
@@ -58,9 +71,9 @@ pub enum MessageError {
 pub enum DecisionError {
     /// Not 3 bytes.
     WrongLength,
-    /// The status byte is neither `0x00` nor `0x01`.
+    /// The status byte is none of `0x00`, `0x01` and `0x02`.
     UnknownStatus,
-    /// Acceptance with a non-zero code.
+    /// Acceptance, or acceptance as a new session, with a non-zero code.
     AcceptWithCode,
     /// Refusal with code `0x0000`.
     RefuseWithoutCode,
@@ -71,6 +84,9 @@ pub enum DecisionError {
 pub enum WireDecision {
     /// `00 00 00`.
     Accept,
+    /// `02 00 00`: a renewal accepted as a new session, since the responder
+    /// holds no live keys to renew.
+    AcceptAsNew,
     /// `01` and the code, little-endian.
     Refuse(RefusalCode),
 }
@@ -78,6 +94,9 @@ pub enum WireDecision {
 /// A first contact, its header checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstContact<'a> {
+    /// Whether it renews keys the initiator holds ([`TYPE_RENEWAL`]), rather
+    /// than open a session ([`TYPE_INITIATION`]).
+    pub renewal: bool,
     /// The initiator's index.
     pub initiator_index: u32,
     /// `e`, `s` encrypted and the empty payload encrypted.
@@ -143,12 +162,22 @@ fn u32_at(packet: &[u8], at: usize) -> Option<u32> {
 ///
 /// A [`MessageError`] when it is not exactly a version 1 first contact.
 pub fn parse_first_contact(packet: &[u8]) -> Result<FirstContact<'_>, MessageError> {
-    check(packet, TYPE_INITIATION, FIRST_CONTACT_LEN)?;
+    let renewal = packet.get(1) == Some(&TYPE_RENEWAL);
+    check(
+        packet,
+        if renewal {
+            TYPE_RENEWAL
+        } else {
+            TYPE_INITIATION
+        },
+        FIRST_CONTACT_LEN,
+    )?;
     let length = MessageError::WrongLength {
         expected: FIRST_CONTACT_LEN,
         actual: packet.len(),
     };
     Ok(FirstContact {
+        renewal,
         initiator_index: u32_at(packet, 2).ok_or(length)?,
         noise: packet
             .get(INITIATION_NOISE_AT..INITIATION_NOISE_AT + INITIATION_NOISE_LEN)
@@ -218,7 +247,8 @@ pub fn parse_response(packet: &[u8]) -> Result<Response<'_>, MessageError> {
 pub fn decode_decision(plaintext: &[u8]) -> Result<WireDecision, DecisionError> {
     match plaintext {
         [0x00, 0x00, 0x00] => Ok(WireDecision::Accept),
-        [0x00, _, _] => Err(DecisionError::AcceptWithCode),
+        [0x02, 0x00, 0x00] => Ok(WireDecision::AcceptAsNew),
+        [0x00 | 0x02, _, _] => Err(DecisionError::AcceptWithCode),
         [0x01, lo, hi] => RefusalCode::from_wire(u16::from_le_bytes([*lo, *hi]))
             .map(WireDecision::Refuse)
             .ok_or(DecisionError::RefuseWithoutCode),
@@ -232,6 +262,7 @@ pub fn decode_decision(plaintext: &[u8]) -> Result<WireDecision, DecisionError> 
 pub fn encode_decision(decision: WireDecision) -> [u8; DECISION_LEN] {
     match decision {
         WireDecision::Accept => [0x00, 0x00, 0x00],
+        WireDecision::AcceptAsNew => [0x02, 0x00, 0x00],
         WireDecision::Refuse(code) => {
             let [lo, hi] = code.get().to_le_bytes();
             [0x01, lo, hi]
@@ -243,25 +274,27 @@ pub fn encode_decision(decision: WireDecision) -> [u8; DECISION_LEN] {
 /// responder's key, and `mac2` under `cookie` when the initiator holds one,
 /// zeros otherwise. The Noise part is
 /// `INITIATION_NOISE_LEN + n` bytes: type `0x01` for `n = 0`, type `0x05` for
-/// a payload. Returns its length, or `None` when `out` is too small or the
-/// payload longer than [`MAX_PAYLOAD`].
+/// a payload, and type `0x06` for a `renewal`, which carries none. Returns its
+/// length, or `None` when `out` is too small, the payload longer than
+/// [`MAX_PAYLOAD`], or a renewal given one.
 pub(crate) fn write_first_contact_into(
     out: &mut [u8],
     initiator_index: u32,
     noise: &[u8],
+    renewal: bool,
     key: &Mac1Key,
     cookie: Option<&crate::dos::Cookie>,
 ) -> Option<usize> {
     let payload = noise.len().checked_sub(INITIATION_NOISE_LEN)?;
-    if payload > MAX_PAYLOAD {
+    if payload > MAX_PAYLOAD || (renewal && payload > 0) {
         return None;
     }
     let len = FIRST_CONTACT_LEN + payload;
     let packet = out.get_mut(..len)?;
-    let kind = if payload == 0 {
-        TYPE_INITIATION
-    } else {
-        TYPE_INITIATION_PAYLOAD
+    let kind = match (renewal, payload) {
+        (true, _) => TYPE_RENEWAL,
+        (false, 0) => TYPE_INITIATION,
+        (false, _) => TYPE_INITIATION_PAYLOAD,
     };
     let mut head = [0u8; INITIATION_NOISE_AT];
     head[0] = VERSION;

@@ -39,6 +39,12 @@ bytes and the next deadline come out.
 - **Time is passed in.** The core does not read a clock. Every call takes "now", and every poll
   returns the next deadline. This lets the tests drive every timer with a virtual clock, and lets
   a microcontroller drive the core from its own timer.
+- **A poll costs what is due, not what is held.** The core and the stream layer index their
+  sessions and channels: the ones changed since they were last looked at, the ones that may have
+  something to do, and their deadlines in order. A server with ten thousand quiet sessions handles
+  a packet as fast as with one. The index's tables take the type of the sessions' (or channels')
+  table, so a microcontroller's stay fixed, and the tests check every poll against a walk of
+  everything held.
 - **Decoders are written not to panic.** Any bytes from the network give a result or an error.
   A decoder does not panic, allocate without a bound, or read beyond its input; fuzzing checks
   this (§9).
@@ -229,12 +235,19 @@ a device that does not need it does not carry it.
   The buffers stay the configuration's.
 - **Datagrams do not wait for messages.**
 - **Quiet at rest:** with everything acknowledged, the channel sets no timer.
+- **Channels live with their session.** When a session goes idle, or a new one replaces it, its
+  channel starts new incarnations for what comes next, and a channel left with nothing is
+  forgotten: a server holds the channels in use, not one for every peer it ever met. A reset
+  reports a loss only: a peer that restarted between two messages continues silently, since
+  nothing was lost and, on the wire, a restart and a session that went idle look the same.
 
 ## 9. How it is checked
 
 - **A deterministic simulator** runs the core with a virtual clock, loss, reordering, duplication
   and NATs of each behaviour.
 - **Every decoder is fuzzed,** and the fuzz targets run in CI (`fuzz/`).
+- **The indexes are checked against walks.** In the tests and the simulator, every poll also walks
+  every session and channel, and asserts that the index found what the walk finds.
 - **Test vectors are committed** and run on every target: on the host, and under QEMU for ARM
   Cortex-M and RISC-V (`firmware/`). They are produced or checked by implementations independent
   of convesso's own code, so a disagreement points to a bug on one side.

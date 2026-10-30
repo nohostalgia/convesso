@@ -183,7 +183,9 @@ async fn a_slow_reader_holds_the_sender_back() {
     let (a, _a_node, a_app, _a_events) = node(8, None, 64).await;
     let (b, _b_node, _b_app, mut b_events) = node(9, None, 2).await;
     hints(&a, &b).await;
-    let sent: Vec<_> = (0..300).map(|i| vec![i as u8; 2000]).collect();
+    // More than both buffers hold: A's send buffer and B's channel, 512 KiB
+    // each.
+    let sent: Vec<_> = (0..1000).map(|i| vec![i as u8; 2000]).collect();
     let (a2, b_address, sent_a) = (a_app.clone(), b.address(), sent.clone());
     let sender = tokio::spawn(async move {
         for m in sent_a {
@@ -192,7 +194,7 @@ async fn a_slow_reader_holds_the_sender_back() {
     });
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!sender.is_finished(), "the sender waits for the reader");
-    let got = messages(&mut b_events, 300, Duration::from_secs(30)).await;
+    let got = messages(&mut b_events, 1000, Duration::from_secs(30)).await;
     sender.await.unwrap();
     assert_eq!(got.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), sent);
 }
@@ -308,8 +310,9 @@ async fn a_slow_reader_of_one_contexts_messages_holds_back_no_other() {
     let b_address = b.address();
     // A clone: the context stays open after the last send, until it arrives.
     let a_slow = a_app.clone();
+    // More than both buffers hold, as above.
     let slow = tokio::spawn(async move {
-        for i in 0..300u32 {
+        for i in 0..1000u32 {
             a_slow
                 .send_message(b_address, vec![i as u8; 2000])
                 .await
@@ -324,7 +327,7 @@ async fn a_slow_reader_of_one_contexts_messages_holds_back_no_other() {
     let got = messages(&mut b_other, 50, Duration::from_secs(10)).await;
     assert_eq!(got.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), sent);
     assert!(!slow.is_finished(), "the unread context's sender waits");
-    let got = messages(&mut b_slow, 300, Duration::from_secs(30)).await;
-    assert_eq!(got.len(), 300);
+    let got = messages(&mut b_slow, 1000, Duration::from_secs(30)).await;
+    assert_eq!(got.len(), 1000);
     slow.await.unwrap();
 }

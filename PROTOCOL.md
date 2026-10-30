@@ -87,13 +87,17 @@ The pre-shared key is the one the application holds for the peer, or 32 zero byt
 | Offset | Length | Content |
 |---|---|---|
 | 0 | 1 | `0x01`, the version |
-| 1 | 1 | `0x01`, first contact |
+| 1 | 1 | `0x01`, an opening; `0x06`, a renewal |
 | 2 | 4 | the initiator's index |
 | 6 | 32 | the initiator's ephemeral public key |
 | 38 | 48 | the initiator's static public key, encrypted |
 | 86 | 16 | the tag of the empty payload |
 | 102 | 16 | `mac1` (§1) |
 | 118 | 16 | `mac2` (§4), or zeros |
+
+**Opening or renewal.** The initiator says which: a renewal (`0x06`) renews keys it still holds
+for the peer in the context, and every other first contact opens a session. A renewal never
+carries a payload. The type byte is outside the Noise message, and `mac1` covers it.
 
 **A first contact may carry a payload** of 1 to 1,200 bytes, where the context allows it. Its type
 byte is `0x05`, and the payload with its tag takes the place of the empty payload's tag, so the
@@ -119,8 +123,10 @@ again on a replay. A context not declared drops a first contact with a payload i
 | 10 | 32 | the responder's ephemeral public key |
 | 42 | 19 | the decision, encrypted: 3 bytes and a tag |
 
-The decision is `00 00 00` to accept, or `01` and a 2-byte refusal code. Accepting and refusing
-are the same length. Codes `0x0001` (capacity exhausted) and `0x0002` (busy) are the library's,
+The decision is `00 00 00` to accept, or `01` and a 2-byte refusal code. To a renewal, a responder
+that holds no live keys for that peer in that context answers `02 00 00`: accepted, as opening a
+session. An initiator that did not ask for a renewal takes `02 00 00` as malformed. Accepting and
+refusing are the same length. Codes `0x0001` (capacity exhausted) and `0x0002` (busy) are the library's,
 `0x0100` to `0xFFFF` the application's.
 
 **Rules:**
@@ -137,6 +143,13 @@ are the same length. Codes `0x0001` (capacity exhausted) and `0x0002` (busy) are
   after 15 seconds.
 - **Channel binding.** Both sides expose the Noise handshake hash, 32 bytes, equal at both ends
   and different for every handshake.
+- **Both ends agree on what a handshake does.** It opens a session when the first contact was an
+  opening, or a renewal answered `02 00 00`; otherwise it renews one. The initiator learns it from
+  the decision, so both ends always agree, whatever the delays.
+- **Openings that cross.** When both sides open a session with each other in the same context at
+  once, the opening started by the greater peer id wins: the other side abandons its own dial and
+  completes the winner's handshake, and the winning side meets the losing first contact with
+  silence. One handshake completes, and both ends hold its binding.
 
 Vectors: `cacophony-ikpsk2.json` (the official Noise vectors) and `handshake-v1.json` (whole
 transcripts, each checked against `snow`).
@@ -230,7 +243,12 @@ Other values are reserved: such a packet is counted against replay, and its cont
   next datagram starts a handshake and waits in a bounded queue (1,024 bytes on a microcontroller,
   65,536 on a server); a datagram that does not fit is refused. When the handshake completes, the
   application is told of a connection again: connection and idle alternate for each session, and
-  a renewal raises neither.
+  a renewal raises neither. A session whose renewal is in flight is not told idle until the
+  renewal ends without keys.
+- **An opening against live keys.** A handshake that opens a session (§3) while the session still
+  has keys replaces it: the application is told of a connection, without an idle before it, and
+  the session takes the new binding. The old keys stay as the previous ones, for the packets in
+  flight.
 - **The passive keepalive.** A session may send one keepalive 10 seconds after receiving data, if
   it sent nothing since, so that a device that only receives keeps its NAT open. It is off unless
   the application turns it on: for a context, as the default of every session opening in it, or
@@ -244,7 +262,8 @@ Other values are reserved: such a packet is counted against replay, and its cont
   dropping its handle (`DESIGN.md §10`).
 - **A datagram too large for the path is refused,** never truncated.
 - **The channel binding** of a session is that of the handshake that opened it, kept across
-  renewals.
+  renewals. It is forgotten, with what the session knew of its paths, when the session is told
+  idle.
 
 Vectors: `transport-v1.json`.
 
@@ -408,7 +427,7 @@ order, or the channel is reset.
 | 8 | the incarnation being acknowledged |
 | 1 | flags: bit 0 RESET, "this channel is reset here" |
 | 4 | the next sequence expected; everything before it was received |
-| 4 | the window: bytes the receiver can still take |
+| 4 | the window: bytes the receiver can hold beyond the next sequence expected, those it holds there included |
 | 4 | the largest message the receiver accepts |
 | 1 | how many ranges follow, 0 to 4 |
 | 8 each | a range of fragments received beyond that point: start and end, the end excluded |
@@ -421,11 +440,25 @@ is ignored whole.
   acknowledged, or when its timeout expires. The timeout follows RFC 6298, between 200 ms and 15
   s. No round-trip sample is taken from a fragment that was sent twice.
 - **Congestion control** is NewReno (RFC 5681, RFC 6582), in bytes, starting at 10 fragments.
-- **Flow control.** A receiver holds only what fits its advertised window. A sender accepts a
+- **Flow control.** A receiver holds only what fits its advertised window. The window counts from
+  the cumulative point, as TCP's does: the fragments held beyond it are inside the window, and a
+  sender counts every byte it sent beyond that point against it. Fragments held in order behind a
+  whole message that waits for its reader are acknowledged cumulatively, since they were received. A sender accepts a
   message only when it fits its buffer, and says when room opens again.
 - **Reset.** A channel is reset when data has waited 30 seconds with no acknowledgement, when the
-  peer starts a new incarnation, when the peer says so, when a message is too large, or when the
-  session closes. Each side gets one event, and the next message opens a new incarnation.
+  peer starts a new incarnation while a message of the older one is incomplete here, when the
+  peer says so, when a message is too large, or when the session closes. Each side gets one
+  event, and the next message opens a new incarnation. A reset reports a loss: a new incarnation
+  with nothing incomplete here replaces the older one silently, after the whole messages of the
+  older one still held are delivered.
+- **Channels live with their session.** When the session goes idle, or a new session replaces one
+  that had keys, each side retires its incarnations with nothing outstanding: a send incarnation
+  with nothing waiting for an acknowledgement, a receive incarnation with nothing incomplete and
+  no acknowledgement owed. The next message each way opens a new one. At idle, a channel left
+  holding nothing, and with no credit granted by a reader, is forgotten. Data still unacknowledged
+  at idle cannot be: it was sent more than 120 seconds into the keys' life, so it started a
+  renewal, which holds idle back, or earlier, and then 30 seconds without progress reset the
+  channel before the keys' 180 seconds.
 - **Silent at rest.** With everything acknowledged, the channel holds no timer and sends nothing.
 - **The channel does not delay datagrams.**
 
