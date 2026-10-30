@@ -916,16 +916,22 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
     }
 
     /// Sends a relay frame in `peer`'s session: sealed now if it has keys,
-    /// otherwise queued; a dormant session is reopened from the client's
-    /// registered address, the frame in the first contact's payload.
+    /// otherwise queued; a session without keys is reopened from the client's
+    /// registered address, on the client's current path, the frame in the
+    /// first contact's payload. The endpoint keeps no session without keys:
+    /// where the client is, the relay knows.
     fn send_to(&mut self, peer: PeerId, frame: &[u8], now: Instant) {
         let live = self.endpoint.is_live(&peer, relay::CONTEXT, now);
-        let address = self
+        let (address, at) = self
             .clients
             .get(peer.as_bytes())
-            .and_then(|client| client.address);
-        let target = match address {
-            Some(ref address) if !live => Target::Address(address),
+            .map_or((None, None), |client| (client.address, client.path(now)));
+        let at = at.map(Dest::label);
+        let target = match (&address, &at) {
+            (Some(address), Some((label, len))) if !live => {
+                Target::AddressAt(address, label.get(..*len).unwrap_or_default())
+            }
+            (Some(address), None) if !live => Target::Address(address),
             _ => Target::Peer(peer),
         };
         let mut admission = Admitting {

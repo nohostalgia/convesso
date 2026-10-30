@@ -142,6 +142,8 @@ async fn node_with(
                 slot: leak(ContextSlot::new()),
                 credit,
                 max_message: None,
+                passive_keepalive: false,
+                early_data: false,
             },
         )
         .await

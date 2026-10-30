@@ -20,10 +20,11 @@
 
 use core::cell::RefCell;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::time::Duration;
 
 use convesso_core::dos::{Source, decode_ip, encode_ip};
 use convesso_core::endpoint::{
-    Endpoint, HintError, MAX_HINTS, Output, Poll, RelayPath, Target, To,
+    Endpoint, HintError, MAX_HINTS, Output, Poll, RelayPath, Settings, Target, To,
 };
 use convesso_core::handshake::Context as Name;
 use convesso_core::handshake::{self, Admission, ChannelBinding, Decision, Psk, ResponderError};
@@ -122,6 +123,15 @@ pub struct ContextOptions<'d, M: RawMutex> {
     /// unset (feature `stream`).
     #[cfg(feature = "stream")]
     pub max_message: Option<usize>,
+    /// Whether its sessions send the passive keepalive, one keepalive 10 s
+    /// after data arrives if they sent nothing since; a session can override
+    /// it ([`Context::set_passive_keepalive`]).
+    pub passive_keepalive: bool,
+    /// Whether it carries early data: the first datagram to a peer with no
+    /// session travels in the first contact, and arrives as
+    /// [`ContextEvent::EarlyDatagram`](crate::ContextEvent::EarlyDatagram),
+    /// unconfirmed. Both sides of the context set it.
+    pub early_data: bool,
 }
 
 /// A context's state, which its handle, its events and the runner share:
@@ -590,6 +600,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
             credit,
             #[cfg(feature = "stream")]
             max_message,
+            passive_keepalive,
+            early_data,
         } = options;
         let mut guard = self.shared.inner.lock().await;
         let inner = &mut *guard;
@@ -624,10 +636,23 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
                 capacity: full.capacity,
             }));
         }
+        // The settings first, so that serving takes them; undone with the
+        // context when it does not open.
+        let settings = Settings {
+            passive_keepalive,
+            early_data,
+        };
+        if let Err(error) = inner.endpoint.set_context_settings(name, settings) {
+            let _ = inner.contexts.remove(&context);
+            return Err(NodeError::Context(error));
+        }
         if let Some(core) = core
             && let Err(error) = inner.endpoint.serve(name, core)
         {
             let _ = inner.contexts.remove(&context);
+            let _ = inner
+                .endpoint
+                .set_context_settings(name, Settings::default());
             return Err(NodeError::Context(error));
         }
         #[cfg(feature = "stream")]
@@ -820,6 +845,34 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
     pub async fn stats(&self) -> Stats {
         self.shared.inner.lock().await.stats
     }
+
+    /// The pinned relay, as the node was last given it; `None` without one.
+    pub async fn relay(&self) -> Option<RelayLocation> {
+        self.shared.inner.lock().await.relay
+    }
+
+    /// Sets how long the relay link may stay silent before a keep-alive: 60
+    /// seconds by default, never less.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::KeepAlive`] below a minute; the interval is unchanged.
+    pub async fn set_relay_keepalive(&self, interval: Duration) -> Result<(), NodeError> {
+        let mut inner = self.shared.inner.lock().await;
+        inner
+            .endpoint
+            .set_relay_keepalive(interval)
+            .map_err(NodeError::KeepAlive)?;
+        drop(inner);
+        self.shared.wake.signal(());
+        Ok(())
+    }
+}
+
+/// What a context's handle asks the core to send.
+enum Op<'a> {
+    Send(Target<'a>, &'a [u8]),
+    Connect(&'a Address),
 }
 
 /// The node's own events, in order.
@@ -932,7 +985,52 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
     /// [`NodeError::Send`] with the core's named error, or
     /// [`NodeError::ContextClosed`].
     pub async fn send(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
-        self.send_target(Target::Address(to), data).await
+        self.send_target(Op::Send(Target::Address(to), data)).await
+    }
+
+    /// Opens a session with the peer at `to` without sending data: the
+    /// handshake's confirmation is a keepalive. Nothing is done for a session
+    /// with keys or one opening.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`].
+    pub async fn connect(&self, to: &Address) -> Result<(), NodeError> {
+        self.send_target(Op::Connect(to)).await
+    }
+
+    /// Whether the session with `peer` has keys now.
+    pub async fn is_live(&self, peer: PeerId) -> bool {
+        let inner = self.shared.inner.lock().await;
+        inner.endpoint.is_live(&peer, self.name.as_bytes(), now())
+    }
+
+    /// The candidates `peer` announced in its session (`PROTOCOL.md §7`),
+    /// written to `out`; returns how many. None without a session with keys.
+    pub async fn peer_candidates(&self, peer: PeerId, out: &mut [Candidate]) -> usize {
+        let inner = self.shared.inner.lock().await;
+        let candidates = inner.endpoint.peer_candidates(&peer, self.name.as_bytes());
+        for (slot, candidate) in out.iter_mut().zip(candidates) {
+            *slot = *candidate;
+        }
+        candidates.len().min(out.len())
+    }
+
+    /// Turns the passive keepalive on or off for the session with `peer`, in
+    /// place of the context's default, for that session's life.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NoSession`] without a session with `peer`.
+    pub async fn set_passive_keepalive(&self, peer: PeerId, on: bool) -> Result<(), NodeError> {
+        let mut inner = self.shared.inner.lock().await;
+        inner
+            .endpoint
+            .set_passive_keepalive(peer, self.name.as_bytes(), on)
+            .map_err(|_| NodeError::NoSession)?;
+        drop(inner);
+        self.shared.wake.signal(());
+        Ok(())
     }
 
     /// Sends `data` to `peer`, which must have a session with keys.
@@ -941,17 +1039,20 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
     ///
     /// As [`Self::send`].
     pub async fn send_to_peer(&self, peer: PeerId, data: &[u8]) -> Result<(), NodeError> {
-        self.send_target(Target::Peer(peer), data).await
+        self.send_target(Op::Send(Target::Peer(peer), data)).await
     }
 
-    async fn send_target(&self, target: Target<'_>, data: &[u8]) -> Result<(), NodeError> {
+    async fn send_target(&self, op: Op<'_>) -> Result<(), NodeError> {
         let mut link_out = self.link_out().await;
         let mut guard = self.open().await?;
         let inner = &mut *guard;
-        let output = with_policies!(
-            inner,
-            send(target, self.name.as_bytes(), data, DIRECT_PATH_MAX, now())
-        )
+        let output = match op {
+            Op::Send(target, data) => with_policies!(
+                inner,
+                send(target, self.name.as_bytes(), data, DIRECT_PATH_MAX, now())
+            ),
+            Op::Connect(to) => with_policies!(inner, connect(to, self.name.as_bytes(), now())),
+        }
         .map_err(NodeError::Send)?;
         match output {
             Output::Transmit { to, len } => {

@@ -530,3 +530,34 @@ fn a_question_about_the_observed_address_is_answered() {
         Some(&Ev::Observed(relay::Link::Udp, world.clients[0].nat))
     );
 }
+
+/// The relay keeps nothing for clients met and gone: 100 clients each send
+/// through the relay, and once their keys expire the relay's endpoint holds
+/// no session for them.
+#[test]
+fn the_relay_keeps_nothing_for_clients_gone() {
+    // The limits on first contacts are not what is measured here.
+    let config = Config {
+        first_contacts_per_recipient: 1_000,
+        first_contacts_burst: 1_000,
+        handshakes_per_ip: 1_000,
+        handshakes_burst: 1_000,
+        ..Config::default()
+    };
+    let mut world = World::new(Open, config, 101);
+    world.open_link(0);
+    world.run_for(1000);
+    for i in 1..=100 {
+        world.send(i, 0, b"once").unwrap();
+    }
+    world.run_for(3000);
+    // Each client opened a session with the relay to send; B, a
+    // microcontroller, takes only the few it has room for.
+    assert!(world.relay.endpoint.session_count() >= 100);
+    world.run_for(181_000);
+    assert_eq!(
+        world.relay.endpoint.session_count(),
+        0,
+        "clients gone, nothing kept"
+    );
+}

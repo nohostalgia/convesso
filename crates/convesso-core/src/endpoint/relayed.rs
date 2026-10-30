@@ -162,6 +162,23 @@ impl core::error::Error for KeepAliveTooShort {}
 const LABEL_UDP: &[u8] = b"convesso relay udp";
 const LABEL_TCP: &[u8] = b"convesso relay tcp";
 
+/// Where an answer to the packet from `source` goes when it leaves through
+/// the next poll, which routes it as a direct answer: through the relay to a
+/// peer it forwarded, back to the relay on the path it came on, or to the
+/// source of the packet handled last, as any direct answer.
+pub(super) fn answer_hop(source: Source<'_>) -> Hop {
+    match source {
+        Source::Relayed(peer) => Hop::Peer {
+            peer,
+            last_source: source.key(),
+            attempt: None,
+        },
+        Source::Direct(LABEL_UDP) => Hop::Relay(RelayPath::Udp),
+        Source::Direct(LABEL_TCP) => Hop::Relay(RelayPath::Tcp),
+        Source::Direct(_) => Hop::Source,
+    }
+}
+
 /// Where the TCP link to the relay stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
@@ -1263,6 +1280,7 @@ impl<C: Config> Endpoint<C> {
         let ours = |peer: &PeerId, context: &Context| relay.is(&(*peer, *context));
         match event {
             Event::Connected { peer, context }
+            | Event::Idle { peer, context }
             | Event::Datagram { peer, context, .. }
             | Event::Frame { peer, context, .. }
             | Event::Payload { peer, context, .. }
@@ -1644,7 +1662,6 @@ impl<C: Config> Endpoint<C> {
         }
         session.confirm = false;
         session.last_sent = Some(now);
-        session.last_used = now;
         Ok(Some((To::Relay(path), len)))
     }
 
@@ -1719,9 +1736,8 @@ impl<C: Config> Endpoint<C> {
         let frame = out
             .get(DATA_AT..DATA_AT + frame_len)
             .ok_or(SendError::Capacity)?;
-        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key).ok_or(SendError::Capacity)?;
         session.address = Some(address);
-        session.last_used = now;
         let indices = &self.indices;
         let session = self.sessions.get_mut(&key).ok_or(SendError::Capacity)?;
         match attempt_of(indices, frame) {
@@ -1757,7 +1773,7 @@ impl<C: Config> Endpoint<C> {
         let Some((key, address)) = self.relay.as_ref().map(|r| (r.key(), r.address)) else {
             return Err(SendError::NoRelay);
         };
-        let len = self.start_dial(key, &address, now, policy, entropy, out)?;
+        let len = self.start_dial(key, &address, None, now, policy, entropy, out)?;
         let path = path.unwrap_or_else(|| self.relay_path(now));
         Ok((To::Relay(path), len))
     }
@@ -2008,6 +2024,7 @@ impl Event<'_> {
     fn owned(self) -> Event<'static> {
         match self {
             Event::Connected { peer, context } => Event::Connected { peer, context },
+            Event::Idle { peer, context } => Event::Idle { peer, context },
             Event::Closed {
                 peer,
                 context,

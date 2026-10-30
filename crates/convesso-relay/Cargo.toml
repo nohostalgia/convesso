@@ -13,7 +13,7 @@ convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["all
 
 [dev-dependencies]
 # Tests put arbitrary packets through the relay, with `through_relay`.
-convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc", "testing"] }
+convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc", "ed25519-seed", "testing"] }
 # Reliable messages in the simulated world.
 convesso-stream = { path = "../convesso-stream", version = "0.0.0", features = ["alloc"] }
 proptest.workspace = true

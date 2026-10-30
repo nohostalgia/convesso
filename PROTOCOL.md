@@ -101,6 +101,13 @@ packet is `134 + n` bytes. Such a payload is authenticated, but it can be replay
 its secrecy if the responder's key is ever stolen; the application is told it is *unconfirmed*. The
 relay uses it to deliver a first packet in one datagram (§6).
 
+**Early data.** An application may declare a context to carry it, on both sides. A dial in such a
+context, started by a datagram, carries the oldest queued datagram as the payload of its first
+contacts when the first contact fits the path, and every retry carries it again under a fresh
+ephemeral key. Once the dial completes, that datagram counts as sent. The responder hands it over
+as an early datagram, before the connection: it can arrive once for each attempt admitted, and
+again on a replay. A context not declared drops a first contact with a payload in silence.
+
 **The response** is exactly 61 bytes:
 
 | Offset | Length | Content |
@@ -217,11 +224,20 @@ Other values are reserved: such a packet is counted against replay, and its cont
   2^60 packets.
 - **Two key pairs.** A session sends with its current keys, and still receives with the previous
   ones, so packets in flight across a renewal are not lost.
-- **Dormancy.** A session with no keys left sends nothing and waits for nothing. The next datagram
-  starts a handshake and waits in a bounded queue (1,024 bytes on a microcontroller, 65,536 on a
-  server); a datagram that does not fit is refused.
+- **Dormancy.** A session with no keys left sends nothing and waits for nothing. The application
+  is told it went *idle*, and, with nothing in progress (no dial, no queued datagram, no close),
+  the session is forgotten: an endpoint holds the sessions in use, whatever the peers it met. The
+  next datagram starts a handshake and waits in a bounded queue (1,024 bytes on a microcontroller,
+  65,536 on a server); a datagram that does not fit is refused. When the handshake completes, the
+  application is told of a connection again: connection and idle alternate for each session, and
+  a renewal raises neither.
+- **The passive keepalive.** A session may send one keepalive 10 seconds after receiving data, if
+  it sent nothing since, so that a device that only receives keeps its NAT open. It is off unless
+  the application turns it on: for a context, as the default of every session opening in it, or
+  for one session, for that session's life.
 - **A session reopens only from an address,** since `mac1` needs the address. Sending by peer id
-  works only while the session has keys.
+  works only while the session has keys. A caller that knows where the peer is, as a relay knows
+  its clients, may name that path for the reopening.
 - **Close** is one authenticated packet with a code. It is not retransmitted. Codes `0x0001` to
   `0x00FF` are the library's, `0x0100` to `0xFFFF` the application's, as for refusals; `0x0000` is
   not sent. `0x0001` is a close without a code: one asked with `0x0000`, or a context closed by

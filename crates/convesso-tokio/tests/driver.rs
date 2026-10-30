@@ -781,3 +781,111 @@ async fn tls_without_the_feature_is_refused() {
     })
     .await;
 }
+
+// --- the core's session controls -------------------------------------------------------
+
+/// Two nodes with no relay, each with `app` opened with `options`, each
+/// knowing where the other is.
+async fn pair_with(options: impl Fn() -> ContextOptions) -> [(Node, Context, ContextEvents); 2] {
+    let (a, _a_events) = start(31, None).await;
+    let (b, _b_events) = start(32, None).await;
+    a.set_hint(b.address().peer_id(), b.local_addr())
+        .await
+        .unwrap();
+    b.set_hint(a.address().peer_id(), a.local_addr())
+        .await
+        .unwrap();
+    let (a_app, a_app_events) = a.context(b"app", options()).await.unwrap();
+    let (b_app, b_app_events) = b.context(b"app", options()).await.unwrap();
+    [(a, a_app, a_app_events), (b, b_app, b_app_events)]
+}
+
+/// Scenario: a session opened without data: the handle reports the
+/// connection, and the session has keys.
+#[tokio::test]
+async fn a_session_opened_without_data() {
+    let [(_a, a_app, mut a_events), (b, _b_app, _b_events)] =
+        pair_with(ContextOptions::default).await;
+    let peer = b.address().peer_id();
+    assert!(!a_app.is_live(peer).await.unwrap());
+    a_app.connect(b.address()).await.unwrap();
+    next(&mut a_events, |e| match e {
+        ContextEvent::Connected { peer: p } if p == peer => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(a_app.is_live(peer).await.unwrap());
+    // The peer announced its candidates in the session, or none: either way
+    // the call answers.
+    let _ = a_app.peer_candidates(peer).await.unwrap();
+}
+
+/// Scenario: a keep-alive interval below a minute is refused; the pinned
+/// relay is the one given.
+#[tokio::test]
+async fn a_keepalive_interval_below_a_minute_is_refused() {
+    let relay = relay().await;
+    let (node, _events) = start(33, Some(&relay)).await;
+    assert!(matches!(
+        node.set_relay_keepalive(Duration::from_secs(30)).await,
+        Err(NodeError::KeepAlive(_))
+    ));
+    node.set_relay_keepalive(Duration::from_secs(120))
+        .await
+        .unwrap();
+    assert_eq!(node.relay().await.unwrap(), Some(relay));
+}
+
+/// Scenario: the passive keepalive of a peer with no session is refused.
+#[tokio::test]
+async fn the_passive_keepalive_of_a_peer_with_no_session() {
+    let (_node, _events, app, _app_events) = node(34, None, 16).await;
+    assert_eq!(
+        app.set_passive_keepalive(identity(35).peer_id(), true)
+            .await,
+        Err(NodeError::NoSession)
+    );
+}
+
+/// Scenario: options left out change nothing: a first datagram arrives as a
+/// datagram, not in the first contact.
+#[tokio::test]
+async fn options_left_out_change_nothing() {
+    let [(_a, a_app, _a_events), (b, _b_app, mut b_events)] =
+        pair_with(ContextOptions::default).await;
+    a_app.send(b.address(), b"plain".to_vec()).await.unwrap();
+    let first = next(&mut b_events, |e| match e {
+        ContextEvent::Datagram { data, .. } => Some(Ok(data)),
+        ContextEvent::EarlyDatagram { data, .. } => Some(Err(data)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first, Ok(b"plain".to_vec()));
+}
+
+/// Early data between two nodes: the first datagram arrives as an early
+/// datagram, before the connection, and not again.
+#[tokio::test]
+async fn early_data_arrives_before_the_connection() {
+    let early = || ContextOptions {
+        early_data: true,
+        ..ContextOptions::default()
+    };
+    let [(a, a_app, _a_events), (b, _b_app, mut b_events)] = pair_with(early).await;
+    a_app.send(b.address(), b"early".to_vec()).await.unwrap();
+    let peer = a.address().peer_id();
+    let first = next(&mut b_events, |e| match e {
+        ContextEvent::EarlyDatagram { peer: p, data } if p == peer => Some(Ok(data)),
+        ContextEvent::Connected { .. } | ContextEvent::Datagram { .. } => Some(Err(e)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first.unwrap(), b"early".to_vec());
+    a_app.send(b.address(), b"then".to_vec()).await.unwrap();
+    let data = next(&mut b_events, |e| match e {
+        ContextEvent::Datagram { data, .. } => Some(data),
+        _ => None,
+    })
+    .await;
+    assert_eq!(data, b"then".to_vec());
+}

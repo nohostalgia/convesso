@@ -36,8 +36,8 @@ use std::time::{Duration, Instant as Clock};
 
 use convesso_core::dos::Source;
 use convesso_core::endpoint::{
-    Endpoint, Event, ExcludeError, HintError, Output, Poll, RelayError, RelayPath, SendError,
-    Target, To,
+    Endpoint, Event, ExcludeError, HintError, KeepAliveTooShort, NoSession, Output, Poll,
+    RelayError, RelayPath, SendError, Settings, Target, To,
 };
 use convesso_core::handshake::{self, ChannelBinding, Context as Name};
 use convesso_core::handshake::{Admission, Decision, DialError, ResponderError};
@@ -218,6 +218,15 @@ pub struct ContextOptions {
     /// configuration's when unset (feature `stream`).
     #[cfg(feature = "stream")]
     pub max_message: Option<usize>,
+    /// Whether its sessions send the passive keepalive: one keepalive 10 s
+    /// after data arrives, if they sent nothing since. A session can override
+    /// it ([`Context::set_passive_keepalive`]). Off by default.
+    pub passive_keepalive: bool,
+    /// Whether it carries early data: the first datagram to a peer with no
+    /// session travels in the first contact, and arrives as
+    /// [`ContextEvent::EarlyDatagram`], unconfirmed. Both sides of the
+    /// context must set it. Off by default.
+    pub early_data: bool,
 }
 
 impl Default for ContextOptions {
@@ -228,6 +237,8 @@ impl Default for ContextOptions {
             events: 256,
             #[cfg(feature = "stream")]
             max_message: None,
+            passive_keepalive: false,
+            early_data: false,
         }
     }
 }
@@ -319,6 +330,11 @@ pub enum NodeError {
     NotPerPeer,
     /// A receiver asked for a peer that already has one open.
     ReceiverOpen,
+    /// No session with that peer in that context.
+    NoSession,
+    /// The relay link's keep-alive interval was refused, with the core's
+    /// named error.
+    KeepAlive(KeepAliveTooShort),
     /// The stream layer refused a message, or a context's largest message,
     /// with its named error.
     #[cfg(feature = "stream")]
@@ -346,6 +362,8 @@ impl std::fmt::Display for NodeError {
                 f.write_str("the context delivers to its event stream, not per peer")
             }
             Self::ReceiverOpen => f.write_str("the peer already has a receiver open"),
+            Self::NoSession => NoSession.fmt(f),
+            Self::KeepAlive(error) => error.fmt(f),
             #[cfg(feature = "stream")]
             Self::Message(error) => write!(f, "the message was refused: {error:?}"),
         }
@@ -383,10 +401,28 @@ pub enum NodeEvent {
 /// Something in a context the application should know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextEvent {
-    /// A first session with a peer.
+    /// A session with a peer has keys, where it had none: its first, or one
+    /// after [`ContextEvent::Idle`].
     Connected {
         /// The peer.
         peer: PeerId,
+    },
+    /// The session with a peer has no keys left: they expired. The next
+    /// datagram opens one again, with [`ContextEvent::Connected`].
+    Idle {
+        /// The peer.
+        peer: PeerId,
+    },
+    /// A datagram that came in a peer's first contact, in a context that
+    /// carries early data, before the session with it is confirmed. It is
+    /// authenticated as the peer's, but **unconfirmed**: a replay of that
+    /// first contact delivers it again, and each attempt of the peer's dial
+    /// may deliver it. To the event stream whatever the context's delivery.
+    EarlyDatagram {
+        /// The peer.
+        peer: PeerId,
+        /// The data.
+        data: Vec<u8>,
     },
     /// A datagram.
     Datagram {
@@ -488,6 +524,7 @@ struct Opening {
     events: mpsc::Sender<ContextEvent>,
     #[cfg(feature = "stream")]
     max_message: Option<usize>,
+    settings: Settings,
 }
 
 enum Command {
@@ -528,6 +565,12 @@ enum Command {
     Receiver(Name, PeerId, oneshot::Sender<Result<Receiver, NodeError>>),
     #[cfg(feature = "stream")]
     SendMessage(Parked),
+    Connect(Name, Address, oneshot::Sender<Result<(), NodeError>>),
+    IsLive(Name, PeerId, oneshot::Sender<bool>),
+    PeerCandidates(Name, PeerId, oneshot::Sender<Vec<Candidate>>),
+    PassiveKeepalive(Name, PeerId, bool, oneshot::Sender<Result<(), NodeError>>),
+    RelayKeepalive(Duration, oneshot::Sender<Result<(), NodeError>>),
+    PinnedRelay(oneshot::Sender<Option<RelayLocation>>),
 }
 
 /// A relay and the UDP addresses its host resolved to, if it did.
@@ -641,6 +684,10 @@ impl Node {
             events: events_tx,
             #[cfg(feature = "stream")]
             max_message: options.max_message,
+            settings: Settings {
+                passive_keepalive: options.passive_keepalive,
+                early_data: options.early_data,
+            },
         };
         self.answer(|reply| Command::Open(opening, reply)).await?;
         Ok((
@@ -780,6 +827,30 @@ impl Node {
     /// [`NodeError::Stopped`].
     pub async fn close_peer(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
         ask(&self.commands, Command::ClosePeer(peer, code)).await
+    }
+
+    /// The pinned relay, as the node was last given it; `None` without one.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn relay(&self) -> Result<Option<RelayLocation>, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        ask(&self.commands, Command::PinnedRelay(reply)).await?;
+        answer.await.map_err(|_| NodeError::Stopped)
+    }
+
+    /// Sets how long the relay link may stay silent before a keep-alive: 60
+    /// seconds by default, never less.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::KeepAlive`] below a minute, the interval unchanged; or
+    /// [`NodeError::Stopped`].
+    pub async fn set_relay_keepalive(&self, interval: Duration) -> Result<(), NodeError> {
+        let (reply, answer) = oneshot::channel();
+        ask(&self.commands, Command::RelayKeepalive(interval, reply)).await?;
+        answer.await.map_err(|_| NodeError::Stopped)?
     }
 
     /// Tells the core the network changed: a reachable node replaces its
@@ -930,6 +1001,58 @@ impl Context {
     /// [`NodeError::Stopped`].
     pub async fn close(&self, peer: PeerId, code: u16) -> Result<(), NodeError> {
         self.ask(Command::Close(self.name_of(), peer, code)).await
+    }
+
+    /// Opens a session with the peer at `to` without sending data: the
+    /// handshake's confirmation is a keepalive. Nothing is done for a session
+    /// with keys or one opening.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Send`] with the core's error; [`NodeError::ContextClosed`];
+    /// or [`NodeError::Stopped`].
+    pub async fn connect(&self, to: Address) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::Connect(context, to, reply))
+            .await
+    }
+
+    /// Whether the session with `peer` has keys now.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn is_live(&self, peer: PeerId) -> Result<bool, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::IsLive(self.name_of(), peer, reply))
+            .await?;
+        answer.await.map_err(|_| NodeError::Stopped)
+    }
+
+    /// The candidates `peer` announced in its session (`PROTOCOL.md §7`);
+    /// none without a session with keys.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Stopped`].
+    pub async fn peer_candidates(&self, peer: PeerId) -> Result<Vec<Candidate>, NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::PeerCandidates(self.name_of(), peer, reply))
+            .await?;
+        answer.await.map_err(|_| NodeError::Stopped)
+    }
+
+    /// Turns the passive keepalive on or off for the session with `peer`, in
+    /// place of the context's default, for that session's life.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NoSession`] without a session with `peer`; or
+    /// [`NodeError::Stopped`].
+    pub async fn set_passive_keepalive(&self, peer: PeerId, on: bool) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::PassiveKeepalive(context, peer, on, reply))
+            .await
     }
 
     /// The path to `peer`, and how it got there; `None` without a session.
@@ -1122,6 +1245,7 @@ async fn build<E: SystemEntropy, C: Profile>(
         relay: config.relay.take(),
         relay_udp: relay_udp.map(|(primary, _)| primary),
         relay_other: relay_udp.and_then(|(_, other)| other),
+        last_from: None,
         link: None,
         connecting: None,
         resolver: config.resolver.clone(),
@@ -1461,6 +1585,7 @@ fn owned_event(event: Event<'_>) -> Owned {
         Event::Connected { peer, context } => {
             Owned::Context(context, ContextEvent::Connected { peer })
         }
+        Event::Idle { peer, context } => Owned::Context(context, ContextEvent::Idle { peer }),
         Event::Datagram {
             peer,
             context,
@@ -1533,8 +1658,18 @@ fn owned_event(event: Event<'_>) -> Owned {
                 Owned::Nothing
             }
         }
-        // Only the relay context accepts payloads, and the core consumes them.
-        Event::Payload { .. } => Owned::Nothing,
+        // Early data: the relay context's payloads never reach here.
+        Event::Payload {
+            peer,
+            context,
+            data,
+        } => Owned::Context(
+            context,
+            ContextEvent::EarlyDatagram {
+                peer,
+                data: data.to_vec(),
+            },
+        ),
     }
 }
 
@@ -1552,6 +1687,9 @@ struct Task<E, C: Profile> {
     /// family, where `RelayPath::UdpOther` goes.
     relay_udp: Option<SocketAddr>,
     relay_other: Option<SocketAddr>,
+    /// The source of the UDP packet handled last: where `To::Source` goes
+    /// when the answer leaves through a poll, as an owed response does.
+    last_from: Option<SocketAddr>,
     link: Option<LinkIo>,
     connecting: Option<Connecting>,
     resolver: Option<Resolver>,
@@ -1626,6 +1764,7 @@ struct Held(PeerId, Kind);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Connected,
+    Idle,
     Closed,
     ReopenFailed,
     PathChanged,
@@ -1647,12 +1786,13 @@ enum NodeKind {
 fn held_key(event: &ContextEvent) -> Option<Held> {
     Some(match *event {
         ContextEvent::Connected { peer } => Held(peer, Kind::Connected),
+        ContextEvent::Idle { peer } => Held(peer, Kind::Idle),
         ContextEvent::Closed { peer, .. } => Held(peer, Kind::Closed),
         ContextEvent::ReopenFailed { peer, .. } => Held(peer, Kind::ReopenFailed),
         ContextEvent::PathChanged { peer, .. } => Held(peer, Kind::PathChanged),
         #[cfg(feature = "stream")]
         ContextEvent::ChannelReset { peer, .. } => Held(peer, Kind::ChannelReset),
-        ContextEvent::Datagram { .. } => return None,
+        ContextEvent::Datagram { .. } | ContextEvent::EarlyDatagram { .. } => return None,
         #[cfg(feature = "stream")]
         ContextEvent::Message { .. } => return None,
     })
@@ -1777,6 +1917,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
 
     async fn udp_packet(&mut self, len: usize, from: SocketAddr) {
         let from = canonical(from);
+        self.last_from = Some(from);
         self.stats.udp_received += 1;
         self.stats.udp_received_bytes += len as u64;
         let now = self.now();
@@ -2013,6 +2154,45 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             Command::RelayUdpProven(reply) => {
                 let _ = reply.send(self.endpoint.relay_udp_proven(now));
             }
+            Command::Connect(context, to, reply) => {
+                if !self.contexts.contains_key(&context) {
+                    let _ = reply.send(Err(NodeError::ContextClosed));
+                    return;
+                }
+                let result = self.endpoint.connect(
+                    &to,
+                    context.as_bytes(),
+                    now,
+                    &mut self.policies,
+                    &mut self.entropy,
+                    &mut self.out,
+                );
+                self.sent(result, reply).await;
+            }
+            Command::IsLive(context, peer, reply) => {
+                let _ = reply.send(self.endpoint.is_live(&peer, context.as_bytes(), now));
+            }
+            Command::PeerCandidates(context, peer, reply) => {
+                let candidates = self.endpoint.peer_candidates(&peer, context.as_bytes());
+                let _ = reply.send(candidates.to_vec());
+            }
+            Command::PassiveKeepalive(context, peer, on, reply) => {
+                let result = self
+                    .endpoint
+                    .set_passive_keepalive(peer, context.as_bytes(), on)
+                    .map_err(|NoSession| NodeError::NoSession);
+                let _ = reply.send(result);
+            }
+            Command::RelayKeepalive(interval, reply) => {
+                let result = self
+                    .endpoint
+                    .set_relay_keepalive(interval)
+                    .map_err(NodeError::KeepAlive);
+                let _ = reply.send(result);
+            }
+            Command::PinnedRelay(reply) => {
+                let _ = reply.send(self.relay.clone());
+            }
             Command::Receiver(context, peer, reply) => {
                 let _ = reply.send(self.open_receiver(context, peer, now));
             }
@@ -2047,6 +2227,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
             events,
             #[cfg(feature = "stream")]
             max_message,
+            settings,
         } = opening;
         let context = Name::new(&name)
             .map_err(|error| NodeError::Context(ResponderError::ContextTooLong(error)))?;
@@ -2075,10 +2256,18 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 }
             }
         }
-        if let Some(access) = core_access(&access) {
-            self.endpoint
-                .serve(&name, access)
-                .map_err(NodeError::Context)?;
+        // The settings first, so that serving takes them; undone if serving
+        // fails, the context then not open.
+        self.endpoint
+            .set_context_settings(&name, settings)
+            .map_err(NodeError::Context)?;
+        if let Some(access) = core_access(&access)
+            && let Err(error) = self.endpoint.serve(&name, access)
+        {
+            let _ = self
+                .endpoint
+                .set_context_settings(&name, Settings::default());
+            return Err(NodeError::Context(error));
         }
         #[cfg(feature = "stream")]
         if let Err(error) = self.channels.set_context(
@@ -2776,7 +2965,7 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 };
                 match to {
                     To::Source => {
-                        if let Some(from) = from {
+                        if let Some(from) = from.or(self.last_from) {
                             self.stats.core_udp_outputs += 1;
                             send_udp(&self.udp, self.dual_stack, &mut self.stats, packet, from)
                                 .await;
