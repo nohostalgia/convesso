@@ -2903,6 +2903,10 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 connected,
             } => {
                 let now = self.now();
+                if connected {
+                    self.channels
+                        .session_opened(peer, context, &mut self.entropy);
+                }
                 self.channels.handle_frame(peer, context, kind, &data, now);
                 if connected {
                     self.emit(context, ContextEvent::Connected { peer });
@@ -2915,6 +2919,11 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 relayed,
                 connected,
             } => {
+                #[cfg(feature = "stream")]
+                if connected {
+                    self.channels
+                        .session_opened(peer, context, &mut self.entropy);
+                }
                 if self.per_peer(&context) {
                     if connected {
                         self.emit(context, ContextEvent::Connected { peer });
@@ -2942,6 +2951,15 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                     }
                     ContextEvent::ReopenFailed { peer, error } => {
                         self.channels.reopen_failed(peer, context, error);
+                    }
+                    // A session's end, or a new one: the channel's
+                    // incarnations retire (`PROTOCOL.md §8`).
+                    ContextEvent::Connected { peer } => {
+                        self.channels
+                            .session_opened(peer, context, &mut self.entropy);
+                    }
+                    ContextEvent::Idle { peer } => {
+                        self.channels.session_idle(peer, context, &mut self.entropy);
                     }
                     _ => {}
                 }

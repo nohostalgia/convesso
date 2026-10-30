@@ -178,7 +178,10 @@ impl Node {
     }
 
     fn first_contacts_sent(&self) -> usize {
-        self.sent.iter().filter(|p| p[..2] == [0x01, 0x01]).count()
+        self.sent
+            .iter()
+            .filter(|p| p[0] == 0x01 && crate::handshake::messages::is_first_contact_type(p[1]))
+            .count()
     }
 }
 
@@ -1390,8 +1393,10 @@ fn datagrams_survive_a_lossy_reordering_duplicating_link() {
     }
 }
 
-/// Simultaneous dials: both sides reopen at the same instant; both handshakes
-/// complete, and datagrams flow both ways afterwards.
+/// Simultaneous dials: both sides reopen at the same instant. The openings
+/// cross, and the one the greater `PeerId` started wins at both ends: one
+/// handshake completes, each side raises one connection, both hold the same
+/// binding, and datagrams flow both ways.
 #[test]
 fn simultaneous_dials_converge() {
     let mut net = Net::new();
@@ -1421,11 +1426,18 @@ fn simultaneous_dials_converge() {
     }
     net.settle_with(queue);
     assert!(net.b_datagrams().contains(&b"from a".to_vec()));
-    assert!(net.a.events.contains(&Ev::Datagram(
-        b"session".to_vec(),
-        b"from b".to_vec(),
-        false
-    )));
+    assert!(
+        net.a
+            .events
+            .iter()
+            .any(|e| matches!(e, Ev::Datagram(_, data, _) if data.as_slice() == b"from b"))
+    );
+    // One connection each for the first session, one for this one.
+    assert_eq!(Net::connections(&net.a), 2, "{:?}", net.a.events);
+    assert_eq!(Net::connections(&net.b), 2, "{:?}", net.b.events);
+    let (a_binding, b_binding) = bindings(&net);
+    assert!(a_binding.is_some());
+    assert_eq!(a_binding, b_binding, "one handshake, one binding");
     // And afterwards, in both directions.
     net.at(401);
     net.a_sends(b"after a").unwrap();
@@ -4256,4 +4268,105 @@ fn early_data_arrives_at_most_once_per_attempt() {
     assert!((1..=4).contains(&delivered), "{delivered}");
     assert!(net.b_datagrams().is_empty());
     assert!(net.a.events.iter().any(|e| matches!(e, Ev::Connected(_))));
+}
+
+#[cfg(feature = "ed25519-seed")]
+crate::profile! {
+    /// The server profile with room for many sessions with keys, admitting
+    /// handshakes as fast as a measurement makes them.
+    Wide: Server { indices: 100_000, load_rate_per_second: 10_000_000, load_burst: 10_000_000 }
+}
+
+/// The cost of one datagram each way between a server-profile endpoint and
+/// one of N peers it holds a session with keys with: how a busy relay or
+/// server scales. Ignored by default; run it with
+/// `cargo test -p convesso-core --all-features --release --lib a_packet_with_sessions_live -- --ignored --nocapture`.
+#[cfg(feature = "ed25519-seed")]
+#[test]
+#[ignore = "a measurement, meaningful only in release"]
+fn a_packet_with_sessions_live() {
+    for n in [1u32, 1_000, 10_000] {
+        let b_source = [192, 0, 2, 1, 0x1f, 0x40];
+        let mut b: Peer<Wide> = Peer::new(identity(0), b_source, 1);
+        // The check walks every session, which is what is measured.
+        b.endpoint.set_index_check(false);
+        let b_peer = b.endpoint.identity().peer_id();
+        let b_address = b.address();
+        let built = std::time::Instant::now();
+        let mut last = None;
+        for i in 0..n {
+            let now = Instant::from_millis(u64::from(i));
+            let [_, x, y, z] = i.to_be_bytes();
+            let mut c: Peer<Mcu> = Peer::new(
+                seeded(10_000 + i),
+                [10, x, y, z, 0x1f, 0x40],
+                7 + u64::from(i),
+            );
+            c.endpoint.set_hints(b_peer, &[&b_source], now).unwrap();
+            let packet = c.send_to(&b_address, b"hi", now);
+            settle_pair(&mut c, &mut b, packet, now);
+            if i + 1 == n {
+                last = Some(c);
+            }
+        }
+        let built = built.elapsed();
+        let mut c = last.unwrap();
+        let c_peer = c.endpoint.identity().peer_id();
+        let start = u64::from(n) + 1;
+        assert!(
+            b.endpoint
+                .is_live(&c_peer, b"session", Instant::from_millis(start))
+        );
+        let rounds = 2_000u64;
+        let started = std::time::Instant::now();
+        for round in 0..rounds {
+            let now = Instant::from_millis(start + round);
+            let packet = c.send_to(&b_address, b"ping", now).expect("a live session");
+            let _ = c.drain(now);
+            let _ = b.take(&packet, c.source, now);
+            let _ = b.drain(now);
+            let mut out = [0u8; 2048];
+            let Ok(Output::Transmit { len, .. }) = b.endpoint.send(
+                Target::Peer(c_peer),
+                b"session",
+                b"pong",
+                PATH,
+                now,
+                &mut b.policy,
+                &mut b.entropy,
+                &mut out,
+            ) else {
+                panic!("round {round}");
+            };
+            let _ = b.drain(now);
+            let _ = c.take(&out[..len], b.source, now);
+            let _ = c.drain(now);
+        }
+        let per_round = started.elapsed() / u32::try_from(rounds).unwrap();
+        std::println!(
+            "{n:>6} sessions with keys: {per_round:?} a round; {} held; opened in {built:?}",
+            b.endpoint.session_count()
+        );
+    }
+}
+
+/// A renewal that outlives the keys: A renews at 179.5 s, its first attempt
+/// is lost, and the retry reaches B after B's keys expired. B answers it as
+/// opening a session; A, whose idle the renewal held back, takes it so too:
+/// both hold the same binding, and the datagram is delivered.
+#[test]
+fn a_renewal_that_outlives_the_keys_keeps_both_ends_agreed() {
+    let mut net = Net::new();
+    net.a_sends(b"one").unwrap();
+    let (before, _) = bindings(&net);
+    net.now = 179_500;
+    net.drop_to_b = true;
+    net.a_sends(b"two").unwrap();
+    net.drop_to_b = false;
+    net.at(181);
+    let (at_a, at_b) = bindings(&net);
+    assert!(at_a.is_some());
+    assert_eq!(at_a, at_b, "one binding at both ends");
+    assert_ne!(at_a, before, "the session opened again");
+    assert!(net.b_datagrams().contains(&b"one".to_vec()));
 }

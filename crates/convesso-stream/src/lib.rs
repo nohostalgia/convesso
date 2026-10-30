@@ -47,6 +47,7 @@ extern crate alloc;
 mod channel;
 pub mod config;
 pub mod frame;
+mod index;
 
 // For `config!`, so that a crate using it need not name the core.
 #[doc(hidden)]
@@ -65,6 +66,7 @@ pub use channel::{
 };
 use channel::{Channel, Emitted, Output};
 use config::{Key, StreamConfig};
+use index::Indexed;
 
 /// Something the application should know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +138,8 @@ struct Limits {
 
 /// Every channel of an endpoint.
 pub struct Channels<C: StreamConfig> {
-    table: C::Channels<Channel<C>>,
+    /// The channels, with the index of what is due among them.
+    table: Indexed<C>,
     /// The contexts given limits of their own.
     contexts: C::Contexts<Limits>,
     /// The frame handed out by the last poll, until the next call.
@@ -159,7 +162,7 @@ impl<C: StreamConfig> Channels<C> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            table: <C::Channels<Channel<C>> as Default>::default(),
+            table: Indexed::default(),
             contexts: <C::Contexts<Limits> as Default>::default(),
             emitted: None,
             cursor: None,
@@ -381,6 +384,12 @@ impl<C: StreamConfig> Channels<C> {
         }
     }
 
+    /// How many channels are held.
+    #[must_use]
+    pub fn channel_count(&self) -> usize {
+        self.table.len()
+    }
+
     /// The bytes a channel holds, both ways, if it exists: what its
     /// configuration bounds.
     #[must_use]
@@ -404,6 +413,33 @@ impl<C: StreamConfig> Channels<C> {
         self.confirm();
         if let Some(channel) = self.table.get_mut(&(peer, context)) {
             channel.reset(Reason::SessionClosed { code });
+        }
+    }
+
+    /// `peer`'s session in `context` went idle: its channel retires the
+    /// incarnations with nothing outstanding, and is forgotten if it then
+    /// holds nothing (`PROTOCOL.md §8`). How many channels a server holds then
+    /// follows the channels in use, not the peers it met.
+    pub fn session_idle(&mut self, peer: PeerId, context: Context, entropy: &mut impl Entropy) {
+        self.confirm();
+        let key = (peer, context);
+        let forget = self.table.get_mut(&key).is_some_and(|channel| {
+            channel.session_ended(entropy);
+            channel.is_idle()
+        });
+        if forget {
+            let _ = self.table.remove(&key);
+        }
+    }
+
+    /// A new session with `peer` in `context` replaced one that still had
+    /// keys: its channel retires the incarnations with nothing outstanding,
+    /// as at [`Self::session_idle`], and is kept, since the old keys still
+    /// open packets in flight and their frames must change nothing.
+    pub fn session_opened(&mut self, peer: PeerId, context: Context, entropy: &mut impl Entropy) {
+        self.confirm();
+        if let Some(channel) = self.table.get_mut(&(peer, context)) {
+            channel.session_ended(entropy);
         }
     }
 
@@ -451,34 +487,21 @@ impl<C: StreamConfig> Channels<C> {
         out: &mut [u8],
     ) -> Poll<'_> {
         self.confirm();
-        self.table.retain(|_, channel| {
-            channel.tick(now);
-            true
-        });
-        let cursor = self.cursor;
-        let mut found = None;
-        for pass in [true, false] {
-            self.table.retain(|key, channel| {
-                if found.is_none() && (!pass || cursor.is_none_or(|c| *key > c)) {
-                    match channel.output(now, deliver(&key.1), out) {
-                        Output::Nothing => {}
-                        output => found = Some((*key, output)),
-                    }
-                }
-                true
-            });
-            if found.is_some() {
-                break;
+        self.table.refresh(now);
+        let found = self.table.find(self.cursor, |key, channel| {
+            let deliver = deliver(&key.1);
+            match channel.output(now, deliver, out) {
+                // A message the reader has no room for: the channel stays
+                // ready, since only the reader's room changes that.
+                Output::Nothing => Err(!deliver && channel.holds_message()),
+                output => Ok(output),
             }
-        }
+        });
         let Some(((peer, context), output)) = found else {
-            let mut earliest: Option<Instant> = None;
-            self.table.for_each(|_, channel| {
-                if let Some(deadline) = channel.deadline() {
-                    earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
-                }
-            });
-            return earliest.map_or(Poll::Idle, Poll::Wait);
+            #[cfg(test)]
+            self.table
+                .check(|key, channel| channel.output(now, deliver(&key.1), out) != Output::Nothing);
+            return self.table.next_deadline().map_or(Poll::Idle, Poll::Wait);
         };
         self.cursor = Some((peer, context));
         match output {

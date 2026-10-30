@@ -20,11 +20,11 @@
 use core::net::{IpAddr, SocketAddr};
 
 use crate::dos::{Source, SourceKey};
-use crate::handshake::messages::{TYPE_INITIATION, TYPE_INITIATION_PAYLOAD, TYPE_RESPONSE};
+use crate::handshake::messages::{TYPE_RESPONSE, is_first_contact_type};
 use crate::handshake::{
     Access, Admission, ChannelBinding, Context, ContextTooLong, Decision, Dial, DialError,
     DialEvent, DialPoll, Entropy, Established, RESPONSE_LEN, Responder, ResponderError,
-    ResponderOutput,
+    ResponderOutput, Standing,
 };
 use crate::identity::{Address, Identity, PeerId};
 use crate::paths::PathKind;
@@ -36,9 +36,11 @@ use crate::transport::{self, OVERHEAD, ReplayWindow, TYPE_TRANSPORT, inner};
 use crate::wire::{self, Classified, Version, VersionNotSupported};
 
 mod direct;
+mod index;
 mod relayed;
 
 pub use direct::ExcludeError;
+use index::{Look, Sessions};
 pub use relayed::{
     ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintError, HintTooLong, KeepAliveTooShort,
     LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RELAY_AFTER_HINTS, RelayError,
@@ -394,7 +396,8 @@ impl core::error::Error for NoSession {}
 pub struct Endpoint<C: Config> {
     responder: Responder<C>,
     dials: C::Dials<Key, Dial>,
-    sessions: C::Sessions<Key, SessionOf<C>>,
+    /// The sessions, with the index of what is due among them.
+    sessions: Sessions<C>,
     indices: C::Indices<u32, Owner>,
     /// A response owed to the source of the last packet, sent by the next poll.
     owed: Option<([u8; RESPONSE_LEN], Hop)>,
@@ -418,6 +421,9 @@ pub struct Endpoint<C: Config> {
     excluded: C::Excluded<(IpAddr, u8), ()>,
     /// The settings of the contexts that have any, served or dialled in.
     settings: C::Contexts<Context, Settings>,
+    /// Whether each poll checks the index against a walk of every session.
+    #[cfg(any(test, feature = "testing"))]
+    check_index: bool,
 }
 
 impl<C: Config> Endpoint<C> {
@@ -447,7 +453,17 @@ impl<C: Config> Endpoint<C> {
             own: direct::Own::new(),
             excluded: Default::default(),
             settings: Default::default(),
+            #[cfg(any(test, feature = "testing"))]
+            check_index: true,
         })
+    }
+
+    /// Turns off the check that each poll's index finds what a walk of every
+    /// session finds, on by default with `testing`: for measurements, which
+    /// it would make cost as much as the walk.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_index_check(&mut self, on: bool) {
+        self.check_index = on;
     }
 
     /// Serves `context`, reached under `access`, while the endpoint runs. A
@@ -665,7 +681,7 @@ impl<C: Config> Endpoint<C> {
         self.expire(now);
         match wire::classify(packet) {
             Classified::Version(Version::V1) => match packet.get(1).copied() {
-                Some(TYPE_INITIATION | TYPE_INITIATION_PAYLOAD) => {
+                Some(kind) if is_first_contact_type(kind) => {
                     self.first_contact(packet, source, now, policy, entropy, out)
                 }
                 Some(TYPE_RESPONSE) => self.route_to_dial(packet, 6, source, now),
@@ -688,10 +704,43 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Output<'a, Hop> {
-        match self
+        // Two openings that cross: the one the greater `PeerId` started wins,
+        // at both ends, so that one handshake completes (`PROTOCOL.md §3`).
+        let me = self.responder.identity().peer_id();
+        let (sessions, dials) = (&self.sessions, &self.dials);
+        let mut yields = None;
+        let standing = |peer: &PeerId, context: &Context, renewal: bool| {
+            let key = (*peer, *context);
+            if !renewal && dials.get(&key).is_some_and(|dial| !dial.is_renewal()) {
+                if me > *peer {
+                    return Standing::Ignore;
+                }
+                yields = Some(key);
+            }
+            let live = sessions
+                .get(&key)
+                .and_then(|session| session.current.as_ref())
+                .is_some_and(|pair| pair.live(now));
+            if live {
+                Standing::LiveKeys
+            } else {
+                Standing::NoKeys
+            }
+        };
+        let answered = self
             .responder
-            .handle(packet, source, now, policy, entropy, out)
+            .handle_with(packet, source, now, policy, standing, entropy, out);
+        // This side's opening lost the crossing: its dial ends, and what it
+        // carried goes once the peer's handshake gives keys.
+        if let Some(key) = yields
+            && self.responder.pending_in(&key.0, &key.1)
         {
+            self.remove_dial(key);
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.carried = false;
+            }
+        }
+        match answered {
             ResponderOutput::Send(len) => Output::Transmit {
                 to: Hop::Source,
                 len,
@@ -826,10 +875,10 @@ impl<C: Config> Endpoint<C> {
             session.last_source = source;
         }
         session.accepted = false;
-        let (freed, renewal) = session.promote(pair, established.channel_binding());
-        // Keys where it had none: a connection, raised once until the session
-        // goes idle.
-        let first = !renewal && !session.connected;
+        // A handshake both ends agreed opens the session starts its life: a
+        // connection, whether it had no keys or keys the new ones replace.
+        let first = established.opens();
+        let freed = session.promote(pair, established.channel_binding(), first);
         session.connected |= first;
         // The dial carried the head of the queue in its first contact.
         if session.carried {
@@ -966,6 +1015,7 @@ impl<C: Config> Endpoint<C> {
         };
         let (peer, context) = (*pending.peer(), *pending.context());
         let binding = *pending.channel_binding();
+        let opens = pending.opens();
         let mut pair: KeyPair<C::ReplayWindow> = KeyPair::new(
             keys,
             pending.responder_index(),
@@ -992,8 +1042,8 @@ impl<C: Config> Endpoint<C> {
         // pair is the session's current one from here.
         heard(session, opened.inner_type, source, path, true, true, now);
         let local_index = pair.local_index;
-        let (freed, renewal) = session.promote(pair, &binding);
-        let first = !renewal && !session.connected;
+        let first = opens;
+        let freed = session.promote(pair, &binding, opens);
         session.connected |= first;
         if let Some(index) = freed {
             self.indices.remove(&index);
@@ -1226,18 +1276,27 @@ impl<C: Config> Endpoint<C> {
         if dialling || pending || session.current.as_ref().is_some_and(|pair| pair.live(now)) {
             return Ok(Output::Nothing);
         }
-        self.start_dial(key, &address, Some(path_max), now, policy, entropy, out)
-            .map(|len| Output::Transmit {
-                to: Hop::Peer {
-                    peer,
-                    last_source: self
-                        .sessions
-                        .get(&key)
-                        .and_then(|s| direct::route_source(peer, s, now, self.relay.is_some())),
-                    attempt: Some(0),
-                },
-                len,
-            })
+        self.start_dial(
+            key,
+            &address,
+            Some(path_max),
+            false,
+            now,
+            policy,
+            entropy,
+            out,
+        )
+        .map(|len| Output::Transmit {
+            to: Hop::Peer {
+                peer,
+                last_source: self
+                    .sessions
+                    .get(&key)
+                    .and_then(|s| direct::route_source(peer, s, now, self.relay.is_some())),
+                attempt: Some(0),
+            },
+            len,
+        })
     }
 
     /// Seals `data` as `inner_type` under the live keys of `key`'s session,
@@ -1381,7 +1440,7 @@ impl<C: Config> Endpoint<C> {
         }
         let session = self.session_for(key).ok_or(SendError::Capacity)?;
         session.address = Some(*address);
-        let len = self.start_dial(key, address, None, now, policy, entropy, out)?;
+        let len = self.start_dial(key, address, None, false, now, policy, entropy, out)?;
         Ok(Output::Transmit {
             to: Hop::Peer {
                 peer: key.0,
@@ -1408,6 +1467,7 @@ impl<C: Config> Endpoint<C> {
         key: Key,
         address: &Address,
         path_max: Option<usize>,
+        renewal: bool,
         now: Instant,
         policy: &mut impl Admission,
         entropy: &mut impl Entropy,
@@ -1417,18 +1477,35 @@ impl<C: Config> Endpoint<C> {
             return Err(SendError::Capacity);
         }
         let psk = policy.psk(&key.0, key.1.as_bytes());
-        let payload = self.wake_payload(&key, out.len(), path_max);
-        let (dial, len) = Dial::start_with_payload(
-            self.responder.identity(),
-            address,
-            key.1.as_bytes(),
-            psk,
-            payload,
-            now,
-            entropy,
-            out,
-        )
-        .map_err(|_| SendError::Capacity)?;
+        // A renewal carries no payload (`PROTOCOL.md §3`).
+        let payload = if renewal {
+            &[][..]
+        } else {
+            self.wake_payload(&key, out.len(), path_max)
+        };
+        let started = if renewal {
+            Dial::renew(
+                self.responder.identity(),
+                address,
+                key.1.as_bytes(),
+                psk,
+                now,
+                entropy,
+                out,
+            )
+        } else {
+            Dial::start_with_payload(
+                self.responder.identity(),
+                address,
+                key.1.as_bytes(),
+                psk,
+                payload,
+                now,
+                entropy,
+                out,
+            )
+        };
+        let (dial, len) = started.map_err(|_| SendError::Capacity)?;
         let carried = !payload.is_empty();
         if let Some(session) = self.sessions.get_mut(&key) {
             session.carried = carried;
@@ -1438,6 +1515,7 @@ impl<C: Config> Endpoint<C> {
         self.dials
             .insert(key, dial)
             .map_err(|_| SendError::Capacity)?;
+        self.sessions.touch(&key);
         Ok(len)
     }
 
@@ -1592,15 +1670,34 @@ impl<C: Config> Endpoint<C> {
 
         // A session whose keys expired: the application is told, once, and
         // the session is forgotten if nothing is in progress.
+        // A renewal in flight holds it back: completed, the session goes on.
         let mut idle = None;
-        self.sessions.for_each(|key, session| {
-            if idle.is_none() && session.connected && session.dormant() {
+        let (dials, responder) = (&self.dials, &self.responder);
+        let idles = |key: &Key, session: &SessionOf<C>| {
+            session.connected
+                && session.dormant()
+                && !dials.get(key).is_some_and(Dial::is_renewal)
+                && !responder.renewal_pending(&key.0, &key.1)
+        };
+        self.sessions.for_each_ready(|key, session| {
+            if idle.is_none() && idles(key, session) {
                 idle = Some(*key);
             }
         });
+        #[cfg(any(test, feature = "testing"))]
+        if self.check_index {
+            let mut walk = false;
+            self.sessions
+                .for_each(|key, session| walk |= idles(key, session));
+            assert_eq!(
+                idle.is_some(),
+                walk,
+                "the index and a walk find idle sessions"
+            );
+        }
         if let Some(key) = idle {
             if let Some(session) = self.sessions.get_mut(&key) {
-                session.connected = false;
+                session.end_life();
             }
             self.expire(now);
             return Poll::Event(Event::Idle {
@@ -1668,30 +1765,33 @@ impl<C: Config> Endpoint<C> {
         let mut due_session = None;
         let dials = &self.dials;
         let generation = self.own.owed_generation();
-        self.sessions.for_each(|key, session| {
-            if due_session.is_some() {
-                return;
-            }
-            let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
-            let wants = session.closing.is_some()
-                || (live && session.confirm)
-                || (live && !session.queue.is_empty())
-                || (live && candidates_owed(key, session, generation))
-                || (session.rekey && session.address.is_some() && dials.get(key).is_none())
-                || session
-                    .passive_keepalive_due()
-                    .is_some_and(|due| due <= now)
-                || direct::path_wants(session, now);
-            if wants {
+        // The ready sessions with nothing to do leave the set; one whose
+        // renewal holds back its idle stays until the renewal ends.
+        self.sessions.retain_ready(|key, session| {
+            let wants = wants(key, session, now, generation, dials);
+            if wants && due_session.is_none() {
                 due_session = Some(*key);
             }
+            wants || (session.connected && session.dormant())
         });
+        #[cfg(any(test, feature = "testing"))]
+        if self.check_index {
+            let mut walk = false;
+            self.sessions
+                .for_each(|key, session| walk |= wants(key, session, now, generation, dials));
+            assert_eq!(
+                due_session.is_some(),
+                walk,
+                "the index and a walk find sessions with something to do"
+            );
+        }
         if let Some(key) = due_session
             && let Some(result) = self.session_step(key, now, policy, entropy, out)
         {
             return result;
         }
 
+        self.expire(now);
         self.responder.expire(now);
         match self.next_deadline() {
             Some(deadline) => Poll::Wait(deadline),
@@ -1750,7 +1850,7 @@ impl<C: Config> Endpoint<C> {
                     attempt: Some(0),
                 };
                 return self
-                    .start_dial(key, &address, None, now, policy, entropy, out)
+                    .start_dial(key, &address, None, true, now, policy, entropy, out)
                     .ok()
                     .map(|len| Poll::Transmit { to, len });
             }
@@ -1845,47 +1945,54 @@ impl<C: Config> Endpoint<C> {
                 consider(due);
             }
         });
-        self.sessions.for_each(|_, session| {
-            for pair in [session.current.as_ref(), session.previous.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                consider(pair.expires_at());
-            }
-            if let Some(due) = session.passive_keepalive_due() {
-                consider(due);
-            }
-            if let Some(due) = direct::path_deadline(session) {
-                consider(due);
-            }
-        });
+        if let Some(due) = self.sessions.next_deadline() {
+            consider(due);
+        }
         if let Some(due) = self.relay.as_ref().and_then(RelayClient::next_due) {
             consider(due);
         }
         if let Some(due) = self.fan_deadline() {
             consider(due);
         }
+        #[cfg(any(test, feature = "testing"))]
+        if self.check_index {
+            let mut walk: Option<Instant> = None;
+            self.sessions.for_each(|_, session| {
+                if let Some(due) = session_deadline(session) {
+                    walk = Some(walk.map_or(due, |w| w.min(due)));
+                }
+            });
+            assert_eq!(
+                walk,
+                self.sessions.next_deadline(),
+                "the index and a walk find the next deadline"
+            );
+        }
         next
     }
 
-    /// Deletes expired key pairs. A session left without keys stays, dormant:
-    /// costs no traffic and no deadline. Once the application was told it
-    /// went idle, it is forgotten, unless something is in progress: a dial, a
-    /// queued datagram, a close (`PROTOCOL.md §5`). The endpoint thus holds
-    /// the sessions in use, whatever the peers it met.
+    /// Brings the index up to `now`, for the sessions touched and those whose
+    /// deadline came: deletes expired key pairs. A session left without keys
+    /// stays, dormant: costs no traffic and no deadline. Once the application
+    /// was told it went idle, it is forgotten, unless something is in
+    /// progress: a dial, a queued datagram, a close (`PROTOCOL.md §5`). The
+    /// endpoint thus holds the sessions in use, whatever the peers it met.
     fn expire(&mut self, now: Instant) {
         let indices = &mut self.indices;
         let dials = &self.dials;
-        self.sessions.retain(|key, session| {
+        let generation = self.own.owed_generation();
+        self.sessions.refresh(now, |key, session| {
             for index in session.expire(now).into_iter().flatten() {
                 indices.remove(&index);
             }
-            !(session.dormant()
-                && !session.connected
-                && session.queue.is_empty()
-                && session.closing.is_none()
-                && dials.get(key).is_none())
+            look(key, session, now, generation, dials)
         });
+        #[cfg(any(test, feature = "testing"))]
+        if self.check_index {
+            self.sessions.check(now, |key, session| {
+                look(key, session, now, generation, dials)
+            });
+        }
     }
 
     /// The session for `key`, created if needed; `None` when the table is
@@ -1894,7 +2001,9 @@ impl<C: Config> Endpoint<C> {
         if self.sessions.get(&key).is_none() {
             let mut session = Session::new();
             session.passive_keepalive = self.settings_of(&key.1).passive_keepalive;
-            self.sessions.insert(key, session).ok()?;
+            if !self.sessions.insert(key, session) {
+                return None;
+            }
         }
         self.sessions.get_mut(&key)
     }
@@ -1916,6 +2025,7 @@ impl<C: Config> Endpoint<C> {
             for index in dial.attempt_indices() {
                 self.indices.remove(&index);
             }
+            self.sessions.touch(&key);
         }
     }
 
@@ -2062,6 +2172,65 @@ fn heard<W, Q>(
 
 /// Whether `key`'s session owes the peer this endpoint's list of
 /// `generation`: never in the relay context, which is the relay's own session.
+/// What the index makes of a session: forgotten when it has no keys and
+/// nothing in progress after it was told idle; otherwise its next deadline,
+/// and whether it may have something to do now.
+fn look<W: ReplayWindow, Q: DatagramQueue>(
+    key: &Key,
+    session: &Session<W, Q>,
+    now: Instant,
+    generation: Option<u16>,
+    dials: &impl Table<Key, Dial>,
+) -> Look {
+    if session.dormant()
+        && !session.connected
+        && session.queue.is_empty()
+        && session.closing.is_none()
+        && dials.get(key).is_none()
+    {
+        return Look::Forget;
+    }
+    Look::Keep {
+        deadline: session_deadline(session),
+        ready: (session.connected && session.dormant())
+            || wants(key, session, now, generation, dials),
+    }
+}
+
+/// Whether a session has something to send at `now`.
+fn wants<W: ReplayWindow, Q: DatagramQueue>(
+    key: &Key,
+    session: &Session<W, Q>,
+    now: Instant,
+    generation: Option<u16>,
+    dials: &impl Table<Key, Dial>,
+) -> bool {
+    let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
+    session.closing.is_some()
+        || (live && session.confirm)
+        || (live && !session.queue.is_empty())
+        || (live && candidates_owed(key, session, generation))
+        || (session.rekey && session.address.is_some() && dials.get(key).is_none())
+        || session
+            .passive_keepalive_due()
+            .is_some_and(|due| due <= now)
+        || direct::path_wants(session, now)
+}
+
+/// The next instant a session has anything due: its keys' expiry, its
+/// passive keepalive, its path work.
+fn session_deadline<W: ReplayWindow, Q: DatagramQueue>(session: &Session<W, Q>) -> Option<Instant> {
+    [
+        session.current.as_ref().map(KeyPair::expires_at),
+        session.previous.as_ref().map(KeyPair::expires_at),
+        session.passive_keepalive_due(),
+        direct::path_deadline(session),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 fn candidates_owed<W, Q>(key: &Key, session: &Session<W, Q>, generation: Option<u16>) -> bool {
     let relayed = session
         .last_source

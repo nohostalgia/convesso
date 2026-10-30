@@ -49,6 +49,10 @@ pub trait Table<K: Ord, V> {
 
     /// Keeps only the entries for which `keep` returns `true`.
     fn retain(&mut self, keep: impl FnMut(&K, &mut V) -> bool);
+
+    /// The entry with the smallest key: what an index ordered by time holds
+    /// next.
+    fn first(&self) -> Option<(&K, &V)>;
 }
 
 /// A new key was refused because the table is full.
@@ -174,6 +178,14 @@ impl<K: Ord, V, const N: usize> Table<K, V> for FixedTable<K, V, N> {
             }
         }
     }
+
+    fn first(&self) -> Option<(&K, &V)> {
+        self.slots
+            .iter()
+            .flatten()
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(k, v)| (k, v))
+    }
 }
 
 /// A table that grows with what it holds, up to `LIMIT` entries.
@@ -247,6 +259,10 @@ impl<K: Ord, V, const LIMIT: usize> Table<K, V> for GrowableTable<K, V, LIMIT> {
 
     fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
         self.entries.retain(|k, v| keep(k, v));
+    }
+
+    fn first(&self) -> Option<(&K, &V)> {
+        self.entries.first_key_value()
     }
 }
 

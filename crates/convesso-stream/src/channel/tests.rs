@@ -17,7 +17,6 @@ use std::vec::Vec;
 use convesso_core::endpoint::FrameKind;
 use convesso_core::handshake::{Context, DialError, Entropy};
 use convesso_core::identity::{Address, PeerId};
-use convesso_core::storage::Table;
 use convesso_core::time::Instant;
 use serde_json::Value;
 
@@ -801,18 +800,59 @@ fn a_vanished_peer_resets_the_channel_within_30_s() {
     assert!(pair.at_rest());
 }
 
-/// Scenario: a device that restarted is recognised at once.
+/// B sends a message of two fragments of which A gets only the first: A
+/// holds part of a message that can never complete.
+fn a_holds_half_a_message(pair: &mut Pair<Mcu, Mcu>) {
+    let before = pair.b.sent.len();
+    pair.cut_to_a = true;
+    pair.b_sends(&message(1, 2000)).unwrap();
+    pair.run_for(100);
+    pair.cut_to_a = false;
+    let first = pair
+        .b
+        .sent
+        .iter()
+        .skip(before)
+        .find(|(_, kind, _)| *kind == FrameKind::Data)
+        .unwrap()
+        .2
+        .clone();
+    pair.inject(false, FrameKind::Data, &first);
+}
+
+/// Scenario: a device that restarted is recognised at once: B restarts in
+/// the middle of a message to A, then sends another; A resets, and delivers
+/// the new one.
 #[test]
 fn a_restarted_device_is_recognised_at_once() {
     let mut pair = mcu_pair(15);
-    pair.a_sends(b"before").unwrap();
     pair.b_sends(b"before, from b").unwrap();
     pair.run_for(1000);
+    a_holds_half_a_message(&mut pair);
     // B restarts: it keeps nothing.
     pair.b = Side::new(1, 99);
     pair.b_sends(b"after the restart").unwrap();
     pair.run_for(1000);
     assert_eq!(pair.a.resets(), vec![Reason::PeerRestarted]);
+    assert_eq!(
+        pair.a.messages(),
+        vec![b"before, from b".to_vec(), b"after the restart".to_vec()]
+    );
+}
+
+/// Scenario: a device that restarted between messages continues silently:
+/// A held nothing incomplete of B, so B's new incarnation takes over without
+/// a reset.
+#[test]
+fn a_device_that_restarted_between_messages_continues_silently() {
+    let mut pair = mcu_pair(25);
+    pair.a_sends(b"before").unwrap();
+    pair.b_sends(b"before, from b").unwrap();
+    pair.run_for(1000);
+    pair.b = Side::new(1, 99);
+    pair.b_sends(b"after the restart").unwrap();
+    pair.run_for(1000);
+    assert!(pair.a.resets().is_empty(), "{:?}", pair.a.resets());
     assert_eq!(
         pair.a.messages(),
         vec![b"before, from b".to_vec(), b"after the restart".to_vec()]
@@ -862,7 +902,8 @@ fn frames_of_a_reset_channel_change_nothing() {
         .unwrap()
         .2
         .clone();
-    // B restarts and sends: A resets.
+    // B restarts in the middle of a message, and sends: A resets.
+    a_holds_half_a_message(&mut pair);
     pair.b = Side::new(1, 97);
     pair.b_sends(b"new").unwrap();
     pair.run_for(1000);
@@ -1048,7 +1089,22 @@ fn a_reset_leaves_the_channel_with_no_credit() {
     pair.a_sends(b"before").unwrap();
     pair.run_for(1000);
     assert_eq!(pair.b.messages(), vec![b"before".to_vec()]);
-    // A restarts: its next message opens a new incarnation.
+    // A restarts in the middle of a message: B holds half of it, and A's next
+    // message opens a new incarnation.
+    pair.cut_to_b = true;
+    pair.a_sends(&message(2, 2000)).unwrap();
+    pair.run_for(100);
+    pair.cut_to_b = false;
+    let first = pair
+        .a
+        .sent
+        .iter()
+        .rev()
+        .find(|(_, kind, bytes)| *kind == FrameKind::Data && bytes.len() > 1000)
+        .unwrap()
+        .2
+        .clone();
+    pair.inject(true, FrameKind::Data, &first);
     pair.a = Side::new(0, 99);
     pair.a_sends(b"after").unwrap();
     pair.run_for(1000);
@@ -1643,4 +1699,110 @@ fn a_context_held_back_holds_back_no_other() {
     pair.run_for(1000);
     assert_eq!(pair.b.messages_in(b"slow"), vec![b"one".to_vec()]);
     assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+}
+
+// --- a session's end ---------------------------------------------------------------
+
+/// Both sides are told their session went idle.
+fn both_idle<A: StreamConfig, B: StreamConfig>(pair: &mut Pair<A, B>) {
+    let (a, b) = (pair.a.peer, pair.b.peer);
+    pair.a.channels.session_idle(b, ctx(), &mut pair.a.entropy);
+    pair.b.channels.session_idle(a, ctx(), &mut pair.b.entropy);
+}
+
+/// Scenario: a channel with nothing left is forgotten at idle, and the next
+/// message opens a new incarnation that the peer takes without a reset.
+#[test]
+fn an_idle_channel_is_forgotten_and_the_next_message_starts_anew() {
+    let mut pair = mcu_pair(30);
+    pair.a_sends(b"one").unwrap();
+    pair.run_for(1000);
+    both_idle(&mut pair);
+    assert_eq!(pair.a.channels.channel_count(), 0);
+    assert_eq!(pair.b.channels.channel_count(), 0);
+    pair.a_sends(b"two").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+}
+
+/// Scenario: an open receiver keeps its channel: the reader granted credit,
+/// so the channel stays at idle, and a message afterwards arrives on it.
+#[test]
+fn an_open_receiver_keeps_its_channel() {
+    let mut pair = credited_pair(31);
+    b_grants(&mut pair, 100_000);
+    pair.a_sends(b"one").unwrap();
+    pair.run_for(1000);
+    both_idle(&mut pair);
+    assert_eq!(pair.b.channels.channel_count(), 1, "the reader holds it");
+    pair.a_sends(b"two").unwrap();
+    pair.run_for(1000);
+    assert_eq!(pair.b.messages(), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert!(pair.b.resets().is_empty());
+}
+
+/// A message in flight at idle keeps its send incarnation: once the link
+/// carries it, it arrives, with no reset on either side.
+#[test]
+fn a_message_in_flight_at_idle_keeps_its_incarnation() {
+    let mut pair = mcu_pair(32);
+    pair.a_sends(b"one").unwrap();
+    pair.run_for(1000);
+    pair.cut_to_b = true;
+    pair.a_sends(b"in flight").unwrap();
+    pair.run_for(100);
+    let b = pair.b.peer;
+    pair.a.channels.session_idle(b, ctx(), &mut pair.a.entropy);
+    assert_eq!(pair.a.channels.channel_count(), 1, "kept, in flight");
+    pair.cut_to_b = false;
+    pair.run_for(3000);
+    assert_eq!(
+        pair.b.messages(),
+        vec![b"one".to_vec(), b"in flight".to_vec()]
+    );
+    assert!(pair.a.resets().is_empty() && pair.b.resets().is_empty());
+}
+
+/// Whole messages a reader has not taken yet are kept at a new incarnation:
+/// they are delivered first, then the new one's, with no reset.
+#[test]
+fn whole_messages_held_are_delivered_before_a_new_incarnation() {
+    let mut pair = mcu_pair(33);
+    pair.b.deliver = false;
+    pair.a_sends(b"held").unwrap();
+    pair.run_for(1000);
+    // A forgets its side, as at idle, and sends again.
+    pair.a = Side::new(0, 77);
+    pair.a_sends(b"after").unwrap();
+    pair.run_for(1000);
+    pair.b.deliver = true;
+    pair.run_for(5000);
+    assert_eq!(pair.b.messages(), vec![b"held".to_vec(), b"after".to_vec()]);
+    assert!(pair.b.resets().is_empty(), "{:?}", pair.b.resets());
+}
+
+// --- the receive window ------------------------------------------------------------
+
+/// Behind a message that waits for credit, the next one arrives whole: the
+/// window counts from the cumulative point, and the fragments held beyond it
+/// are inside it, not taken from it again. Once the reader grants credit,
+/// both are handed out at once, with no transfer left to wait for.
+#[cfg(feature = "alloc")]
+#[test]
+fn behind_a_message_waiting_for_credit_the_next_arrives_whole() {
+    use crate::config::Server;
+    let mut pair: Pair<Server, Server> = Pair::new(41);
+    pair.b.channels = Channels::with_credit();
+    let a = pair.a.peer;
+    let first = message(1, 200_000);
+    let second = message(2, 250_000);
+    pair.a_sends(&first).unwrap();
+    pair.a_sends(&second).unwrap();
+    pair.run_for(10_000);
+    assert!(pair.b.messages().is_empty());
+    pair.b.channels.grant(a, b"ctx", 1_000_000).unwrap();
+    // Less than a one-way delay: nothing can come from A meanwhile.
+    pair.run_for(5);
+    assert_eq!(pair.b.messages(), vec![first, second]);
 }

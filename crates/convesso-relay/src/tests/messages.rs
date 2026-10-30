@@ -160,7 +160,8 @@ fn a_peer_switched_off_resets_the_channel_within_30_s() {
     assert_eq!(packets(&world, 0), after, "nothing after the reset");
 }
 
-/// Scenario: a device that restarted is recognised at once.
+/// Scenario: a device that restarted is recognised at once: it restarts
+/// while the peer holds part of a message from it.
 #[test]
 fn a_restarted_device_is_recognised_at_once() {
     let mut world = World::new(Open, Config::default(), 2);
@@ -171,6 +172,10 @@ fn a_restarted_device_is_recognised_at_once() {
     world.send_message(0, 1, b"and back").unwrap();
     world.run_for(2000);
     assert_eq!(world.clients[0].messages, vec![b"before".to_vec()]);
+    // More than the first flight: the device restarts once that arrived,
+    // before its acknowledgement lets the rest go.
+    world.send_message(1, 0, &[7u8; 30_000]).unwrap();
+    world.run_for(2 * world.delay + 10);
     world.restart(1);
     world.send_message(1, 0, b"after the restart").unwrap();
     world.run_for(3000);
@@ -181,9 +186,29 @@ fn a_restarted_device_is_recognised_at_once() {
     );
 }
 
+/// Scenario: a device that restarted between messages continues silently.
+#[test]
+fn a_device_that_restarted_between_messages_continues_silently() {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.with_streams();
+    world.open_link(0);
+    world.run_for(1000);
+    world.send_message(1, 0, b"before").unwrap();
+    world.send_message(0, 1, b"and back").unwrap();
+    world.run_for(2000);
+    world.restart(1);
+    world.send_message(1, 0, b"after the restart").unwrap();
+    world.run_for(3000);
+    assert!(world.clients[0].stream_resets.is_empty());
+    assert_eq!(
+        world.clients[0].messages,
+        vec![b"before".to_vec(), b"after the restart".to_vec()]
+    );
+}
+
 /// Scenario: a device that restarted tells a sender at once, once it has a
-/// fresh session: its peer's next message on the old channel is answered
-/// with RESET, and the one after is delivered.
+/// fresh session: its peer's message still in flight on the old channel is
+/// answered with RESET, and the one after is delivered.
 #[test]
 fn a_restarted_device_tells_a_sender_at_once() {
     let mut world = World::new(Open, Config::default(), 2);
@@ -194,15 +219,16 @@ fn a_restarted_device_tells_a_sender_at_once() {
     world.run_for(2000);
     world.restart(1);
     let before = world.clients[1].messages.len();
+    // Sent on the old channel while the device is down: lost, and sent again.
+    world
+        .send_message(0, 1, b"to a device that forgot")
+        .unwrap();
+    world.run_for(500);
     world.open_link(1);
     world.run_for(1000);
     // The device wakes and opens a fresh session, as a waking device does.
     world.send(1, 0, b"awake").unwrap();
-    world.run_for(1000);
-    world
-        .send_message(0, 1, b"to a device that forgot")
-        .unwrap();
-    world.run_for(2000);
+    world.run_for(5000);
     assert_eq!(world.clients[0].stream_resets, vec![Reason::ResetByPeer]);
     world.send_message(0, 1, b"again").unwrap();
     world.run_for(2000);

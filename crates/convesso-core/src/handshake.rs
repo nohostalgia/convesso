@@ -24,7 +24,9 @@ use core::num::NonZeroU16;
 use core::time::Duration;
 
 pub use initiator::{Dial, DialError, DialEvent, DialPoll, Established};
-pub use responder::{Access, Pending, Responder, ResponderError, ResponderOutput, Served};
+pub use responder::{
+    Access, Pending, Responder, ResponderError, ResponderOutput, Served, Standing,
+};
 
 use crate::identity::PeerId;
 

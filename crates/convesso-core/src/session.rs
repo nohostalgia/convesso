@@ -367,6 +367,8 @@ pub(crate) struct Session<W, Q> {
     /// The channel binding of the handshake that gave the session keys when
     /// it had none (`PROTOCOL.md §5`). Forgotten with the keys.
     pub(crate) binding: Option<ChannelBinding>,
+    /// Its entry in the endpoint's index of deadlines.
+    pub(crate) deadline: Option<Instant>,
 }
 
 impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
@@ -388,14 +390,14 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
             carried: false,
             paths: PeerPaths::new(),
             binding: None,
+            deadline: None,
         }
     }
 
     /// Deletes every key pair past its life. Returns the local indices freed.
-    /// A session that loses its last key pair here forgets what it knew of its
-    /// paths and its binding, once.
+    /// What the session knew of its paths and its binding stays until it is
+    /// told idle ([`Self::end_life`]): a renewal still in flight keeps them.
     pub(crate) fn expire(&mut self, now: Instant) -> [Option<u32>; 2] {
-        let had_keys = !self.dormant();
         let mut freed = [None, None];
         if self.previous.as_ref().is_some_and(|keys| !keys.live(now)) {
             freed[0] = self.previous.take().map(|keys| keys.local_index);
@@ -403,37 +405,38 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
         if self.current.as_ref().is_some_and(|keys| !keys.live(now)) {
             freed[1] = self.current.take().map(|keys| keys.local_index);
         }
-        if had_keys && self.dormant() {
-            // A direct source learned through an attempt is a NAT's hole,
-            // gone by the time the session reopens: it reopens through its
-            // hint or the relay.
-            if self.paths.exchanged
-                && self
-                    .last_source
-                    .is_some_and(|source| source.relayed_from().is_none())
-            {
-                self.last_source = None;
-            }
-            self.paths = PeerPaths::new();
-            self.binding = None;
-        }
         freed
     }
 
+    /// The session's life ended without keys: it forgets what it knew of its
+    /// paths, and its binding, once (`PROTOCOL.md §5`).
+    pub(crate) fn end_life(&mut self) {
+        // A direct source learned through an attempt is a NAT's hole, gone by
+        // the time the session reopens: it reopens through its hint or the
+        // relay.
+        if self.paths.exchanged
+            && self
+                .last_source
+                .is_some_and(|source| source.relayed_from().is_none())
+        {
+            self.last_source = None;
+        }
+        self.paths = PeerPaths::new();
+        self.binding = None;
+        self.connected = false;
+    }
+
     /// Makes `keys` current; the old current becomes previous, and the old
-    /// previous is deleted. A session without live keys takes `binding` as
-    /// its own; a renewal keeps the one it has. Returns the local index freed, if
-    /// any, and whether it was a renewal.
+    /// previous is deleted. A handshake that `opens` the session, as both ends
+    /// agreed (`PROTOCOL.md §3`), gives it `binding`; a renewal keeps the one
+    /// it has. Returns the local index freed, if any.
     pub(crate) fn promote(
         &mut self,
         keys: KeyPair<W>,
         binding: &ChannelBinding,
-    ) -> (Option<u32>, bool) {
-        let renewal = [&self.current, &self.previous]
-            .into_iter()
-            .flatten()
-            .any(|old| old.live(keys.created));
-        if !renewal || self.binding.is_none() {
+        opens: bool,
+    ) -> Option<u32> {
+        if opens || self.binding.is_none() {
             self.binding = Some(*binding);
         }
         let dropped = self.previous.take().map(|old| old.local_index);
@@ -441,7 +444,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
         self.current = Some(keys);
         self.rekey = false;
         self.paths.new_keys();
-        (dropped, renewal)
+        dropped
     }
 
     /// Whether the session has no keys: it sends nothing and sets no deadline.

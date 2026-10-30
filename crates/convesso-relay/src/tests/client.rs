@@ -741,3 +741,81 @@ fn early_data_crosses_a_late_relay() {
     world.run_for(1000);
     assert_eq!(world.clients[1].datagrams(), vec![(b"then".to_vec(), true)]);
 }
+
+/// Scenario: a path that became faster changes nothing. A opens a session
+/// with B through the relay, so B, which answered, dates its keys one relay
+/// trip before A does. The moment B's keys expire, B sends to A at a hint, a
+/// path faster than the relay, so its first contact reaches A while A's keys
+/// still live. Both ends must return the same binding for the session that
+/// opens.
+#[test]
+fn a_path_that_became_faster_changes_nothing() {
+    let mut world = World::new(Open, Config::default(), 2);
+    // The relay's hops take 50 ms each, a direct path 5 ms.
+    world.delay = 50;
+    world.direct_delay = Some(5);
+    world.open_link(1);
+    world.run_for(1000);
+    world.send(0, 1, b"through the relay").unwrap();
+    world.run_for(1000);
+    let (a, b) = (world.clients[0].peer_id(), world.clients[1].peer_id());
+    assert!(
+        world.clients[1]
+            .endpoint
+            .is_live(&a, SESSION, world.instant())
+    );
+    world.hint(1, 0);
+    // Up to B's expiry, a millisecond at a time.
+    world.run_for(178_000);
+    while !world.clients[1].events.contains(&Ev::Idle(a)) {
+        world.run_for(1);
+    }
+    assert!(
+        world.clients[0]
+            .endpoint
+            .is_live(&b, SESSION, world.instant()),
+        "A's keys still live: the window"
+    );
+    world.send(1, 0, b"right after").unwrap();
+    world.run_for(3000);
+    let at_a = world.clients[0].endpoint.channel_binding(&b, SESSION);
+    let at_b = world.clients[1].endpoint.channel_binding(&a, SESSION);
+    assert!(at_a.is_some() && at_b.is_some());
+    assert_eq!(at_a, at_b, "the same binding at both ends");
+}
+
+/// Scenario: a renewal finds no keys. A opened the session, so B, which
+/// answered, dates its keys one relay trip earlier. The moment B's keys
+/// expire, A, whose keys still live, sends: for A the handshake renews the
+/// session, for B, which has none, it opens one. Both ends must return the
+/// same binding.
+#[test]
+fn a_renewal_finds_no_keys() {
+    let mut world = World::new(Open, Config::default(), 2);
+    // The relay's hops take 50 ms each, a direct path 5 ms.
+    world.delay = 50;
+    world.direct_delay = Some(5);
+    world.open_link(1);
+    world.run_for(1000);
+    world.send(0, 1, b"through the relay").unwrap();
+    world.run_for(1000);
+    let (a, b) = (world.clients[0].peer_id(), world.clients[1].peer_id());
+    // The session goes on, from A's side, on a direct path.
+    world.hint(0, 1);
+    world.run_for(178_000);
+    while !world.clients[1].events.contains(&Ev::Idle(a)) {
+        world.run_for(1);
+    }
+    assert!(
+        world.clients[0]
+            .endpoint
+            .is_live(&b, SESSION, world.instant()),
+        "A's keys still live: the window"
+    );
+    world.send(0, 1, b"right after").unwrap();
+    world.run_for(3000);
+    let at_a = world.clients[0].endpoint.channel_binding(&b, SESSION);
+    let at_b = world.clients[1].endpoint.channel_binding(&a, SESSION);
+    assert!(at_a.is_some() && at_b.is_some(), "{at_a:?} {at_b:?}");
+    assert_eq!(at_a, at_b, "the same binding at both ends");
+}

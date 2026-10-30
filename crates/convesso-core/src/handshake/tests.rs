@@ -200,6 +200,7 @@ fn crafted_first_contact(
         &mut packet,
         7,
         &noise_out,
+        false,
         &Mac1Key::for_address(address.as_bytes()),
         None,
     )
@@ -283,9 +284,18 @@ fn decisions_decode_strictly() {
         decode_decision(&[1, 0, 0]),
         Err(DecisionError::RefuseWithoutCode)
     );
+    assert_eq!(decode_decision(&[2, 0, 0]), Ok(WireDecision::AcceptAsNew));
     assert_eq!(
-        decode_decision(&[2, 0, 0]),
+        decode_decision(&[2, 1, 0]),
+        Err(DecisionError::AcceptWithCode)
+    );
+    assert_eq!(
+        decode_decision(&[3, 0, 0]),
         Err(DecisionError::UnknownStatus)
+    );
+    assert_eq!(
+        messages::encode_decision(WireDecision::AcceptAsNew),
+        [2, 0, 0]
     );
     assert_eq!(decode_decision(&[0, 0]), Err(DecisionError::WrongLength));
     assert_eq!(
@@ -989,6 +999,9 @@ struct Transcript {
     decision: Decision,
     /// The length of the first contact's payload (`a_payload`), 0 for none.
     payload: usize,
+    /// For a renewal (type `0x06`), where the responder stands: with live
+    /// keys, or none, which it answers `02 00 00`.
+    renewal: Option<Standing>,
 }
 
 fn transcripts() -> Vec<Transcript> {
@@ -1005,6 +1018,7 @@ fn transcripts() -> Vec<Transcript> {
             responder_ephemeral: [0x22; 32],
             decision: Decision::Accept { psk: None },
             payload: 0,
+            renewal: None,
         },
         Transcript {
             name: "acceptance under a PSK, empty context",
@@ -1020,6 +1034,7 @@ fn transcripts() -> Vec<Transcript> {
                 psk: Some([0x5a; 32]),
             },
             payload: 0,
+            renewal: None,
         },
         Transcript {
             name: "refusal with a library code",
@@ -1036,6 +1051,7 @@ fn transcripts() -> Vec<Transcript> {
                 psk: None,
             },
             payload: 0,
+            renewal: None,
         },
         Transcript {
             name: "refusal with an application code, 32-byte context",
@@ -1052,6 +1068,7 @@ fn transcripts() -> Vec<Transcript> {
                 psk: None,
             },
             payload: 0,
+            renewal: None,
         },
         Transcript {
             name: "a payload of 1 byte, relay context",
@@ -1065,6 +1082,7 @@ fn transcripts() -> Vec<Transcript> {
             responder_ephemeral: [0xaa; 32],
             decision: Decision::Accept { psk: None },
             payload: 1,
+            renewal: None,
         },
         Transcript {
             name: "a payload of 168 bytes under a PSK",
@@ -1080,6 +1098,7 @@ fn transcripts() -> Vec<Transcript> {
                 psk: Some([0xa5; 32]),
             },
             payload: 168,
+            renewal: None,
         },
         Transcript {
             name: "a payload of 1,200 bytes",
@@ -1093,6 +1112,7 @@ fn transcripts() -> Vec<Transcript> {
             responder_ephemeral: [0xee; 32],
             decision: Decision::Accept { psk: None },
             payload: 1200,
+            renewal: None,
         },
         Transcript {
             name: "a payload of 168 bytes, refused",
@@ -1109,6 +1129,37 @@ fn transcripts() -> Vec<Transcript> {
                 psk: None,
             },
             payload: 168,
+            renewal: None,
+        },
+        Transcript {
+            name: "a renewal of live keys",
+            initiator: 1,
+            responder: 0,
+            context: b"session",
+            psk: None,
+            initiator_index: 0x2122_2324,
+            initiator_ephemeral: [0x56; 32],
+            responder_index: 0x3132_3334,
+            responder_ephemeral: [0x78; 32],
+            decision: Decision::Accept { psk: None },
+            payload: 0,
+            renewal: Some(Standing::LiveKeys),
+        },
+        Transcript {
+            name: "a renewal without keys, accepted as a new session",
+            initiator: 2,
+            responder: 3,
+            context: b"session",
+            psk: Some([0x3c; 32]),
+            initiator_index: 0x4142_4344,
+            initiator_ephemeral: [0x9a; 32],
+            responder_index: 0x5152_5354,
+            responder_ephemeral: [0xbc; 32],
+            decision: Decision::Accept {
+                psk: Some([0x3c; 32]),
+            },
+            payload: 0,
+            renewal: Some(Standing::NoKeys),
         },
     ]
 }
@@ -1128,16 +1179,28 @@ fn run_transcript(transcript: &Transcript) -> Value {
     script.extend_from_slice(&transcript.initiator_ephemeral);
     let payload = a_payload(transcript.payload);
     let mut out = [0u8; MAX_FIRST_CONTACT_LEN];
-    let (mut dial, len) = Dial::start_with_payload(
-        &initiator,
-        &address,
-        transcript.context,
-        transcript.psk,
-        &payload,
-        t(0),
-        &mut Scripted(script),
-        &mut out,
-    )
+    let (mut dial, len) = if transcript.renewal.is_some() {
+        Dial::renew(
+            &initiator,
+            &address,
+            transcript.context,
+            transcript.psk,
+            t(0),
+            &mut Scripted(script),
+            &mut out,
+        )
+    } else {
+        Dial::start_with_payload(
+            &initiator,
+            &address,
+            transcript.context,
+            transcript.psk,
+            &payload,
+            t(0),
+            &mut Scripted(script),
+            &mut out,
+        )
+    }
     .unwrap();
     let first = out[..len].to_vec();
     assert_eq!(first.len(), FIRST_CONTACT_LEN + payload.len());
@@ -1155,11 +1218,13 @@ fn run_transcript(transcript: &Transcript) -> Value {
         responder.accept_payload(transcript.context).unwrap();
     }
     let mut response_out = [0u8; RESPONSE_LEN + MAX_PAYLOAD];
-    let len = match responder.handle(
+    let stands = transcript.renewal.unwrap_or(Standing::NoKeys);
+    let len = match responder.handle_with(
         &first,
         SOURCE,
         t(1),
         &mut Fixed::with(transcript.decision),
+        |_, _, _| stands,
         &mut Scripted(script),
         &mut response_out,
     ) {
@@ -1192,6 +1257,9 @@ fn run_transcript(transcript: &Transcript) -> Value {
     let response = response_out[..len].to_vec();
 
     let (binding, decision_bytes) = match dial.handle(&initiator, &response, t(2)) {
+        DialEvent::Established(e) if transcript.renewal.is_some() && e.opens() => {
+            (Some(*e.channel_binding()), [2u8, 0, 0])
+        }
         DialEvent::Established(e) => (Some(*e.channel_binding()), [0u8, 0, 0]),
         DialEvent::Failed(DialError::Refused(code)) => {
             let [lo, hi] = code.get().to_le_bytes();
@@ -1280,6 +1348,9 @@ fn run_transcript(transcript: &Transcript) -> Value {
     });
     if !payload.is_empty() {
         record["payload"] = Value::from(to_hex(&payload));
+    }
+    if transcript.renewal.is_some() {
+        record["renewal"] = Value::from(true);
     }
     record
 }
@@ -2247,4 +2318,134 @@ fn only_served_contexts_can_be_bound() {
     assert!(served.stop_serving(&relay));
     assert!(!served.serves(&relay));
     served.serve(b"c", Access::Policy).unwrap();
+}
+
+/// A renewal is the 134 bytes of a first contact with byte 1 `0x06`: it
+/// parses as a renewal, refuses a payload and any other length, and `mac1`
+/// fails when byte 1 is changed in transit.
+#[test]
+fn a_renewal_is_a_first_contact_of_its_own_type() {
+    let mut entropy = TestEntropy(0);
+    let (_, opening) = dial(&mut entropy, None);
+    let noise = &opening[6..6 + messages::INITIATION_NOISE_LEN];
+    let key = Mac1Key::for_address(identity(0).address().as_bytes());
+    let mut renewal = vec![0u8; FIRST_CONTACT_LEN];
+    let len = messages::write_first_contact_into(&mut renewal, 7, noise, true, &key, None).unwrap();
+    assert_eq!(len, FIRST_CONTACT_LEN);
+    assert_eq!(&renewal[..2], &[0x01, 0x06]);
+    let parsed = messages::parse_first_contact(&renewal).unwrap();
+    assert!(parsed.renewal);
+    assert!(!messages::parse_first_contact(&opening).unwrap().renewal);
+    // No payload, and no other length.
+    let mut with_payload = vec![0u8; FIRST_CONTACT_LEN + 8];
+    let mut longer_noise = noise.to_vec();
+    longer_noise.extend_from_slice(&[0; 8]);
+    assert_eq!(
+        messages::write_first_contact_into(&mut with_payload, 7, &longer_noise, true, &key, None),
+        None
+    );
+    let mut longer = renewal.clone();
+    longer.push(0);
+    assert!(messages::parse_first_contact(&longer).is_err());
+    // mac1 covers byte 1: an opening turned into a renewal fails it.
+    let mut turned = opening.clone();
+    turned[1] = 0x06;
+    assert!(key.verify(&opening));
+    assert!(!key.verify(&turned));
+}
+
+// --- opening or renewal ----------------------------------------------------------------
+
+/// A dial from `INITIATOR`, a renewal or an opening, answered by a responder
+/// standing as `stands`; returns the response's decision bytes, what the
+/// initiator concluded, and whether the responder's pending handshake opens.
+fn renewal_round(renewal: bool, stands: Standing) -> (Option<[u8; 3]>, DialEvent, Option<bool>) {
+    let mut entropy = TestEntropy(4242);
+    let mut out = [0u8; 256];
+    let (mut dial, len) = if renewal {
+        Dial::renew(
+            &identity(INITIATOR),
+            &responder_address(),
+            CONTEXT,
+            None,
+            t(0),
+            &mut entropy,
+            &mut out,
+        )
+    } else {
+        Dial::start(
+            &identity(INITIATOR),
+            &responder_address(),
+            CONTEXT,
+            None,
+            t(0),
+            &mut entropy,
+            &mut out,
+        )
+    }
+    .unwrap();
+    assert_eq!(out[1], if renewal { 0x06 } else { 0x01 });
+    let first = out[..len].to_vec();
+    let mut responder = responder();
+    let mut answer = [0u8; 256];
+    let answered = responder.handle_with(
+        &first,
+        SOURCE,
+        t(1),
+        &mut Fixed::accept(),
+        |_, _, _| stands,
+        &mut entropy,
+        &mut answer,
+    );
+    let ResponderOutput::Send(len) = answered else {
+        return (None, DialEvent::Ignored, None);
+    };
+    let response = answer[..len].to_vec();
+    let opens = responder
+        .pending(u32::from_le_bytes(response[2..6].try_into().unwrap()))
+        .map(Pending::opens);
+    let event = dial.handle(&identity(INITIATOR), &response, t(2));
+    // The decision as sent: read back through the initiator's own keys is not
+    // possible here, so it is inferred from the outcome and the pending state.
+    let decision = match (&event, opens) {
+        (DialEvent::Established(e), Some(true)) if renewal && e.opens() => Some([2, 0, 0]),
+        (DialEvent::Established(_), _) => Some([0, 0, 0]),
+        _ => None,
+    };
+    (decision, event, opens)
+}
+
+/// An opening opens a session, whatever keys the responder holds; a renewal
+/// renews live keys; a renewal of keys the responder does not hold is
+/// answered `02 00 00`, and both sides take it as opening a session.
+#[test]
+fn each_handshake_says_whether_it_opens() {
+    for stands in [Standing::NoKeys, Standing::LiveKeys] {
+        let (decision, event, opens) = renewal_round(false, stands);
+        let DialEvent::Established(e) = event else {
+            panic!("an opening completes, standing {stands:?}");
+        };
+        assert!(e.opens() && opens == Some(true), "{stands:?}");
+        assert_eq!(decision, Some([0, 0, 0]));
+    }
+    let (_, event, opens) = renewal_round(true, Standing::LiveKeys);
+    let DialEvent::Established(e) = event else {
+        panic!("a renewal of live keys completes");
+    };
+    assert!(!e.opens() && opens == Some(false));
+    let (decision, event, opens) = renewal_round(true, Standing::NoKeys);
+    let DialEvent::Established(e) = event else {
+        panic!("a renewal without keys completes, as an opening");
+    };
+    assert!(e.opens() && opens == Some(true));
+    assert_eq!(decision, Some([2, 0, 0]));
+}
+
+/// A first contact this side's own crossing opening wins against meets
+/// silence, and keeps no state.
+#[test]
+fn a_crossing_opening_that_loses_meets_silence() {
+    let (decision, event, opens) = renewal_round(false, Standing::Ignore);
+    assert_eq!((decision, opens), (None, None));
+    assert!(matches!(event, DialEvent::Ignored));
 }

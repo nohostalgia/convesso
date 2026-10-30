@@ -8,6 +8,7 @@
 use convesso_core::handshake::Context;
 use convesso_core::identity::PeerId;
 use convesso_core::storage::Table;
+use convesso_core::time::Instant;
 
 use crate::channel::{Sent, Stored};
 
@@ -31,6 +32,9 @@ pub trait StreamConfig {
     type Stored: Slots<Stored>;
     /// The channels, by session.
     type Channels<V>: Table<Key, V> + Default;
+    /// The channels' deadlines, in order: one entry per channel, so sized
+    /// as the channels.
+    type Deadlines<V>: Table<(Instant, Key), V> + Default;
     /// What each context's channels take, for the contexts given limits of
     /// their own.
     type Contexts<V>: Table<Context, V> + Default;
@@ -124,6 +128,11 @@ macro_rules! __fixed_stream_config {
                 V,
                 { $name::SIZES.channels },
             >;
+            type Deadlines<V> = $crate::__core::storage::FixedTable<
+                ($crate::__core::time::Instant, $crate::config::Key),
+                V,
+                { $name::SIZES.channels },
+            >;
             type Contexts<V> = $crate::__core::storage::FixedTable<
                 $crate::__core::handshake::Context,
                 V,
@@ -147,6 +156,11 @@ macro_rules! __growable_stream_config {
             type Stored = $crate::config::GrowableSlots<$crate::Stored, { $name::SIZES.stored }>;
             type Channels<V> = $crate::__core::storage::GrowableTable<
                 $crate::config::Key,
+                V,
+                { $name::SIZES.channels },
+            >;
+            type Deadlines<V> = $crate::__core::storage::GrowableTable<
+                ($crate::__core::time::Instant, $crate::config::Key),
                 V,
                 { $name::SIZES.channels },
             >;
