@@ -96,7 +96,9 @@ convesso tries to avoid it.
   front of the device would forget the link, and the device could no longer be reached.
 - **Everything else happens on use.** Key renewals, the search for a direct path and the checks of
   that path are all caused by traffic. A session nobody uses lets its keys expire and becomes
-  *dormant*: it sends nothing and sets no timer. The next datagram reopens it.
+  *dormant*: it sends nothing and sets no timer, and it is forgotten, so that a server's memory
+  and the cost of each packet follow the peers in use, not every peer it met. The next datagram
+  opens a session again.
 - **Traffic at rest is measured.** The tests run an idle month on a virtual clock and count what
   was sent.
 

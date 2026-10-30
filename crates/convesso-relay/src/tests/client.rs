@@ -679,3 +679,65 @@ fn a_forward_too_large_to_carry_dials_first() {
     }
     assert!(forwarded, "the forward follows the handshake");
 }
+
+/// Scenario: the relay session going idle is not reported: a client keeping
+/// a link carries no traffic until its relay session's keys expire, and its
+/// application hears of no idle session, nor of any connection.
+#[test]
+fn the_relay_session_going_idle_is_not_reported() {
+    let mut world = World::new(Open, Config::default(), 1);
+    world.open_link(0);
+    world.run_for(1000);
+    world.run_for(200_000);
+    let relay = world.relay.address().peer_id();
+    assert!(!world.clients[0].endpoint.is_live(
+        &relay,
+        convesso_core::relay::CONTEXT,
+        world.instant()
+    ));
+    let events = &world.clients[0].events;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Ev::Idle(_) | Ev::Connected(_))),
+        "{events:?}"
+    );
+}
+
+/// Early data through a late relay: the datagram A sends with no session
+/// reaches B in A's first contact, as an early datagram, while the relay
+/// ignores A's first contacts for 5 s; B sees at most two distinct attempts,
+/// and A's next datagram reaches B under the keys.
+#[test]
+fn early_data_crosses_a_late_relay() {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.open_link(1);
+    world.run_for(1000);
+    let early = convesso_core::endpoint::Settings {
+        early_data: true,
+        ..Default::default()
+    };
+    for client in &mut world.clients {
+        client
+            .endpoint
+            .set_context_settings(SESSION, early)
+            .unwrap();
+    }
+    world.clients[0].handshakes_ignored = true;
+    world.send(0, 1, b"early").unwrap();
+    world.run_for(5000);
+    world.clients[0].handshakes_ignored = false;
+    world.run_for(10_000);
+    let payloads = world.clients[1]
+        .events
+        .iter()
+        .filter(|e| matches!(e, Ev::Payload))
+        .count();
+    assert!((1..=2).contains(&payloads), "{payloads} early datagrams");
+    assert!(world.clients[1].datagrams().is_empty(), "not sent again");
+    let (_, distinct) = first_contacts_to(&world, 1);
+    assert!(distinct <= 2, "{distinct} distinct attempts");
+    world.send(0, 1, b"then").unwrap();
+    world.run_for(1000);
+    assert_eq!(world.clients[1].datagrams(), vec![(b"then".to_vec(), true)]);
+}

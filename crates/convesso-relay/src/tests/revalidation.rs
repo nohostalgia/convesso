@@ -160,7 +160,14 @@ fn an_idle_month_with_a_direct_session_costs_nothing_more() {
         let now = world.clients[i].sent;
         assert_eq!((now.udp, now.tcp), (sent[i].udp, sent[i].tcp), "client {i}");
         assert_eq!(world.sent_direct(i).len(), direct[i], "client {i}");
-        assert_eq!(path(&world, i), PathKind::Relayed, "forgotten");
+        // The session itself is forgotten, its path with it.
+        let peer = world.clients[1 - i].peer_id();
+        assert!(
+            world.clients[i]
+                .endpoint
+                .path_info(&peer, SESSION)
+                .is_none()
+        );
     }
     assert_eq!(world.clients[0].deadline, None);
     assert_eq!(

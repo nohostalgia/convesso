@@ -10,7 +10,7 @@
 #![no_main]
 
 use convesso_core::dos::Source;
-use convesso_core::endpoint::{Endpoint, Output, Poll};
+use convesso_core::endpoint::{Endpoint, Output, Poll, Settings};
 use convesso_core::handshake::{Access, Admission, Decision, Entropy, RefusalCode};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::storage::Mcu;
@@ -90,7 +90,13 @@ fn change(b: &mut Endpoint<Mcu>, op: u8, a: PeerId) {
         4 => b.set_access(context, Some(Access::Policy), 0x0200, &mut Accept),
         5 => b.set_access(context, Some(Access::Bound(a)), 0x0200, &mut Accept),
         6 => b.close_context(context, 0x0201),
-        _ => b.accept_payload(context),
+        _ => b.set_context_settings(
+            context,
+            Settings {
+                early_data: true,
+                ..Settings::default()
+            },
+        ),
     };
     assert!(b.contexts_served() <= 4, "the profile's table holds 4");
 }

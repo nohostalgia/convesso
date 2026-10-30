@@ -221,6 +221,8 @@ async fn application(spawner: Spawner) {
                 credit: false,
                 #[cfg(feature = "stream")]
                 max_message: None,
+                passive_keepalive: false,
+                early_data: false,
             },
         )
         .await;

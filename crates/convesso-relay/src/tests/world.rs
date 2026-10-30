@@ -25,10 +25,18 @@ pub(crate) const SESSION: &[u8] = b"session";
 /// The path a client gives for sends through the relay.
 pub(crate) const RELAY_PATH_MAX: usize = convesso_core::relay::MAX_CARRIED;
 
+/// The identity of index `i`: one of the committed vectors' keys, and past
+/// them one made from a seed, for a world of many clients.
 pub(crate) fn identity(i: usize) -> Identity {
     let vectors: Value =
         serde_json::from_str(include_str!("../../../convesso-core/vectors/identity.json")).unwrap();
-    let key = &vectors["keys"][i];
+    let keys = vectors["keys"].as_array().unwrap();
+    if i >= keys.len() {
+        let mut seed = [3u8; 32];
+        seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        return Identity::from_ed25519_seed(&seed).unwrap();
+    }
+    let key = &keys[i];
     let bytes = |v: &Value| -> [u8; 32] {
         let text = v.as_str().unwrap();
         (0..32)
@@ -72,6 +80,7 @@ impl Admission for AcceptAll {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ev {
     Connected(PeerId),
+    Idle(PeerId),
     Datagram {
         peer: PeerId,
         data: Vec<u8>,
@@ -96,6 +105,7 @@ pub(crate) enum Ev {
 fn own(event: Event<'_>) -> Ev {
     match event {
         Event::Connected { peer, .. } => Ev::Connected(peer),
+        Event::Idle { peer, .. } => Ev::Idle(peer),
         Event::Datagram {
             peer,
             data,

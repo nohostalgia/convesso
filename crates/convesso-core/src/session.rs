@@ -351,12 +351,10 @@ pub(crate) struct Session<W, Q> {
     pub(crate) passive_keepalive: bool,
     pub(crate) last_received_data: Option<Instant>,
     pub(crate) last_sent: Option<Instant>,
-    /// The last time the session was used, to choose which dormant session a
-    /// full table forgets.
-    pub(crate) last_used: Instant,
-    /// Whether the application was told of a connection with this peer in this
-    /// context: later handshakes are silent rekeys.
-    pub(crate) ever_connected: bool,
+    /// Whether the application was told of this session's connection and not
+    /// yet that it went idle (`PROTOCOL.md §5`): a handshake while it is set
+    /// is a silent renewal.
+    pub(crate) connected: bool,
     /// Whether this side answered the handshake that gave the current keys:
     /// admission was asked for it, and a change of access judges it again.
     pub(crate) accepted: bool,
@@ -372,7 +370,7 @@ pub(crate) struct Session<W, Q> {
 }
 
 impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             address: None,
             current: None,
@@ -385,8 +383,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
             passive_keepalive: false,
             last_received_data: None,
             last_sent: None,
-            last_used: now,
-            ever_connected: false,
+            connected: false,
             accepted: false,
             carried: false,
             paths: PeerPaths::new(),
@@ -395,7 +392,10 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
     }
 
     /// Deletes every key pair past its life. Returns the local indices freed.
+    /// A session that loses its last key pair here forgets what it knew of its
+    /// paths and its binding, once.
     pub(crate) fn expire(&mut self, now: Instant) -> [Option<u32>; 2] {
+        let had_keys = !self.dormant();
         let mut freed = [None, None];
         if self.previous.as_ref().is_some_and(|keys| !keys.live(now)) {
             freed[0] = self.previous.take().map(|keys| keys.local_index);
@@ -403,7 +403,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
         if self.current.as_ref().is_some_and(|keys| !keys.live(now)) {
             freed[1] = self.current.take().map(|keys| keys.local_index);
         }
-        if self.dormant() {
+        if had_keys && self.dormant() {
             // A direct source learned through an attempt is a NAT's hole,
             // gone by the time the session reopens: it reopens through its
             // hint or the relay.
@@ -423,8 +423,12 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
     /// Makes `keys` current; the old current becomes previous, and the old
     /// previous is deleted. A session without live keys takes `binding` as
     /// its own; a renewal keeps the one it has. Returns the local index freed, if
-    /// any.
-    pub(crate) fn promote(&mut self, keys: KeyPair<W>, binding: &ChannelBinding) -> Option<u32> {
+    /// any, and whether it was a renewal.
+    pub(crate) fn promote(
+        &mut self,
+        keys: KeyPair<W>,
+        binding: &ChannelBinding,
+    ) -> (Option<u32>, bool) {
         let renewal = [&self.current, &self.previous]
             .into_iter()
             .flatten()
@@ -437,7 +441,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
         self.current = Some(keys);
         self.rekey = false;
         self.paths.new_keys();
-        dropped
+        (dropped, renewal)
     }
 
     /// Whether the session has no keys: it sends nothing and sets no deadline.

@@ -307,11 +307,32 @@ impl<C: Config> Responder<C> {
     /// [`ResponderError::NotServed`] for a context not served.
     pub fn accept_payload(&mut self, context: &[u8]) -> Result<(), ResponderError> {
         let context = Context::new(context).map_err(ResponderError::ContextTooLong)?;
+        self.set_accepts_payload(&context, true)
+    }
+
+    /// Whether `context` is served and accepts first contacts with a payload.
+    #[cfg(test)]
+    pub(crate) fn accepts_payload(&self, context: &Context) -> bool {
+        self.contexts
+            .get(context)
+            .is_some_and(|served| served.accepts_payload)
+    }
+
+    /// Whether first contacts with a payload are accepted in `context`.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::NotServed`] for a context not served.
+    pub fn set_accepts_payload(
+        &mut self,
+        context: &Context,
+        on: bool,
+    ) -> Result<(), ResponderError> {
         let served = self
             .contexts
-            .get_mut(&context)
+            .get_mut(context)
             .ok_or(ResponderError::NotServed)?;
-        served.accepts_payload = true;
+        served.accepts_payload = on;
         Ok(())
     }
 

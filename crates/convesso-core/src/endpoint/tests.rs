@@ -82,6 +82,7 @@ impl Admission for Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ev {
     Connected(Vec<u8>),
+    Idle(Vec<u8>),
     Datagram(Vec<u8>, Vec<u8>, bool),
     Closed(Vec<u8>, u16, bool),
     ReopenFailed(Vec<u8>, DialError),
@@ -100,6 +101,7 @@ enum Ev {
 fn own(event: Event<'_>) -> Ev {
     match event {
         Event::Connected { context, .. } => Ev::Connected(context.as_bytes().to_vec()),
+        Event::Idle { context, .. } => Ev::Idle(context.as_bytes().to_vec()),
         Event::Datagram {
             context,
             data,
@@ -742,8 +744,9 @@ fn keys_past_180_seconds_are_not_used() {
 
 // --- dormancy and the queue --------------------------------------------------------------
 
-/// Scenario: a dormant session reopens on the next datagram, without a new
-/// connection event; scenario: the queue is sent when the keys arrive.
+/// Scenario: a dormant session reopens on the next datagram, with a new
+/// connection event after the idle one; scenario: the queue is sent when the
+/// keys arrive.
 #[test]
 fn a_dormant_session_reopens_and_flushes_its_queue_in_order() {
     let mut net = Net::new();
@@ -764,8 +767,19 @@ fn a_dormant_session_reopens_and_flushes_its_queue_in_order() {
             b"three".to_vec()
         ]
     );
-    assert_eq!(Net::connections(&net.a), 1, "{:?}", net.a.events);
-    assert_eq!(Net::connections(&net.b), 1, "{:?}", net.b.events);
+    // Each side: connected, idle at the expiry, connected again.
+    for node in [&net.a, &net.b] {
+        assert_eq!(Net::connections(node), 2, "{:?}", node.events);
+        let idle = node
+            .events
+            .iter()
+            .position(|e| *e == Ev::Idle(b"session".to_vec()));
+        let last = node
+            .events
+            .iter()
+            .rposition(|e| matches!(e, Ev::Connected(_) | Ev::Datagram(_, _, true)));
+        assert!(idle.unwrap() < last.unwrap(), "{:?}", node.events);
+    }
 }
 
 /// Scenario: a full queue refuses with a named error.
@@ -814,6 +828,8 @@ fn an_unanswered_reopening_reports_no_response() {
         net.a.events,
         vec![Ev::ReopenFailed(b"session".to_vec(), DialError::NoResponse)]
     );
+    // It never had keys: no idle event, and nothing kept.
+    assert_eq!(net.a.endpoint.session_count(), 0);
 }
 
 // --- path size and targets ----------------------------------------------------------------
@@ -1090,7 +1106,8 @@ fn the_passive_keepalive_when_enabled() {
     net.a_sends(b"hello").unwrap();
     net.b
         .endpoint
-        .set_passive_keepalive(net.a.peer_id(), b"session", true);
+        .set_passive_keepalive(net.a.peer_id(), b"session", true)
+        .unwrap();
     let sent = net.b.sent.len();
     for second in 1..=9 {
         net.at(second);
@@ -2143,7 +2160,13 @@ fn the_relay_context_and_a_duplicate_are_refused() {
         Err(ResponderError::RelayContext)
     );
     assert_eq!(
-        endpoint.accept_payload(crate::relay::CONTEXT),
+        endpoint.set_context_settings(
+            crate::relay::CONTEXT,
+            Settings {
+                early_data: true,
+                ..Settings::default()
+            }
+        ),
         Err(ResponderError::RelayContext)
     );
     assert_eq!(
@@ -3601,4 +3624,636 @@ fn with_no_carried_head_the_newest_takes_the_heads_place() {
     let after = kinds(&a.queued());
     assert_eq!(after.len(), 1, "{after:?}");
     assert!(matches!(after[0], Queued::Attempt(..)) && after[0] != first[0]);
+}
+
+// --- peers met and gone -------------------------------------------------------------
+
+/// An endpoint of any profile, with what a test drives it with.
+struct Peer<C: Config> {
+    endpoint: Endpoint<C>,
+    policy: Policy,
+    entropy: TestEntropy,
+    source: [u8; 6],
+    events: Vec<Ev>,
+}
+
+impl<C: Config> Peer<C> {
+    fn new(identity: Identity, source: [u8; 6], seed: u64) -> Self {
+        Self {
+            endpoint: Endpoint::new(identity, &[b"session"]).unwrap(),
+            policy: Policy {
+                decision: Decision::Accept { psk: None },
+                asked: 0,
+                refuse: Vec::new(),
+            },
+            entropy: TestEntropy(seed),
+            source,
+            events: Vec::new(),
+        }
+    }
+
+    fn address(&self) -> Address {
+        *self.endpoint.identity().address()
+    }
+
+    /// Everything the endpoint has to send at `now`; its events kept.
+    fn drain(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let mut sent = Vec::new();
+        for _ in 0..100_000 {
+            let mut out = [0u8; 2048];
+            match self
+                .endpoint
+                .poll(now, &mut self.policy, &mut self.entropy, &mut out)
+            {
+                Poll::Transmit { len, .. } => sent.push(out[..len].to_vec()),
+                Poll::Event(event) => self.events.push(own(event)),
+                Poll::OpenRelayLink | Poll::CloseRelayLink => panic!("no relay here"),
+                Poll::Wait(_) | Poll::Idle => break,
+            }
+        }
+        sent
+    }
+
+    /// Hands it `packet` from `from`; returns its answer, if any.
+    fn take(&mut self, packet: &[u8], from: [u8; 6], now: Instant) -> Option<Vec<u8>> {
+        let mut buffer = packet.to_vec();
+        let mut out = [0u8; 2048];
+        match self.endpoint.handle_packet(
+            &mut buffer,
+            Source::Direct(&from),
+            now,
+            &mut self.policy,
+            &mut self.entropy,
+            &mut out,
+        ) {
+            Output::Transmit { len, .. } => Some(out[..len].to_vec()),
+            Output::Event(event) => {
+                self.events.push(own(event));
+                None
+            }
+            Output::Nothing => None,
+        }
+    }
+
+    /// Sends `data` to `to` by its address at `now`; returns the packet.
+    fn send_to(&mut self, to: &Address, data: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let mut out = [0u8; 2048];
+        match self
+            .endpoint
+            .send(
+                Target::Address(to),
+                b"session",
+                data,
+                PATH,
+                now,
+                &mut self.policy,
+                &mut self.entropy,
+                &mut out,
+            )
+            .unwrap()
+        {
+            Output::Transmit { len, .. } => Some(out[..len].to_vec()),
+            _ => None,
+        }
+    }
+}
+
+/// Carries packets between `a` and `b` at `now`, starting with `first` from
+/// `a`, until neither has anything to send.
+fn settle_pair<A: Config, B: Config>(
+    a: &mut Peer<A>,
+    b: &mut Peer<B>,
+    first: Option<Vec<u8>>,
+    now: Instant,
+) {
+    let mut queue: VecDeque<(bool, Vec<u8>)> = first.into_iter().map(|p| (true, p)).collect();
+    for _ in 0..1000 {
+        queue.extend(a.drain(now).into_iter().map(|p| (true, p)));
+        queue.extend(b.drain(now).into_iter().map(|p| (false, p)));
+        let Some((from_a, packet)) = queue.pop_front() else {
+            return;
+        };
+        let answer = if from_a {
+            b.take(&packet, a.source, now)
+        } else {
+            a.take(&packet, b.source, now)
+        };
+        if let Some(answer) = answer {
+            queue.push_back((!from_a, answer));
+        }
+    }
+    panic!("the pair never settled");
+}
+
+/// A peer of identity `i`, made from a seed.
+#[cfg(feature = "ed25519-seed")]
+fn seeded(i: u32) -> Identity {
+    let mut seed = [7u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Identity::from_ed25519_seed(&seed).unwrap()
+}
+
+/// Scenario: peers met and gone leave no state. A server-profile endpoint
+/// opens a session with each of 100 peers, each sends it a datagram, and
+/// all keys expire: it holds no session, and a datagram to one of them by
+/// address opens a session again, with a connection event.
+#[cfg(feature = "ed25519-seed")]
+#[test]
+fn peers_met_and_gone_leave_no_state() {
+    use crate::storage::Server;
+
+    let server_source = [10, 0, 0, 2, 0, 2];
+    let mut server: Peer<Server> = Peer::new(identity(0), server_source, 200);
+    let mut first = None;
+    for i in 0..100u32 {
+        let [hi, lo, ..] = (i as u16).to_be_bytes().map(u32::from).map(|b| b as u8)[..] else {
+            unreachable!()
+        };
+        let source = [10, 1, hi, lo, 0, 1];
+        let mut client: Peer<Mcu> = Peer::new(seeded(i), source, 1_000 + u64::from(i));
+        let now = Instant::from_millis(u64::from(i));
+        let server_peer = server.endpoint.identity().peer_id();
+        client
+            .endpoint
+            .set_hints(server_peer, &[&server_source], now)
+            .unwrap();
+        let packet = client.send_to(&server.address(), b"hello", now);
+        settle_pair(&mut client, &mut server, packet, now);
+        if i == 0 {
+            first = Some(client);
+        }
+    }
+    assert_eq!(server.endpoint.sessions.len(), 100, "every peer met");
+
+    // Every key expired: polled at its deadlines, the server holds nothing.
+    let later = Instant::from_millis(100 + 181_000);
+    let _ = server.drain(later);
+    assert_eq!(
+        server.endpoint.sessions.len(),
+        0,
+        "peers gone, nothing kept"
+    );
+
+    // The first peer, by address, opens a session again, with an event.
+    let mut client = first.unwrap();
+    client.events.clear();
+    server.events.clear();
+    let client_peer = client.endpoint.identity().peer_id();
+    server
+        .endpoint
+        .set_hints(client_peer, &[&client.source], later)
+        .unwrap();
+    let packet = server.send_to(&client.address(), b"again", later);
+    settle_pair(&mut server, &mut client, packet, later);
+    assert!(
+        server.events.contains(&Ev::Connected(b"session".to_vec())),
+        "{:?}",
+        server.events
+    );
+}
+
+/// The cost of one datagram each way between two server-profile endpoints
+/// that have met 1, 1,000, 10,000 and 100,000 peers whose keys expired.
+/// Ignored by default; run it with
+/// `cargo test -p convesso-core --all-features --release --lib a_packet_with_peers_met -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, meaningful only in release"]
+fn a_packet_with_peers_met() {
+    use crate::storage::Server;
+
+    for met in [1u32, 1_000, 10_000, 100_000] {
+        let (a_source, b_source) = ([10, 0, 0, 1, 0, 1], [10, 0, 0, 2, 0, 2]);
+        let mut a: Peer<Server> = Peer::new(identity(1), a_source, 100);
+        let mut b: Peer<Server> = Peer::new(identity(0), b_source, 200);
+        let start = Instant::from_millis(0);
+        let (a_peer, b_peer) = (
+            a.endpoint.identity().peer_id(),
+            b.endpoint.identity().peer_id(),
+        );
+        a.endpoint.set_hints(b_peer, &[&b_source], start).unwrap();
+        b.endpoint.set_hints(a_peer, &[&a_source], start).unwrap();
+
+        // The peers met: sessions whose keys are gone, as they are left.
+        let (mut made, mut i) = (0, 0u32);
+        while made < met {
+            let mut bytes = [9u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            bytes[31] = 0x40;
+            i += 1;
+            let Ok(peer) = PeerId::from_static(bytes) else {
+                continue;
+            };
+            made += 1;
+            for node in [&mut a.endpoint, &mut b.endpoint] {
+                let _ = node.sessions.insert((peer, ctx()), Session::new());
+            }
+        }
+
+        let address = b.address();
+        let packet = a.send_to(&address, b"open", start);
+        settle_pair(&mut a, &mut b, packet, start);
+
+        let rounds = 2_000u64;
+        let started = std::time::Instant::now();
+        for round in 0..rounds {
+            let now = Instant::from_millis(1 + round);
+            let packet = a.send_to(&address, b"ping", now).expect("a live session");
+            let _ = a.drain(now);
+            assert!(b.take(&packet, a_source, now).is_none());
+            let _ = b.drain(now);
+            let mut out = [0u8; 2048];
+            let Ok(Output::Transmit { len, .. }) = b.endpoint.send(
+                Target::Peer(a_peer),
+                b"session",
+                b"pong",
+                PATH,
+                now,
+                &mut b.policy,
+                &mut b.entropy,
+                &mut out,
+            ) else {
+                panic!("round {round}");
+            };
+            let _ = b.drain(now);
+            assert!(a.take(&out[..len], b_source, now).is_none());
+            let _ = a.drain(now);
+        }
+        let per_round = started.elapsed() / u32::try_from(rounds).unwrap();
+        std::println!(
+            "{met:>7} peers met: {per_round:?} a round (two datagrams, their polls); sessions held {}",
+            a.endpoint.sessions.len()
+        );
+    }
+}
+
+// --- idle and forgotten ---------------------------------------------------------------
+
+/// Scenario: the keys' expiry raises the idle event, on both sides, sends
+/// nothing, and leaves no session.
+#[test]
+fn the_keys_expiry_raises_the_idle_event() {
+    let mut net = Net::new();
+    net.a_sends(b"hello").unwrap();
+    let sent = (net.a.sent.len(), net.b.sent.len());
+    net.at(179);
+    assert!(!net.a.events.contains(&Ev::Idle(b"session".to_vec())));
+    net.at(181);
+    for node in [&net.a, &net.b] {
+        let idles = node
+            .events
+            .iter()
+            .filter(|e| **e == Ev::Idle(b"session".to_vec()))
+            .count();
+        assert_eq!(idles, 1, "{:?}", node.events);
+        assert_eq!(node.endpoint.session_count(), 0);
+    }
+    assert_eq!((net.a.sent.len(), net.b.sent.len()), sent, "nothing sent");
+}
+
+/// Scenario: a closed session raises no idle event, on either side.
+#[test]
+fn a_closed_session_raises_no_idle_event() {
+    let mut net = Net::new();
+    net.a_sends(b"hello").unwrap();
+    let now = net.t();
+    let peer_b = net.b.peer_id();
+    let mut out = [0u8; 2048];
+    let Output::Transmit { len, .. } = net
+        .a
+        .endpoint
+        .close(peer_b, b"session", 0x0101, now, &mut out)
+    else {
+        panic!("a close is sent");
+    };
+    net.deliver(true, &out[..len]);
+    net.at(200);
+    for node in [&net.a, &net.b] {
+        assert!(
+            !node.events.iter().any(|e| matches!(e, Ev::Idle(_))),
+            "{:?}",
+            node.events
+        );
+        assert_eq!(node.endpoint.session_count(), 0);
+    }
+}
+
+/// Scenario: a renewal raises no event: a session that keeps sending renews
+/// its keys past 120 s, and is never reported idle or connected again.
+#[test]
+fn a_renewal_raises_no_event() {
+    let mut net = Net::new();
+    for second in 0..400 {
+        net.now = second * 1000;
+        net.a_sends(b"tick").unwrap();
+    }
+    for node in [&net.a, &net.b] {
+        assert_eq!(Net::connections(node), 1, "{:?}", node.events);
+        assert!(!node.events.iter().any(|e| matches!(e, Ev::Idle(_))));
+    }
+}
+
+/// A full table on the microcontroller profile refuses a fifth peer, and the
+/// four live sessions are untouched: nothing is evicted.
+#[cfg(feature = "ed25519-seed")]
+#[test]
+fn a_full_table_refuses_and_evicts_nothing() {
+    let a_source = [10, 0, 0, 1, 0, 1];
+    let mut a: Peer<Mcu> = Peer::new(identity(1), a_source, 100);
+    let mut peers: Vec<Peer<Mcu>> = Vec::new();
+    let now = Instant::from_millis(0);
+    for i in 0..5u8 {
+        let source = [10, 0, 1, i + 1, 0, 1];
+        let peer: Peer<Mcu> = Peer::new(seeded(u32::from(i) + 500), source, 300 + u64::from(i));
+        peers.push(peer);
+    }
+    // The profile holds 4 peers' hints: each is given just before its send.
+    for peer in peers.iter_mut().take(4) {
+        let id = peer.endpoint.identity().peer_id();
+        a.endpoint.set_hints(id, &[&peer.source], now).unwrap();
+        let packet = a.send_to(&peer.address(), b"hello", now);
+        settle_pair(&mut a, peer, packet, now);
+    }
+    assert_eq!(a.endpoint.session_count(), 4);
+    let mut out = [0u8; 2048];
+    let fifth = peers[4].address();
+    let fifth_id = peers[4].endpoint.identity().peer_id();
+    a.endpoint
+        .set_hints(fifth_id, &[&peers[4].source], now)
+        .unwrap();
+    assert_eq!(
+        a.endpoint
+            .send(
+                Target::Address(&fifth),
+                b"session",
+                b"hello",
+                PATH,
+                now,
+                &mut a.policy,
+                &mut a.entropy,
+                &mut out,
+            )
+            .err(),
+        Some(SendError::Capacity)
+    );
+    for peer in peers.iter().take(4) {
+        let id = peer.endpoint.identity().peer_id();
+        assert!(a.endpoint.is_live(&id, b"session", now));
+    }
+}
+
+/// A send at a source the caller knows reopens the session there, with no
+/// hint and no relay; a source longer than any the core keeps is refused.
+#[test]
+fn a_send_at_a_known_source_dials_there() {
+    let mut a = Dialler::new(1);
+    let b = identity(0);
+    let source = [10, 0, 0, 9, 0, 9];
+    let mut out = [0u8; 2048];
+    let sent = a.endpoint.send(
+        Target::AddressAt(b.address(), &source),
+        b"session",
+        b"hello",
+        PATH,
+        Instant::from_millis(0),
+        &mut a.policy,
+        &mut a.entropy,
+        &mut out,
+    );
+    let Ok(Output::Transmit { to, .. }) = sent else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(to, direct(&source));
+    let long = [0u8; 64];
+    assert_eq!(
+        a.endpoint
+            .send(
+                Target::AddressAt(b.address(), &long),
+                b"session",
+                b"hello",
+                PATH,
+                Instant::from_millis(0),
+                &mut a.policy,
+                &mut a.entropy,
+                &mut out,
+            )
+            .err(),
+        Some(SendError::SourceTooLong { len: 64 })
+    );
+}
+
+// --- context settings ------------------------------------------------------------------
+
+/// Settings given before a context is served, or after, make it accept a
+/// payload alike; the default takes it back; and a table full of settings
+/// refuses one more context.
+#[test]
+fn context_settings_apply_whenever_given() {
+    let early = Settings {
+        early_data: true,
+        ..Settings::default()
+    };
+    let mut endpoint: Endpoint<Mcu> = Endpoint::new(identity(0), &[]).unwrap();
+    let name = |c: &[u8]| Context::new(c).unwrap();
+
+    endpoint.set_context_settings(b"before", early).unwrap();
+    endpoint.serve(b"before", Access::Policy).unwrap();
+    assert!(endpoint.responder.accepts_payload(&name(b"before")));
+
+    endpoint.serve(b"after", Access::Policy).unwrap();
+    assert!(!endpoint.responder.accepts_payload(&name(b"after")));
+    endpoint.set_context_settings(b"after", early).unwrap();
+    assert!(endpoint.responder.accepts_payload(&name(b"after")));
+    endpoint
+        .set_context_settings(b"after", Settings::default())
+        .unwrap();
+    assert!(!endpoint.responder.accepts_payload(&name(b"after")));
+
+    // A dial-only context keeps its settings too; the profile holds four.
+    endpoint.set_context_settings(b"dial-a", early).unwrap();
+    endpoint.set_context_settings(b"dial-b", early).unwrap();
+    endpoint.set_context_settings(b"dial-c", early).unwrap();
+    assert_eq!(
+        endpoint.set_context_settings(b"dial-d", early),
+        Err(ResponderError::TooManyContexts { capacity: 4 })
+    );
+    // Closing a context frees its settings.
+    endpoint.close_context(b"before", 1).unwrap();
+    endpoint.set_context_settings(b"dial-d", early).unwrap();
+}
+
+/// How many keepalives (31-byte transport packets) `node` sends at `now`.
+fn keepalives_at<C: Config>(node: &mut Peer<C>, now: Instant) -> usize {
+    node.drain(now).iter().filter(|p| p.len() == 31).count()
+}
+
+/// Scenario: a context's default applies to every session: two peers each
+/// send B a datagram in a context whose default is on, and each of B's
+/// sessions sends one keepalive 10 s later.
+#[cfg(feature = "ed25519-seed")]
+#[test]
+fn a_contexts_default_applies_to_every_session() {
+    let b_source = [10, 0, 0, 2, 0, 2];
+    let mut b: Peer<Mcu> = Peer::new(identity(0), b_source, 200);
+    let on = Settings {
+        passive_keepalive: true,
+        ..Settings::default()
+    };
+    b.endpoint.set_context_settings(b"session", on).unwrap();
+    let start = Instant::from_millis(0);
+    for i in 0..2u8 {
+        let mut a: Peer<Mcu> = Peer::new(
+            seeded(600 + u32::from(i)),
+            [10, 0, 0, 10 + i, 0, 1],
+            100 + u64::from(i),
+        );
+        let b_peer = b.endpoint.identity().peer_id();
+        a.endpoint.set_hints(b_peer, &[&b_source], start).unwrap();
+        let packet = a.send_to(&b.address(), b"hello", start);
+        settle_pair(&mut a, &mut b, packet, start);
+    }
+    assert_eq!(keepalives_at(&mut b, Instant::from_millis(9_000)), 0);
+    assert_eq!(keepalives_at(&mut b, Instant::from_millis(10_000)), 2);
+}
+
+/// Scenario: an override lasts for its session only; scenario: no session,
+/// no setting.
+#[test]
+fn an_override_lasts_for_its_session_only() {
+    let mut net = Net::new();
+    let on = Settings {
+        passive_keepalive: true,
+        ..Settings::default()
+    };
+    net.b.endpoint.set_context_settings(b"session", on).unwrap();
+    let a = net.a.peer_id();
+    // No session yet: refused, and nothing changes.
+    assert_eq!(
+        net.b.endpoint.set_passive_keepalive(a, b"session", false),
+        Err(NoSession)
+    );
+    net.a_sends(b"hello").unwrap();
+    net.b
+        .endpoint
+        .set_passive_keepalive(a, b"session", false)
+        .unwrap();
+    let sent = net.b.sent.len();
+    for second in 1..=20 {
+        net.at(second);
+    }
+    assert_eq!(net.b.sent.len(), sent, "the override holds");
+
+    // The keys expire; the next session takes the context's default.
+    net.at(200);
+    assert_eq!(net.b.endpoint.session_count(), 0);
+    net.a_sends(b"again").unwrap();
+    let sent = net.b.sent.len();
+    net.at(210);
+    assert_eq!(net.b.sent.len(), sent + 1, "the default again");
+}
+
+// --- early data ------------------------------------------------------------------------
+
+fn early_data(net: &mut Net) {
+    let early = Settings {
+        early_data: true,
+        ..Settings::default()
+    };
+    for node in [&mut net.a, &mut net.b] {
+        node.endpoint
+            .set_context_settings(b"session", early)
+            .unwrap();
+    }
+}
+
+fn payloads(node: &Node) -> Vec<Vec<u8>> {
+    node.events
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Payload(_, data) => Some(data.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scenario: early data reaches the peer in the first contact, before the
+/// connection, and is not sent again under the keys.
+#[test]
+fn early_data_reaches_the_peer_in_the_first_contact() {
+    let mut net = Net::new();
+    early_data(&mut net);
+    net.a_sends(b"hello").unwrap();
+    assert_eq!(net.a.sent[0][..2], [0x01, 0x05]);
+    assert_eq!(payloads(&net.b), vec![b"hello".to_vec()]);
+    assert!(net.b_datagrams().is_empty(), "not sent again");
+    let payload = net
+        .b
+        .events
+        .iter()
+        .position(|e| matches!(e, Ev::Payload(..)))
+        .unwrap();
+    let connected = net
+        .b
+        .events
+        .iter()
+        .position(|e| matches!(e, Ev::Connected(_) | Ev::Datagram(_, _, true)))
+        .unwrap();
+    assert!(payload < connected, "{:?}", net.b.events);
+    // The next datagram goes under the keys.
+    net.a_sends(b"next").unwrap();
+    assert_eq!(net.b_datagrams(), vec![b"next".to_vec()]);
+}
+
+/// Scenario: without the declaration, no payload is sent.
+#[test]
+fn without_early_data_no_payload_is_sent() {
+    let mut net = Net::new();
+    net.a_sends(b"hello").unwrap();
+    assert_eq!(net.a.sent[0][..2], [0x01, 0x01]);
+    assert!(payloads(&net.b).is_empty());
+    assert_eq!(net.b_datagrams(), vec![b"hello".to_vec()]);
+}
+
+/// Scenario: a datagram too large for a first contact waits for the keys.
+#[test]
+fn a_datagram_too_large_for_a_first_contact_waits() {
+    let mut net = Net::new();
+    early_data(&mut net);
+    // A 1,000-byte path: 900 bytes fit a transport packet, not a first contact.
+    let large = vec![7u8; 900];
+    let address = net.b.address();
+    let mut out = [0u8; 2048];
+    let Ok(Output::Transmit { len, .. }) = net.a.endpoint.send(
+        Target::Address(&address),
+        b"session",
+        &large,
+        1_000,
+        net.t(),
+        &mut net.a.policy,
+        &mut net.a.entropy,
+        &mut out,
+    ) else {
+        panic!("a first contact");
+    };
+    assert_eq!(out[..2], [0x01, 0x01]);
+    net.settle_with(VecDeque::from([(true, out[..len].to_vec())]));
+    assert!(payloads(&net.b).is_empty());
+    assert_eq!(net.b_datagrams(), vec![large]);
+}
+
+/// A dial whose four attempts are all admitted hands the payload over at
+/// most once per attempt, and the datagram is never sent again.
+#[test]
+fn early_data_arrives_at_most_once_per_attempt() {
+    let mut net = Net::new();
+    early_data(&mut net);
+    net.drop_to_a = true;
+    net.a_sends(b"hello").unwrap();
+    net.at(1);
+    net.at(3);
+    net.drop_to_a = false;
+    net.at(7);
+    let delivered = payloads(&net.b).len();
+    assert!((1..=4).contains(&delivered), "{delivered}");
+    assert!(net.b_datagrams().is_empty());
+    assert!(net.a.events.iter().any(|e| matches!(e, Ev::Connected(_))));
 }

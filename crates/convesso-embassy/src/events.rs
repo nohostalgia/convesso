@@ -71,10 +71,28 @@ pub enum NodeEvent {
 /// Something in a context the application should know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextEvent<'a> {
-    /// A first session with a peer.
+    /// A session with a peer has keys, where it had none: its first, or one
+    /// after [`ContextEvent::Idle`].
     Connected {
         /// The peer.
         peer: PeerId,
+    },
+    /// The session with a peer has no keys left: they expired. The next
+    /// datagram opens one again, with [`ContextEvent::Connected`].
+    Idle {
+        /// The peer.
+        peer: PeerId,
+    },
+    /// A datagram that came in a peer's first contact, in a context that
+    /// carries early data, before the session is confirmed: authenticated as
+    /// the peer's, but **unconfirmed**, as a replay, or another attempt of the
+    /// peer's dial, may deliver it again. Its data is cut to the buffer given
+    /// to [`crate::ContextEvents::next`] when longer.
+    EarlyDatagram {
+        /// The peer.
+        peer: PeerId,
+        /// The data.
+        data: &'a [u8],
     },
     /// A datagram. Its data is cut to the buffer given to
     /// [`crate::ContextEvents::next`] when longer.
@@ -149,6 +167,11 @@ pub enum NodeError {
     Context(ResponderError),
     /// The context was closed.
     ContextClosed,
+    /// No session with that peer in that context.
+    NoSession,
+    /// The relay link's keep-alive interval was refused, with the core's
+    /// named error.
+    KeepAlive(convesso_core::endpoint::KeepAliveTooShort),
     /// The stream layer refused a message, a grant or a context's largest
     /// message, with its named error.
     #[cfg(feature = "stream")]
@@ -165,6 +188,8 @@ impl core::fmt::Display for NodeError {
             Self::Exclude(error) => error.fmt(f),
             Self::Context(error) => write!(f, "the context: {error}"),
             Self::ContextClosed => f.write_str("the context was closed"),
+            Self::NoSession => convesso_core::endpoint::NoSession.fmt(f),
+            Self::KeepAlive(error) => error.fmt(f),
             #[cfg(feature = "stream")]
             Self::Message(error) => write!(f, "the message was refused: {error:?}"),
         }
@@ -184,9 +209,11 @@ pub(crate) enum Event<'a> {
 /// ring.
 #[derive(Debug, Clone, Copy)]
 enum Entry {
+    /// A datagram, or with `early` an early datagram.
     Datagram {
         peer: PeerId,
         relayed: bool,
+        early: bool,
         len: usize,
     },
     #[cfg(feature = "stream")]
@@ -248,7 +275,10 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
     /// not fit, or would overtake what waits aside, is dropped. Returns
     /// whether it was dropped.
     pub(crate) fn push_or_hold(&mut self, event: Event<'_>) -> bool {
-        let data = matches!(event, Event::Context(ContextEvent::Datagram { .. }));
+        let data = matches!(
+            event,
+            Event::Context(ContextEvent::Datagram { .. } | ContextEvent::EarlyDatagram { .. })
+        );
         #[cfg(feature = "stream")]
         let data = data || matches!(event, Event::Context(ContextEvent::Message { .. }));
         if data {
@@ -335,16 +365,9 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
                 peer,
                 data,
                 relayed,
-            }) => {
-                if !self.push_bytes(data) {
-                    return false;
-                }
-                self.push_entry(Entry::Datagram {
-                    peer,
-                    relayed,
-                    len: data.len(),
-                });
-                true
+            }) => self.push_datagram(peer, data, relayed, false),
+            Event::Context(ContextEvent::EarlyDatagram { peer, data }) => {
+                self.push_datagram(peer, data, false, true)
             }
             #[cfg(feature = "stream")]
             Event::Context(ContextEvent::Message { peer, data }) => {
@@ -367,6 +390,19 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
         }
     }
 
+    fn push_datagram(&mut self, peer: PeerId, data: &[u8], relayed: bool, early: bool) -> bool {
+        if !self.push_bytes(data) {
+            return false;
+        }
+        self.push_entry(Entry::Datagram {
+            peer,
+            relayed,
+            early,
+            len: data.len(),
+        });
+        true
+    }
+
     /// Takes the oldest event; a datagram's or a message's data is copied
     /// into `buf`, cut to its length.
     pub(crate) fn pop<'b>(&mut self, buf: &'b mut [u8]) -> Option<Event<'b>> {
@@ -379,12 +415,22 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
         self.flush();
         Some(match entry {
             Entry::Other(event) => event,
-            Entry::Datagram { peer, relayed, len } => {
+            Entry::Datagram {
+                peer,
+                relayed,
+                early,
+                len,
+            } => {
                 let kept = self.pop_bytes(len, buf);
-                Event::Context(ContextEvent::Datagram {
-                    peer,
-                    data: buf.get(..kept).unwrap_or_default(),
-                    relayed,
+                let data = buf.get(..kept).unwrap_or_default();
+                Event::Context(if early {
+                    ContextEvent::EarlyDatagram { peer, data }
+                } else {
+                    ContextEvent::Datagram {
+                        peer,
+                        data,
+                        relayed,
+                    }
                 })
             }
             #[cfg(feature = "stream")]
@@ -435,6 +481,8 @@ fn key(event: &Event<'static>) -> (Option<PeerId>, u8) {
         Event::Context(ContextEvent::Message { peer, .. }) => (Some(peer), 9),
         #[cfg(feature = "stream")]
         Event::Context(ContextEvent::ChannelReset { peer, .. }) => (Some(peer), 10),
+        Event::Context(ContextEvent::Idle { peer }) => (Some(peer), 11),
+        Event::Context(ContextEvent::EarlyDatagram { peer, .. }) => (Some(peer), 12),
     }
 }
 
@@ -446,6 +494,7 @@ fn owned(event: Event<'_>) -> Event<'static> {
     };
     Event::Context(match context {
         ContextEvent::Connected { peer } => ContextEvent::Connected { peer },
+        ContextEvent::Idle { peer } => ContextEvent::Idle { peer },
         ContextEvent::Closed {
             peer,
             code,
@@ -458,7 +507,9 @@ fn owned(event: Event<'_>) -> Event<'static> {
         ContextEvent::ReopenFailed { peer, error } => ContextEvent::ReopenFailed { peer, error },
         ContextEvent::PathChanged { peer, path } => ContextEvent::PathChanged { peer, path },
         // Datagrams and messages go through the byte ring, never here.
-        ContextEvent::Datagram { peer, .. } => ContextEvent::Connected { peer },
+        ContextEvent::Datagram { peer, .. } | ContextEvent::EarlyDatagram { peer, .. } => {
+            ContextEvent::Connected { peer }
+        }
         #[cfg(feature = "stream")]
         ContextEvent::Message { peer, .. } => ContextEvent::Connected { peer },
         #[cfg(feature = "stream")]
@@ -477,6 +528,9 @@ pub(crate) fn from_core(
             Some(context),
             Event::Context(ContextEvent::Connected { peer }),
         ),
+        Core::Idle { peer, context } => {
+            (Some(context), Event::Context(ContextEvent::Idle { peer }))
+        }
         Core::Datagram {
             peer,
             context,
@@ -545,8 +599,15 @@ pub(crate) fn from_core(
                 Event::Context(ContextEvent::Connected { peer }),
             )
         }
-        // Only the relay context accepts payloads, and the core consumes them.
-        Core::Payload { .. } => return None,
+        // Early data: the relay context's payloads never reach here.
+        Core::Payload {
+            peer,
+            context,
+            data,
+        } => (
+            Some(context),
+            Event::Context(ContextEvent::EarlyDatagram { peer, data }),
+        ),
     })
 }
 

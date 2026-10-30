@@ -87,6 +87,11 @@ pub enum Target<'a> {
     /// A peer by its identity: only while the session has keys, because a
     /// `PeerId` does not determine the address bytes `mac1` is keyed by.
     Peer(PeerId),
+    /// A peer by its address, at a direct source the caller knows it at, in
+    /// the encoding the driver gives sources in: a session without keys is
+    /// reopened there. A live session keeps its own path. What a relay uses
+    /// to reach a client it knows the path of (`PROTOCOL.md §6`).
+    AddressAt(&'a Address, &'a [u8]),
 }
 
 /// Where a packet goes. The core always names the path; a driver never
@@ -110,8 +115,19 @@ pub enum To {
 /// Something the application should know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
-    /// A first session with this peer in this context.
+    /// A session with this peer in this context has keys, where it had none
+    /// (`PROTOCOL.md §5`): its first handshake, or one after [`Event::Idle`].
     Connected {
+        /// The peer.
+        peer: PeerId,
+        /// The context.
+        context: Context,
+    },
+    /// The session with this peer in this context has no keys left: they
+    /// expired. It sends nothing more; the next datagram to the peer opens a
+    /// session again, with [`Event::Connected`]. Never raised for a session
+    /// that was closed, nor for one whose opening failed.
+    Idle {
         /// The peer.
         peer: PeerId,
         /// The context.
@@ -301,6 +317,12 @@ pub enum SendError {
     QueueFull(QueueFull),
     /// The session has no keys and the peer's address is unknown.
     AddressUnknown,
+    /// The source given with [`Target::AddressAt`] is longer than any source
+    /// the core keeps.
+    SourceTooLong {
+        /// Its length.
+        len: usize,
+    },
     /// The context is too long.
     ContextTooLong(ContextTooLong),
     /// The endpoint's tables are full.
@@ -327,6 +349,7 @@ impl core::fmt::Display for SendError {
             Self::AddressUnknown => {
                 f.write_str("the session has no keys and the peer's address is unknown")
             }
+            Self::SourceTooLong { len } => write!(f, "a {len}-byte source is too long"),
             Self::ContextTooLong(error) => error.fmt(f),
             Self::Capacity => f.write_str("the endpoint's tables are full"),
             Self::NoRelay => f.write_str("no relay is pinned"),
@@ -338,6 +361,34 @@ impl core::fmt::Display for SendError {
 }
 
 impl core::error::Error for SendError {}
+
+/// What an application chooses for a context, on both sides of its sessions
+/// (`PROTOCOL.md §3`, §5). The default is every choice off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// Whether each session opening in the context sends the passive
+    /// keepalive, until a session overrides it
+    /// ([`Endpoint::set_passive_keepalive`]).
+    pub passive_keepalive: bool,
+    /// Whether the context carries early data: a dial carries the first
+    /// queued datagram in its first contacts when it fits, and a first
+    /// contact with a payload is accepted, its payload handed over as
+    /// [`Event::Payload`], unconfirmed. Both sides of a context choose it
+    /// alike.
+    pub early_data: bool,
+}
+
+/// The endpoint holds no session with that peer in that context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoSession;
+
+impl core::fmt::Display for NoSession {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("no session with that peer in that context")
+    }
+}
+
+impl core::error::Error for NoSession {}
 
 /// An endpoint for one identity.
 pub struct Endpoint<C: Config> {
@@ -365,6 +416,8 @@ pub struct Endpoint<C: Config> {
     own: direct::Own,
     /// The prefixes no direct path may use, by masked address and length.
     excluded: C::Excluded<(IpAddr, u8), ()>,
+    /// The settings of the contexts that have any, served or dialled in.
+    settings: C::Contexts<Context, Settings>,
 }
 
 impl<C: Config> Endpoint<C> {
@@ -393,6 +446,7 @@ impl<C: Config> Endpoint<C> {
             last_opened: None,
             own: direct::Own::new(),
             excluded: Default::default(),
+            settings: Default::default(),
         })
     }
 
@@ -410,20 +464,55 @@ impl<C: Config> Endpoint<C> {
         if context == relay::CONTEXT {
             return Err(ResponderError::RelayContext);
         }
-        self.responder.serve(context, access)
+        self.responder.serve(context, access)?;
+        self.apply_early_data(context)
     }
 
-    /// Accepts first contacts with a payload in `context`, served already.
+    /// Sets what the application chooses for `context`, served or only
+    /// dialled in, in place of what it chose before. A session takes the
+    /// passive keepalive when it opens, so the sessions open keep theirs.
     ///
     /// # Errors
     ///
-    /// [`ResponderError::RelayContext`] for the relay context, and
-    /// [`ResponderError::NotServed`] for a context not served.
-    pub fn accept_payload(&mut self, context: &[u8]) -> Result<(), ResponderError> {
+    /// [`ResponderError::RelayContext`] for the relay context, whose settings
+    /// are the relay's; [`ResponderError::ContextTooLong`]; and
+    /// [`ResponderError::TooManyContexts`] for one context more than the
+    /// storage profile holds.
+    pub fn set_context_settings(
+        &mut self,
+        context: &[u8],
+        settings: Settings,
+    ) -> Result<(), ResponderError> {
         if context == relay::CONTEXT {
             return Err(ResponderError::RelayContext);
         }
-        self.responder.accept_payload(context)
+        let name = Context::new(context).map_err(ResponderError::ContextTooLong)?;
+        if settings == Settings::default() {
+            self.settings.remove(&name);
+        } else {
+            self.settings.insert(name, settings).map_err(|full| {
+                ResponderError::TooManyContexts {
+                    capacity: full.capacity,
+                }
+            })?;
+        }
+        self.apply_early_data(context)
+    }
+
+    /// The settings of `context`: the default when it has none.
+    fn settings_of(&self, context: &Context) -> Settings {
+        self.settings.get(context).copied().unwrap_or_default()
+    }
+
+    /// Has the responder accept a payload in `context` as its settings say,
+    /// if it serves it.
+    fn apply_early_data(&mut self, context: &[u8]) -> Result<(), ResponderError> {
+        let name = Context::new(context).map_err(ResponderError::ContextTooLong)?;
+        if self.responder.serves(&name) {
+            let early = self.settings_of(&name).early_data;
+            self.responder.set_accepts_payload(&name, early)?;
+        }
+        Ok(())
     }
 
     /// Changes who may reach this endpoint in `context`: `Some(access)` serves
@@ -457,7 +546,10 @@ impl<C: Config> Endpoint<C> {
             Some(access) if self.responder.serves(&served) => {
                 self.responder.set_access(&served, access)?;
             }
-            Some(access) => self.responder.serve(context, access)?,
+            Some(access) => {
+                self.responder.serve(context, access)?;
+                self.apply_early_data(context)?;
+            }
             None => {
                 self.responder.stop_serving(&served);
             }
@@ -514,6 +606,7 @@ impl<C: Config> Endpoint<C> {
         self.responder
             .retain_pending(|pending| *pending.context() != closed);
         self.responder.stop_serving(&closed);
+        self.settings.remove(&closed);
         Ok(())
     }
 
@@ -621,7 +714,9 @@ impl<C: Config> Endpoint<C> {
                     return Output::Nothing;
                 };
                 field.copy_from_slice(plaintext);
-                self.owed = Some((response, Hop::Source));
+                // The poll that sends the response no longer knows where the
+                // packet came from: it is named now.
+                self.owed = Some((response, relayed::answer_hop(source)));
                 Output::Event(Event::Payload {
                     peer,
                     context,
@@ -719,7 +814,7 @@ impl<C: Config> Endpoint<C> {
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
             relay.register_due |= relay.link_open();
         }
-        let Some(session) = self.session_for(key, now) else {
+        let Some(session) = self.session_for(key) else {
             return Output::Nothing;
         };
         if address.is_some() {
@@ -730,10 +825,12 @@ impl<C: Config> Endpoint<C> {
         if source.is_some() {
             session.last_source = source;
         }
-        let first = !session.ever_connected;
-        session.ever_connected = true;
         session.accepted = false;
-        let freed = session.promote(pair, established.channel_binding());
+        let (freed, renewal) = session.promote(pair, established.channel_binding());
+        // Keys where it had none: a connection, raised once until the session
+        // goes idle.
+        let first = !renewal && !session.connected;
+        session.connected |= first;
         // The dial carried the head of the queue in its first contact.
         if session.carried {
             session.queue.pop();
@@ -841,7 +938,6 @@ impl<C: Config> Endpoint<C> {
             newest,
             now,
         );
-        session.last_used = now;
         self.last_opened = Some((key, newest));
         let relayed = matches!(source, Source::Relayed(_));
         let arrival = Arrival {
@@ -888,17 +984,17 @@ impl<C: Config> Endpoint<C> {
 
         let key = (peer, context);
         let path = self.may_be_path(source.key());
-        let Some(session) = self.session_for(key, now) else {
+        let Some(session) = self.session_for(key) else {
             return Output::Nothing;
         };
-        let first = !session.ever_connected;
-        session.ever_connected = true;
         session.accepted = true;
         // The first packet of a pending pair: the newest it has, and the
         // pair is the session's current one from here.
         heard(session, opened.inner_type, source, path, true, true, now);
         let local_index = pair.local_index;
-        let freed = session.promote(pair, &binding);
+        let (freed, renewal) = session.promote(pair, &binding);
+        let first = !renewal && !session.connected;
+        session.connected |= first;
         if let Some(index) = freed {
             self.indices.remove(&index);
         }
@@ -1077,9 +1173,15 @@ impl<C: Config> Endpoint<C> {
         }
         let context = Context::new(context).map_err(SendError::ContextTooLong)?;
         self.expire(now);
-        let (peer, address) = match target {
-            Target::Address(address) => (address.peer_id(), Some(*address)),
-            Target::Peer(peer) => (peer, None),
+        let (peer, address, at) = match target {
+            Target::Address(address) => (address.peer_id(), Some(*address), None),
+            Target::Peer(peer) => (peer, None, None),
+            Target::AddressAt(address, source) => {
+                let at = Source::Direct(source)
+                    .key()
+                    .ok_or(SendError::SourceTooLong { len: source.len() })?;
+                (address.peer_id(), Some(*address), Some(at))
+            }
         };
         let key = (peer, context);
         let dialling = self.dials.get(&key).is_some();
@@ -1110,19 +1212,21 @@ impl<C: Config> Endpoint<C> {
             if !pending && !live {
                 return Err(SendError::AddressUnknown);
             }
-            let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
-            session.last_used = now;
+            let session = self.session_for(key).ok_or(SendError::Capacity)?;
             session.queue.push(data).map_err(SendError::QueueFull)?;
             return Ok(Output::Nothing);
         };
-        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key).ok_or(SendError::Capacity)?;
         session.address = Some(address);
-        session.last_used = now;
+        if at.is_some() && !live {
+            // Reopened where the caller knows the peer is.
+            session.last_source = at;
+        }
         session.queue.push(data).map_err(SendError::QueueFull)?;
         if dialling || pending || session.current.as_ref().is_some_and(|pair| pair.live(now)) {
             return Ok(Output::Nothing);
         }
-        self.start_dial(key, &address, now, policy, entropy, out)
+        self.start_dial(key, &address, Some(path_max), now, policy, entropy, out)
             .map(|len| Output::Transmit {
                 to: Hop::Peer {
                     peer,
@@ -1183,7 +1287,6 @@ impl<C: Config> Endpoint<C> {
         }
         session.confirm = false;
         session.last_sent = Some(now);
-        session.last_used = now;
         Ok(Output::Transmit { to, len })
     }
 
@@ -1276,10 +1379,9 @@ impl<C: Config> Endpoint<C> {
         if self.dials.get(&key).is_some() || self.is_live(&key.0, context.as_bytes(), now) {
             return Ok(Output::Nothing);
         }
-        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key).ok_or(SendError::Capacity)?;
         session.address = Some(*address);
-        session.last_used = now;
-        let len = self.start_dial(key, address, now, policy, entropy, out)?;
+        let len = self.start_dial(key, address, None, now, policy, entropy, out)?;
         Ok(Output::Transmit {
             to: Hop::Peer {
                 peer: key.0,
@@ -1293,13 +1395,19 @@ impl<C: Config> Endpoint<C> {
         })
     }
 
-    /// Starts a dial for `key`. In the relay context its first contacts carry
-    /// the head of the session's queue, when it fits: the one-datagram wake
-    /// (`PROTOCOL.md §6`), from a client or from the relay.
+    /// Starts a dial for `key`. Its first contacts carry the head of the
+    /// session's queue when it fits ([`Self::wake_payload`]): the one-datagram
+    /// wake of the relay context (`PROTOCOL.md §6`), and early data in a
+    /// context that carries it (`PROTOCOL.md §3`), within `path_max`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the sans-IO inputs of a dial, and the path it takes"
+    )]
     fn start_dial(
         &mut self,
         key: Key,
         address: &Address,
+        path_max: Option<usize>,
         now: Instant,
         policy: &mut impl Admission,
         entropy: &mut impl Entropy,
@@ -1309,7 +1417,7 @@ impl<C: Config> Endpoint<C> {
             return Err(SendError::Capacity);
         }
         let psk = policy.psk(&key.0, key.1.as_bytes());
-        let payload = self.wake_payload(&key, out.len());
+        let payload = self.wake_payload(&key, out.len(), path_max);
         let (dial, len) = Dial::start_with_payload(
             self.responder.identity(),
             address,
@@ -1437,14 +1545,26 @@ impl<C: Config> Endpoint<C> {
         self.responder.discard_peer(&peer);
     }
 
-    /// Turns the passive keepalive on or off for a session.
-    pub fn set_passive_keepalive(&mut self, peer: PeerId, context: &[u8], on: bool) {
-        let Ok(context) = Context::new(context) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(&(peer, context)) {
-            session.passive_keepalive = on;
-        }
+    /// Turns the passive keepalive on or off for the session with `peer` in
+    /// `context`, in place of its context's default, for the session's life:
+    /// the next session takes the default again ([`Settings`]).
+    ///
+    /// # Errors
+    ///
+    /// [`NoSession`] when the endpoint holds no session with `peer` in
+    /// `context`; nothing changes.
+    pub fn set_passive_keepalive(
+        &mut self,
+        peer: PeerId,
+        context: &[u8],
+        on: bool,
+    ) -> Result<(), NoSession> {
+        let session = Context::new(context)
+            .ok()
+            .and_then(|context| self.sessions.get_mut(&(peer, context)))
+            .ok_or(NoSession)?;
+        session.passive_keepalive = on;
+        Ok(())
     }
 
     /// Does what is due at `now`: dial retries and failures, confirmations,
@@ -1469,6 +1589,25 @@ impl<C: Config> Endpoint<C> {
         out: &mut [u8],
     ) -> Poll<Hop> {
         self.expire(now);
+
+        // A session whose keys expired: the application is told, once, and
+        // the session is forgotten if nothing is in progress.
+        let mut idle = None;
+        self.sessions.for_each(|key, session| {
+            if idle.is_none() && session.connected && session.dormant() {
+                idle = Some(*key);
+            }
+        });
+        if let Some(key) = idle {
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.connected = false;
+            }
+            self.expire(now);
+            return Poll::Event(Event::Idle {
+                peer: key.0,
+                context: key.1,
+            });
+        }
 
         if let Some((response, to)) = self.owed.take()
             && let Some(field) = out.get_mut(..RESPONSE_LEN)
@@ -1611,7 +1750,7 @@ impl<C: Config> Endpoint<C> {
                     attempt: Some(0),
                 };
                 return self
-                    .start_dial(key, &address, now, policy, entropy, out)
+                    .start_dial(key, &address, None, now, policy, entropy, out)
                     .ok()
                     .map(|len| Poll::Transmit { to, len });
             }
@@ -1730,43 +1869,32 @@ impl<C: Config> Endpoint<C> {
     }
 
     /// Deletes expired key pairs. A session left without keys stays, dormant:
-    /// it costs no traffic and no deadline, and it remembers that the
-    /// application was told of the connection, so reopening it raises no new
-    /// event. A full table forgets the dormant session used least recently
-    /// ([`Self::session_for`]).
+    /// costs no traffic and no deadline. Once the application was told it
+    /// went idle, it is forgotten, unless something is in progress: a dial, a
+    /// queued datagram, a close (`PROTOCOL.md §5`). The endpoint thus holds
+    /// the sessions in use, whatever the peers it met.
     fn expire(&mut self, now: Instant) {
         let indices = &mut self.indices;
-        self.sessions.retain(|_, session| {
+        let dials = &self.dials;
+        self.sessions.retain(|key, session| {
             for index in session.expire(now).into_iter().flatten() {
                 indices.remove(&index);
             }
-            true
+            !(session.dormant()
+                && !session.connected
+                && session.queue.is_empty()
+                && session.closing.is_none()
+                && dials.get(key).is_none())
         });
     }
 
-    /// The session for `key`, created if needed. When the table is full, the
-    /// dormant session used least recently is forgotten to make room: it holds
-    /// no keys, and its address can be given again.
-    fn session_for(&mut self, key: Key, now: Instant) -> Option<&mut SessionOf<C>> {
+    /// The session for `key`, created if needed; `None` when the table is
+    /// full. Nothing is evicted to make room: the sessions held are in use.
+    fn session_for(&mut self, key: Key) -> Option<&mut SessionOf<C>> {
         if self.sessions.get(&key).is_none() {
-            if self
-                .sessions
-                .capacity()
-                .is_some_and(|c| self.sessions.len() >= c)
-            {
-                let mut oldest: Option<(Instant, Key)> = None;
-                self.sessions.for_each(|k, session| {
-                    if session.dormant()
-                        && session.queue.is_empty()
-                        && oldest.is_none_or(|(at, _)| session.last_used < at)
-                    {
-                        oldest = Some((session.last_used, *k));
-                    }
-                });
-                let (_, evicted) = oldest?;
-                self.sessions.remove(&evicted);
-            }
-            self.sessions.insert(key, Session::new(now)).ok()?;
+            let mut session = Session::new();
+            session.passive_keepalive = self.settings_of(&key.1).passive_keepalive;
+            self.sessions.insert(key, session).ok()?;
         }
         self.sessions.get_mut(&key)
     }
@@ -1791,13 +1919,20 @@ impl<C: Config> Endpoint<C> {
         }
     }
 
-    /// The head of `key`'s queue, if a dial for it should carry it: in the
-    /// relay context, and when it fits a first contact and an output of
-    /// `room` bytes.
-    fn wake_payload(&self, key: &Key, room: usize) -> &[u8] {
-        if key.1.as_bytes() != crate::relay::CONTEXT {
-            return &[];
-        }
+    /// The head of `key`'s queue, if a dial for it should carry it, when it
+    /// fits a first contact and an output of `room` bytes: in the relay
+    /// context; and in a context that carries early data, when the dial
+    /// starts from a send whose path takes `path_max` bytes, the first contact
+    /// fitting that path too.
+    fn wake_payload(&self, key: &Key, room: usize, path_max: Option<usize>) -> &[u8] {
+        let room = if key.1.as_bytes() == crate::relay::CONTEXT {
+            room
+        } else {
+            match path_max {
+                Some(path) if self.settings_of(&key.1).early_data => room.min(path),
+                _ => return &[],
+            }
+        };
         self.sessions
             .get(key)
             .and_then(|session| session.queue.front())
@@ -1806,6 +1941,12 @@ impl<C: Config> Endpoint<C> {
                     && room >= crate::handshake::FIRST_CONTACT_LEN + head.len()
             })
             .unwrap_or_default()
+    }
+
+    /// How many sessions the endpoint holds, its relay session included.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// The session the last packet handled authenticated, if it was a
