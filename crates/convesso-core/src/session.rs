@@ -14,6 +14,7 @@ use crate::dos::SourceKey;
 use crate::handshake::ChannelBinding;
 use crate::identity::Address;
 use crate::paths::PeerPaths;
+use crate::storage::Maybe;
 use crate::time::Instant;
 use crate::transport::{MAX_COUNTER, ReplayWindow};
 
@@ -38,6 +39,9 @@ pub struct QueueFull {
 pub trait DatagramQueue: Default {
     /// The bound, in bytes of datagrams plus 2 bytes of bookkeeping each.
     const LIMIT: usize;
+
+    /// An empty queue, built at compile time.
+    const EMPTY: Self;
 
     /// Appends a datagram.
     ///
@@ -118,6 +122,10 @@ impl<const N: usize> FixedQueue<N> {
 
 impl<const N: usize> DatagramQueue for FixedQueue<N> {
     const LIMIT: usize = N;
+    const EMPTY: Self = Self {
+        buffer: [0; N],
+        used: 0,
+    };
 
     fn push(&mut self, datagram: &[u8]) -> Result<(), QueueFull> {
         let full = QueueFull { limit: N };
@@ -212,6 +220,10 @@ pub struct GrowableQueue<const LIMIT: usize> {
 #[cfg(feature = "alloc")]
 impl<const LIMIT: usize> DatagramQueue for GrowableQueue<LIMIT> {
     const LIMIT: usize = LIMIT;
+    const EMPTY: Self = Self {
+        datagrams: alloc::collections::VecDeque::new(),
+        used: 0,
+    };
 
     fn push(&mut self, datagram: &[u8]) -> Result<(), QueueFull> {
         let cost = 2 + datagram.len();
@@ -337,8 +349,8 @@ impl<W: ReplayWindow> KeyPair<W> {
 /// A session with one peer in one context.
 pub(crate) struct Session<W, Q> {
     pub(crate) address: Option<Address>,
-    pub(crate) current: Option<KeyPair<W>>,
-    pub(crate) previous: Option<KeyPair<W>>,
+    pub(crate) current: Maybe<KeyPair<W>>,
+    pub(crate) previous: Maybe<KeyPair<W>>,
     pub(crate) queue: Q,
     pub(crate) last_source: Option<SourceKey>,
     /// Set when this side completed a handshake as initiator and owes the
@@ -371,29 +383,31 @@ pub(crate) struct Session<W, Q> {
     pub(crate) deadline: Option<Instant>,
 }
 
-impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
-    pub(crate) fn new() -> Self {
-        Self {
-            address: None,
-            current: None,
-            previous: None,
-            queue: Q::default(),
-            last_source: None,
-            confirm: false,
-            rekey: false,
-            closing: None,
-            passive_keepalive: false,
-            last_received_data: None,
-            last_sent: None,
-            connected: false,
-            accepted: false,
-            carried: false,
-            paths: PeerPaths::new(),
-            binding: None,
-            deadline: None,
-        }
-    }
+impl<W: ReplayWindow, Q: DatagramQueue> crate::storage::Empty for Session<W, Q> {
+    /// A session with no keys, made in the sessions' table and then given
+    /// its settings.
+    const EMPTY: Self = Self {
+        address: None,
+        current: Maybe::None,
+        previous: Maybe::None,
+        queue: Q::EMPTY,
+        last_source: None,
+        confirm: false,
+        rekey: false,
+        closing: None,
+        passive_keepalive: false,
+        last_received_data: None,
+        last_sent: None,
+        connected: false,
+        accepted: false,
+        carried: false,
+        paths: PeerPaths::new(),
+        binding: None,
+        deadline: None,
+    };
+}
 
+impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
     /// Deletes every key pair past its life. Returns the local indices freed.
     /// What the session knew of its paths and its binding stays until it is
     /// told idle ([`Self::end_life`]): a renewal still in flight keeps them.
@@ -440,8 +454,8 @@ impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
             self.binding = Some(*binding);
         }
         let dropped = self.previous.take().map(|old| old.local_index);
-        self.previous = self.current.take();
-        self.current = Some(keys);
+        self.previous = self.current.take().into();
+        self.current = Maybe::Some(keys);
         self.rekey = false;
         self.paths.new_keys();
         dropped

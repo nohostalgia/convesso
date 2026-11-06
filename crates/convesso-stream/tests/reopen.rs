@@ -151,8 +151,8 @@ impl Net {
             cut: false,
         };
         let (a, b) = (
-            net.a.endpoint.identity().peer_id(),
-            net.b.endpoint.identity().peer_id(),
+            net.a.endpoint.identity().unwrap().peer_id(),
+            net.b.endpoint.identity().unwrap().peer_id(),
         );
         let (sa, sb) = (net.a.source, net.b.source);
         net.a
@@ -357,7 +357,7 @@ impl Net {
 
     fn a_sends(&mut self, message: &[u8]) {
         let now = self.t();
-        let address = *self.b.endpoint.identity().address();
+        let address = *self.b.endpoint.identity().unwrap().address();
         let peer = address.peer_id();
         let node = &mut self.a;
         node.channels
@@ -378,7 +378,7 @@ impl Net {
 #[test]
 fn a_message_to_a_dormant_session_reopens_it() {
     let mut net = Net::new();
-    let address = *net.b.endpoint.identity().address();
+    let address = *net.b.endpoint.identity().unwrap().address();
     let ctx = b"ctx";
     net.a_sends(b"before");
     net.run_until(5_000);

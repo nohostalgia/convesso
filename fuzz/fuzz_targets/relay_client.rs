@@ -113,7 +113,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut wake = out[..len].to_vec();
-    let client_peer = client.identity().peer_id();
+    let client_peer = client.identity().unwrap().peer_id();
     let _ = relay.handle_packet(
         &mut wake,
         Source::Direct(&CLIENT_SOURCE),

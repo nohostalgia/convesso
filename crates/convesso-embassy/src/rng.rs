@@ -34,6 +34,18 @@ pub trait SecureRng {
     fn try_fill(&mut self, dest: &mut [u8]) -> Result<(), RngFailed>;
 }
 
+/// No generator yet: a slot not started. Every read fails, as a generator
+/// that fails does, so the core is never handed predictable bytes; but no
+/// handle exists to ask for one before the start gives the slot its own.
+impl SecureRng for Option<&mut (dyn SecureRng + Send)> {
+    fn try_fill(&mut self, dest: &mut [u8]) -> Result<(), RngFailed> {
+        match self {
+            Some(rng) => rng.try_fill(dest),
+            None => Err(RngFailed),
+        }
+    }
+}
+
 /// The core's entropy, from a checked [`SecureRng`]. A read that fails after
 /// the check stops the device: the core cannot be handed predictable bytes.
 pub(crate) struct Checked<R>(pub(crate) R);

@@ -369,11 +369,11 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) fn peer_id(&self) -> PeerId {
-        self.endpoint.identity().peer_id()
+        self.endpoint.identity().unwrap().peer_id()
     }
 
     pub(crate) fn address(&self) -> Address {
-        *self.endpoint.identity().address()
+        *self.endpoint.identity().unwrap().address()
     }
 
     pub(crate) fn datagrams(&self) -> Vec<(Vec<u8>, bool)> {

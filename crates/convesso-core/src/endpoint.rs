@@ -30,7 +30,7 @@ use crate::identity::{Address, Identity, PeerId};
 use crate::paths::PathKind;
 use crate::relay::{self, Link};
 use crate::session::{DatagramQueue, KeyPair, QueueFull, Session};
-use crate::storage::{Config, Table};
+use crate::storage::{Config, Maybe, Table};
 use crate::time::Instant;
 use crate::transport::{self, OVERHEAD, ReplayWindow, TYPE_TRANSPORT, inner};
 use crate::wire::{self, Classified, Version, VersionNotSupported};
@@ -58,6 +58,11 @@ pub enum Owner {
     Dial(PeerId, Context),
     /// A key pair of the session with this peer, in this context.
     Session(PeerId, Context),
+}
+
+impl crate::storage::Empty for Owner {
+    /// What a free slot of the indices holds, never read.
+    const EMPTY: Self = Self::Dial(crate::identity::Address::UNSET.peer_id(), Context::EMPTY);
 }
 
 /// Which stream frame a packet carries (`PROTOCOL.md §8`). The core
@@ -329,6 +334,9 @@ pub enum SendError {
     ContextTooLong(ContextTooLong),
     /// The endpoint's tables are full.
     Capacity,
+    /// The endpoint has no identity yet: it was built empty, and not started
+    /// ([`Endpoint::start`]).
+    NotStarted,
     /// No relay is pinned.
     NoRelay,
     /// The relay context is the endpoint's own.
@@ -354,6 +362,7 @@ impl core::fmt::Display for SendError {
             Self::SourceTooLong { len } => write!(f, "a {len}-byte source is too long"),
             Self::ContextTooLong(error) => error.fmt(f),
             Self::Capacity => f.write_str("the endpoint's tables are full"),
+            Self::NotStarted => f.write_str("the endpoint is not started"),
             Self::NoRelay => f.write_str("no relay is pinned"),
             Self::ReservedContext => f.write_str("the relay context is reserved"),
             Self::NoPath => f.write_str("no path to the peer is known"),
@@ -380,6 +389,13 @@ pub struct Settings {
     pub early_data: bool,
 }
 
+impl crate::storage::Empty for Settings {
+    const EMPTY: Self = Self {
+        passive_keepalive: false,
+        early_data: false,
+    };
+}
+
 /// The endpoint holds no session with that peer in that context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoSession;
@@ -400,7 +416,7 @@ pub struct Endpoint<C: Config> {
     sessions: Sessions<C>,
     indices: C::Indices<u32, Owner>,
     /// A response owed to the source of the last packet, sent by the next poll.
-    owed: Option<([u8; RESPONSE_LEN], Hop)>,
+    owed: Maybe<([u8; RESPONSE_LEN], Hop)>,
     /// First contacts owed to the hints after the first, one per dial attempt,
     /// by the order they were made in.
     fans: C::Dials<u32, relayed::Fan>,
@@ -409,12 +425,12 @@ pub struct Endpoint<C: Config> {
     /// hints in the order given.
     hints: C::Hints<(PeerId, u8), relayed::Hint>,
     /// The pinned relay, if any.
-    relay: Option<RelayClient>,
+    relay: Maybe<RelayClient>,
     /// The driver is to be asked to close the link of a relay removed.
     link_close_owed: bool,
     /// The session whose transport packet opened last, if the last packet was
     /// one, and whether its counter was the newest.
-    last_opened: Option<(Key, bool)>,
+    last_opened: Maybe<(Key, bool)>,
     /// This endpoint's candidates (`PROTOCOL.md §7`).
     own: direct::Own,
     /// The prefixes no direct path may use, by masked address and length.
@@ -435,27 +451,63 @@ impl<C: Config> Endpoint<C> {
     ///
     /// As [`Self::serve`].
     pub fn new(identity: Identity, contexts: &[&[u8]]) -> Result<Self, ResponderError> {
+        let mut endpoint = Self::EMPTY;
+        endpoint.start(identity, contexts)?;
+        Ok(endpoint)
+    }
+
+    /// An endpoint with no identity, built at compile time, to be placed in a
+    /// `static` and started there ([`Self::start`]): its tables never cross
+    /// the stack. Until it is started, it answers no packet, its poll has
+    /// nothing to do, and every send is refused with
+    /// [`SendError::NotStarted`].
+    pub const EMPTY: Self = Self {
+        responder: Responder::EMPTY,
+        dials: <C::Dials<Key, Dial> as Table<Key, Dial>>::EMPTY,
+        sessions: Sessions::EMPTY,
+        indices: <C::Indices<u32, Owner> as Table<u32, Owner>>::EMPTY,
+        owed: Maybe::None,
+        fans: <C::Dials<u32, relayed::Fan> as Table<u32, relayed::Fan>>::EMPTY,
+        fan_seq: 0,
+        hints: <C::Hints<(PeerId, u8), relayed::Hint> as Table<(PeerId, u8), relayed::Hint>>::EMPTY,
+        relay: Maybe::None,
+        link_close_owed: false,
+        last_opened: Maybe::None,
+        own: direct::Own::new(),
+        excluded: <C::Excluded<(IpAddr, u8), ()> as Table<(IpAddr, u8), ()>>::EMPTY,
+        settings: <C::Contexts<Context, Settings> as Table<Context, Settings>>::EMPTY,
+        #[cfg(any(test, feature = "testing"))]
+        check_index: true,
+    };
+
+    /// Starts an endpoint built empty ([`Self::EMPTY`]), in place: gives it
+    /// `identity`, and serves `contexts` under [`Access::Policy`]. Refused,
+    /// and nothing changed, for an endpoint already started or a context it
+    /// cannot serve.
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError::Started`] for an endpoint already started, and as
+    /// [`Self::serve`].
+    pub fn start(&mut self, identity: Identity, contexts: &[&[u8]]) -> Result<(), ResponderError> {
+        if self.responder.identity().is_some() {
+            return Err(ResponderError::Started);
+        }
         if contexts.contains(&relay::CONTEXT) {
             return Err(ResponderError::RelayContext);
         }
-        Ok(Self {
-            responder: Responder::new(identity, contexts)?,
-            dials: Default::default(),
-            sessions: Default::default(),
-            indices: Default::default(),
-            owed: None,
-            fans: Default::default(),
-            fan_seq: 0,
-            hints: Default::default(),
-            relay: None,
-            link_close_owed: false,
-            last_opened: None,
-            own: direct::Own::new(),
-            excluded: Default::default(),
-            settings: Default::default(),
-            #[cfg(any(test, feature = "testing"))]
-            check_index: true,
-        })
+        for (served, context) in contexts.iter().enumerate() {
+            if let Err(error) = self.responder.serve(context, Access::Policy) {
+                for context in contexts.iter().take(served) {
+                    if let Ok(context) = Context::new(context) {
+                        self.responder.stop_serving(&context);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        self.responder.start(identity);
+        Ok(())
     }
 
     /// Turns off the check that each poll's index finds what a walk of every
@@ -638,9 +690,9 @@ impl<C: Config> Endpoint<C> {
         self.responder.contexts_served()
     }
 
-    /// This endpoint's identity.
+    /// This endpoint's identity; `None` for one built empty and not started.
     #[must_use]
-    pub const fn identity(&self) -> &Identity {
+    pub const fn identity(&self) -> Option<&Identity> {
         self.responder.identity()
     }
 
@@ -659,6 +711,9 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Output<'a> {
+        if self.responder.identity().is_none() {
+            return Output::Nothing;
+        }
         let mut policy = self.aware(policy);
         let output = self.handle_inner(packet, source, now, &mut policy, entropy, out);
         let answer = match source {
@@ -677,7 +732,7 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Output<'a, Hop> {
-        self.last_opened = None;
+        self.last_opened = Maybe::None;
         self.expire(now);
         match wire::classify(packet) {
             Classified::Version(Version::V1) => match packet.get(1).copied() {
@@ -706,7 +761,9 @@ impl<C: Config> Endpoint<C> {
     ) -> Output<'a, Hop> {
         // Two openings that cross: the one the greater `PeerId` started wins,
         // at both ends, so that one handshake completes (`PROTOCOL.md §3`).
-        let me = self.responder.identity().peer_id();
+        let Some(me) = self.responder.identity().map(Identity::peer_id) else {
+            return Output::Nothing;
+        };
         let (sessions, dials) = (&self.sessions, &self.dials);
         let mut yields = None;
         let standing = |peer: &PeerId, context: &Context, renewal: bool| {
@@ -765,7 +822,7 @@ impl<C: Config> Endpoint<C> {
                 field.copy_from_slice(plaintext);
                 // The poll that sends the response no longer knows where the
                 // packet came from: it is named now.
-                self.owed = Some((response, relayed::answer_hop(source)));
+                self.owed = Maybe::Some((response, relayed::answer_hop(source)));
                 Output::Event(Event::Payload {
                     peer,
                     context,
@@ -825,7 +882,9 @@ impl<C: Config> Endpoint<C> {
         source: Source<'_>,
         now: Instant,
     ) -> Output<'a, Hop> {
-        let identity = self.responder.identity();
+        let Some(identity) = self.responder.identity() else {
+            return Output::Nothing;
+        };
         let Some(dial) = self.dials.get_mut(&key) else {
             return Output::Nothing;
         };
@@ -987,7 +1046,7 @@ impl<C: Config> Endpoint<C> {
             newest,
             now,
         );
-        self.last_opened = Some((key, newest));
+        self.last_opened = Maybe::Some((key, newest));
         let relayed = matches!(source, Source::Relayed(_));
         let arrival = Arrival {
             connected: false,
@@ -1051,7 +1110,7 @@ impl<C: Config> Endpoint<C> {
         let _ = self
             .indices
             .insert(local_index, Owner::Session(peer, context));
-        self.last_opened = Some((key, true));
+        self.last_opened = Maybe::Some((key, true));
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
             relay.register_due |= relay.link_open();
         }
@@ -1179,6 +1238,9 @@ impl<C: Config> Endpoint<C> {
     ) -> Result<Output<'static>, SendError> {
         if self.relay.is_some() && context == crate::relay::CONTEXT {
             return Err(SendError::ReservedContext);
+        }
+        if self.responder.identity().is_none() {
+            return Err(SendError::NotStarted);
         }
         if let Target::Address(address) = target
             && !self.has_path(&address.peer_id(), now)
@@ -1382,6 +1444,9 @@ impl<C: Config> Endpoint<C> {
         if self.relay.is_some() && context == crate::relay::CONTEXT {
             return Err(SendError::ReservedContext);
         }
+        if self.responder.identity().is_none() {
+            return Err(SendError::NotStarted);
+        }
         let packet = OVERHEAD + frame.len();
         if packet > crate::relay::MAX_CARRIED {
             return Err(SendError::TooLarge {
@@ -1414,6 +1479,9 @@ impl<C: Config> Endpoint<C> {
     ) -> Result<Output<'static>, SendError> {
         if self.relay.is_some() && context == crate::relay::CONTEXT {
             return Err(SendError::ReservedContext);
+        }
+        if self.responder.identity().is_none() {
+            return Err(SendError::NotStarted);
         }
         if !self.has_path(&address.peer_id(), now) {
             return Err(SendError::NoPath);
@@ -1473,56 +1541,40 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Result<usize, SendError> {
-        if self.dials.capacity().is_some_and(|c| self.dials.len() >= c) {
-            return Err(SendError::Capacity);
+        if self.responder.identity().is_none() {
+            return Err(SendError::NotStarted);
         }
+        // A dial made again replaces the one before, its indices freed.
+        self.remove_dial(key);
         let psk = policy.psk(&key.0, key.1.as_bytes());
+        let early_data = self.settings_of(&key.1).early_data;
         // A renewal carries no payload (`PROTOCOL.md §3`).
         let payload = if renewal {
             &[][..]
         } else {
-            self.wake_payload(&key, out.len(), path_max)
+            wake_payload(&self.sessions, early_data, &key, out.len(), path_max)
         };
-        let started = if renewal {
-            Dial::renew(
-                self.responder.identity(),
-                address,
-                key.1.as_bytes(),
-                psk,
-                now,
-                entropy,
-                out,
-            )
-        } else {
-            Dial::start_with_payload(
-                self.responder.identity(),
-                address,
-                key.1.as_bytes(),
-                psk,
-                payload,
-                now,
-                entropy,
-                out,
-            )
-        };
-        let (dial, len) = started.map_err(|_| SendError::Capacity)?;
+        if !Dial::fits(payload.len(), out.len()) {
+            return Err(SendError::Capacity);
+        }
+        let identity = self.responder.identity().ok_or(SendError::NotStarted)?;
+        // Made where it is kept: a dial never crosses the stack.
+        let dial = self
+            .dials
+            .insert_empty(key)
+            .map_err(|_| SendError::Capacity)?;
+        dial.open(address, key.1, psk, renewal, now);
+        let len = dial.first_attempt(identity, payload, now, entropy, out);
+        for index in dial.attempt_indices() {
+            let _ = self.indices.insert(index, Owner::Dial(key.0, key.1));
+        }
         let carried = !payload.is_empty();
         if let Some(session) = self.sessions.get_mut(&key) {
             session.carried = carried;
         }
         self.peer_session_opening(&key, now);
-        self.register_attempts(key, &dial);
-        self.dials
-            .insert(key, dial)
-            .map_err(|_| SendError::Capacity)?;
         self.sessions.touch(&key);
         Ok(len)
-    }
-
-    fn register_attempts(&mut self, key: Key, dial: &Dial) {
-        for index in dial.attempt_indices() {
-            let _ = self.indices.insert(index, Owner::Dial(key.0, key.1));
-        }
     }
 
     /// Closes the session with `peer` in `context`, sending one authenticated
@@ -1655,6 +1707,9 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Poll {
+        if self.responder.identity().is_none() {
+            return Poll::Idle;
+        }
         let mut policy = self.aware(policy);
         self.poll_routed(now, &mut policy, entropy, out)
     }
@@ -1723,8 +1778,9 @@ impl<C: Config> Endpoint<C> {
                 due_dial = Some(*key);
             }
         });
-        if let Some(key) = due_dial {
-            let identity = self.responder.identity();
+        if let Some(key) = due_dial
+            && let Some(identity) = self.responder.identity()
+        {
             let payload: &[u8] = self
                 .sessions
                 .get(&key)
@@ -1999,17 +2055,17 @@ impl<C: Config> Endpoint<C> {
     /// full. Nothing is evicted to make room: the sessions held are in use.
     fn session_for(&mut self, key: Key) -> Option<&mut SessionOf<C>> {
         if self.sessions.get(&key).is_none() {
-            let mut session = Session::new();
-            session.passive_keepalive = self.settings_of(&key.1).passive_keepalive;
-            if !self.sessions.insert(key, session) {
-                return None;
-            }
+            let passive_keepalive = self.settings_of(&key.1).passive_keepalive;
+            // Made where it is kept: a session never crosses the stack.
+            let session = self.sessions.insert_empty(key)?;
+            session.passive_keepalive = passive_keepalive;
+            return Some(session);
         }
         self.sessions.get_mut(&key)
     }
 
     fn remove_session(&mut self, key: Key) {
-        if let Some(session) = self.sessions.remove(&key) {
+        if let Some(session) = self.sessions.get(&key) {
             for pair in [session.current.as_ref(), session.previous.as_ref()]
                 .into_iter()
                 .flatten()
@@ -2017,40 +2073,20 @@ impl<C: Config> Endpoint<C> {
                 self.indices.remove(&pair.local_index);
             }
         }
+        // Dropped where it is kept.
+        self.sessions.discard(&key);
         self.remove_dial(key);
     }
 
     fn remove_dial(&mut self, key: Key) {
-        if let Some(dial) = self.dials.remove(&key) {
+        if let Some(dial) = self.dials.get(&key) {
             for index in dial.attempt_indices() {
                 self.indices.remove(&index);
             }
+        }
+        if self.dials.discard(&key) {
             self.sessions.touch(&key);
         }
-    }
-
-    /// The head of `key`'s queue, if a dial for it should carry it, when it
-    /// fits a first contact and an output of `room` bytes: in the relay
-    /// context; and in a context that carries early data, when the dial
-    /// starts from a send whose path takes `path_max` bytes, the first contact
-    /// fitting that path too.
-    fn wake_payload(&self, key: &Key, room: usize, path_max: Option<usize>) -> &[u8] {
-        let room = if key.1.as_bytes() == crate::relay::CONTEXT {
-            room
-        } else {
-            match path_max {
-                Some(path) if self.settings_of(&key.1).early_data => room.min(path),
-                _ => return &[],
-            }
-        };
-        self.sessions
-            .get(key)
-            .and_then(|session| session.queue.front())
-            .filter(|head| {
-                head.len() <= crate::handshake::MAX_PAYLOAD
-                    && room >= crate::handshake::FIRST_CONTACT_LEN + head.len()
-            })
-            .unwrap_or_default()
     }
 
     /// How many sessions the endpoint holds, its relay session included.
@@ -2064,12 +2100,12 @@ impl<C: Config> Endpoint<C> {
     #[must_use]
     pub const fn last_authenticated(&self) -> Option<Authenticated> {
         match self.last_opened {
-            Some(((peer, context), newest)) => Some(Authenticated {
+            Maybe::Some(((peer, context), newest)) => Some(Authenticated {
                 peer,
                 context,
                 newest,
             }),
-            None => None,
+            Maybe::None => None,
         }
     }
 
@@ -2229,6 +2265,37 @@ fn session_deadline<W: ReplayWindow, Q: DatagramQueue>(session: &Session<W, Q>) 
     .into_iter()
     .flatten()
     .min()
+}
+
+/// The head of `key`'s queue, if a dial for it should carry it, when it fits
+/// a first contact and an output of `room` bytes: in the relay context; and
+/// in a context that carries early data (`early_data`), when the dial starts
+/// from a send whose path takes `path_max` bytes, the first contact fitting
+/// that path too. A function of the sessions alone, so that the dial it is
+/// for can be made in its own table meanwhile.
+fn wake_payload<'s, C: Config>(
+    sessions: &'s Sessions<C>,
+    early_data: bool,
+    key: &Key,
+    room: usize,
+    path_max: Option<usize>,
+) -> &'s [u8] {
+    let room = if key.1.as_bytes() == crate::relay::CONTEXT {
+        room
+    } else {
+        match path_max {
+            Some(path) if early_data => room.min(path),
+            _ => return &[],
+        }
+    };
+    sessions
+        .get(key)
+        .and_then(|session| session.queue.front())
+        .filter(|head| {
+            head.len() <= crate::handshake::MAX_PAYLOAD
+                && room >= crate::handshake::FIRST_CONTACT_LEN + head.len()
+        })
+        .unwrap_or_default()
 }
 
 fn candidates_owed<W, Q>(key: &Key, session: &Session<W, Q>, generation: Option<u16>) -> bool {

@@ -170,11 +170,11 @@ impl Node {
     }
 
     fn address(&self) -> Address {
-        *self.endpoint.identity().address()
+        *self.endpoint.identity().unwrap().address()
     }
 
     fn peer_id(&self) -> PeerId {
-        self.endpoint.identity().peer_id()
+        self.endpoint.identity().unwrap().peer_id()
     }
 
     fn first_contacts_sent(&self) -> usize {
@@ -1968,7 +1968,7 @@ fn a_forged_answer_moves_nothing() {
     net.settle_with(VecDeque::from([(true, packet)]));
     let key = (net.a.peer_id(), ctx());
     let attempt = net.b.endpoint.sessions.get(&key).unwrap().paths.attempt;
-    let nonce = attempt.expect("an attempt").nonces[0];
+    let nonce = attempt.as_ref().expect("an attempt").nonces[0];
     let sent = net.b.sent.len();
 
     let mut forged = vec![
@@ -1983,8 +1983,8 @@ fn a_forged_answer_moves_nothing() {
         net.settle_with(VecDeque::from([(true, packet)]));
     }
     let session = net.b.endpoint.sessions.get(&key).unwrap();
-    assert_eq!(session.paths.direct, None);
-    assert!(!session.paths.attempt.unwrap().stopped);
+    assert!(session.paths.direct.is_none());
+    assert!(!session.paths.attempt.as_ref().unwrap().stopped);
     assert_eq!(net.b.sent.len(), sent, "nothing in response");
     let info = net.b.endpoint.path_info(&key.0, b"session").unwrap();
     assert_eq!(info.validated_after, None);
@@ -3175,8 +3175,8 @@ fn direct_session_used(validated: bool, used: bool) -> (Net, Key) {
     }
     let paths = &net.b.endpoint.sessions.get(&key).unwrap().paths;
     assert!(paths.fresh(net.t()).is_some(), "a fresh direct path");
-    assert_eq!(paths.direct.unwrap().validated, validated);
-    assert_eq!(paths.direct.unwrap().carried, used);
+    assert_eq!(paths.direct.as_ref().unwrap().validated, validated);
+    assert_eq!(paths.direct.as_ref().unwrap().carried, used);
     (net, key)
 }
 
@@ -3665,7 +3665,7 @@ impl<C: Config> Peer<C> {
     }
 
     fn address(&self) -> Address {
-        *self.endpoint.identity().address()
+        *self.endpoint.identity().unwrap().address()
     }
 
     /// Everything the endpoint has to send at `now`; its events kept.
@@ -3784,7 +3784,7 @@ fn peers_met_and_gone_leave_no_state() {
         let source = [10, 1, hi, lo, 0, 1];
         let mut client: Peer<Mcu> = Peer::new(seeded(i), source, 1_000 + u64::from(i));
         let now = Instant::from_millis(u64::from(i));
-        let server_peer = server.endpoint.identity().peer_id();
+        let server_peer = server.endpoint.identity().unwrap().peer_id();
         client
             .endpoint
             .set_hints(server_peer, &[&server_source], now)
@@ -3810,7 +3810,7 @@ fn peers_met_and_gone_leave_no_state() {
     let mut client = first.unwrap();
     client.events.clear();
     server.events.clear();
-    let client_peer = client.endpoint.identity().peer_id();
+    let client_peer = client.endpoint.identity().unwrap().peer_id();
     server
         .endpoint
         .set_hints(client_peer, &[&client.source], later)
@@ -3839,8 +3839,8 @@ fn a_packet_with_peers_met() {
         let mut b: Peer<Server> = Peer::new(identity(0), b_source, 200);
         let start = Instant::from_millis(0);
         let (a_peer, b_peer) = (
-            a.endpoint.identity().peer_id(),
-            b.endpoint.identity().peer_id(),
+            a.endpoint.identity().unwrap().peer_id(),
+            b.endpoint.identity().unwrap().peer_id(),
         );
         a.endpoint.set_hints(b_peer, &[&b_source], start).unwrap();
         b.endpoint.set_hints(a_peer, &[&a_source], start).unwrap();
@@ -3857,7 +3857,7 @@ fn a_packet_with_peers_met() {
             };
             made += 1;
             for node in [&mut a.endpoint, &mut b.endpoint] {
-                let _ = node.sessions.insert((peer, ctx()), Session::new());
+                let _ = node.sessions.insert_empty((peer, ctx()));
             }
         }
 
@@ -3980,7 +3980,7 @@ fn a_full_table_refuses_and_evicts_nothing() {
     }
     // The profile holds 4 peers' hints: each is given just before its send.
     for peer in peers.iter_mut().take(4) {
-        let id = peer.endpoint.identity().peer_id();
+        let id = peer.endpoint.identity().unwrap().peer_id();
         a.endpoint.set_hints(id, &[&peer.source], now).unwrap();
         let packet = a.send_to(&peer.address(), b"hello", now);
         settle_pair(&mut a, peer, packet, now);
@@ -3988,7 +3988,7 @@ fn a_full_table_refuses_and_evicts_nothing() {
     assert_eq!(a.endpoint.session_count(), 4);
     let mut out = [0u8; 2048];
     let fifth = peers[4].address();
-    let fifth_id = peers[4].endpoint.identity().peer_id();
+    let fifth_id = peers[4].endpoint.identity().unwrap().peer_id();
     a.endpoint
         .set_hints(fifth_id, &[&peers[4].source], now)
         .unwrap();
@@ -4008,7 +4008,7 @@ fn a_full_table_refuses_and_evicts_nothing() {
         Some(SendError::Capacity)
     );
     for peer in peers.iter().take(4) {
-        let id = peer.endpoint.identity().peer_id();
+        let id = peer.endpoint.identity().unwrap().peer_id();
         assert!(a.endpoint.is_live(&id, b"session", now));
     }
 }
@@ -4118,7 +4118,7 @@ fn a_contexts_default_applies_to_every_session() {
             [10, 0, 0, 10 + i, 0, 1],
             100 + u64::from(i),
         );
-        let b_peer = b.endpoint.identity().peer_id();
+        let b_peer = b.endpoint.identity().unwrap().peer_id();
         a.endpoint.set_hints(b_peer, &[&b_source], start).unwrap();
         let packet = a.send_to(&b.address(), b"hello", start);
         settle_pair(&mut a, &mut b, packet, start);
@@ -4290,7 +4290,7 @@ fn a_packet_with_sessions_live() {
         let mut b: Peer<Wide> = Peer::new(identity(0), b_source, 1);
         // The check walks every session, which is what is measured.
         b.endpoint.set_index_check(false);
-        let b_peer = b.endpoint.identity().peer_id();
+        let b_peer = b.endpoint.identity().unwrap().peer_id();
         let b_address = b.address();
         let built = std::time::Instant::now();
         let mut last = None;
@@ -4311,7 +4311,7 @@ fn a_packet_with_sessions_live() {
         }
         let built = built.elapsed();
         let mut c = last.unwrap();
-        let c_peer = c.endpoint.identity().peer_id();
+        let c_peer = c.endpoint.identity().unwrap().peer_id();
         let start = u64::from(n) + 1;
         assert!(
             b.endpoint
@@ -4369,4 +4369,133 @@ fn a_renewal_that_outlives_the_keys_keeps_both_ends_agreed() {
     assert_eq!(at_a, at_b, "one binding at both ends");
     assert_ne!(at_a, before, "the session opened again");
     assert!(net.b_datagrams().contains(&b"one".to_vec()));
+}
+
+// --- an endpoint started in place --------------------------------------------------
+
+/// An endpoint of the microcontroller profile built at compile time, in a
+/// `static`, as an integrator places one.
+static IN_PLACE: std::sync::Mutex<Endpoint<Mcu>> = std::sync::Mutex::new(Endpoint::EMPTY);
+
+/// Scenario: an endpoint in static memory is started in place, serves its
+/// context, and refuses a second start, keeping its identity.
+#[test]
+fn an_endpoint_in_static_memory_is_started_in_place() {
+    let mut endpoint = IN_PLACE.lock().unwrap();
+    assert!(endpoint.identity().is_none());
+    endpoint.start(identity(1), &[b"session"]).unwrap();
+    assert_eq!(
+        endpoint.identity().unwrap().address(),
+        identity(1).address()
+    );
+    assert!(endpoint.serves(b"session"));
+    assert_eq!(
+        endpoint.start(identity(0), &[b"other"]),
+        Err(ResponderError::Started)
+    );
+    assert_eq!(
+        endpoint.identity().unwrap().address(),
+        identity(1).address()
+    );
+    assert!(!endpoint.serves(b"other"));
+}
+
+/// An endpoint started in place talks as one made by `new` does: a session
+/// opens, and a datagram goes each way.
+#[test]
+fn an_endpoint_started_in_place_opens_a_session() {
+    let now = Instant::from_millis(0);
+    let b_source = [192, 0, 2, 2, 0x1f, 0x40];
+    let mut a: Peer<Mcu> = Peer::new(identity(0), [192, 0, 2, 1, 0x1f, 0x40], 1);
+    let mut b: Peer<Mcu> = Peer::new(identity(0), b_source, 2);
+    b.endpoint = Endpoint::EMPTY;
+    b.endpoint.start(identity(1), &[b"session"]).unwrap();
+    let b_peer = b.endpoint.identity().unwrap().peer_id();
+    a.endpoint.set_hints(b_peer, &[&b_source], now).unwrap();
+    let first = a.send_to(&b.address(), b"to b", now);
+    settle_pair(&mut a, &mut b, first, now);
+    let a_address = a.address();
+    let back = b.send_to(&a_address, b"to a", now);
+    settle_pair(&mut b, &mut a, back, now);
+    let datagrams = |events: &[Ev]| -> Vec<Vec<u8>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Datagram(_, data, _) => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(datagrams(&b.events), vec![b"to b".to_vec()]);
+    assert_eq!(datagrams(&a.events), vec![b"to a".to_vec()]);
+}
+
+/// Scenario: an endpoint not started is silent: it answers no first contact,
+/// polls idle, and refuses every send.
+#[test]
+fn an_endpoint_not_started_is_silent() {
+    let now = Instant::from_millis(0);
+    let mut a: Peer<Mcu> = Peer::new(identity(0), [192, 0, 2, 1, 0x1f, 0x40], 1);
+    let mut b: Peer<Mcu> = Peer::new(identity(1), [192, 0, 2, 2, 0x1f, 0x40], 2);
+    let b_address = b.address();
+    a.endpoint
+        .set_hints(b_address.peer_id(), &[&b.source], now)
+        .unwrap();
+    let first = a.send_to(&b_address, b"hello", now).unwrap();
+    b.endpoint = Endpoint::EMPTY;
+    b.endpoint.serve(b"session", Access::Policy).unwrap();
+    assert_eq!(b.take(&first, a.source, now), None);
+    assert!(b.events.is_empty());
+    assert!(b.drain(now).is_empty());
+    let mut out = [0u8; 2048];
+    assert_eq!(
+        b.endpoint
+            .poll(now, &mut b.policy, &mut b.entropy, &mut out),
+        Poll::Idle
+    );
+    let a_address = a.address();
+    assert_eq!(
+        b.endpoint.send(
+            Target::Address(&a_address),
+            b"session",
+            b"x",
+            PATH,
+            now,
+            &mut b.policy,
+            &mut b.entropy,
+            &mut out
+        ),
+        Err(SendError::NotStarted)
+    );
+    assert_eq!(
+        b.endpoint.connect(
+            &a_address,
+            b"session",
+            now,
+            &mut b.policy,
+            &mut b.entropy,
+            &mut out
+        ),
+        Err(SendError::NotStarted)
+    );
+}
+
+/// A start refused leaves the endpoint as it was: not started, and serving
+/// none of the contexts it was given.
+#[test]
+fn a_start_refused_changes_nothing() {
+    let mut endpoint: Endpoint<Device> = Endpoint::EMPTY;
+    assert_eq!(
+        endpoint.start(identity(0), &[b"a", b"b", b"c"]),
+        Err(ResponderError::TooManyContexts { capacity: 2 })
+    );
+    assert!(endpoint.identity().is_none());
+    assert!(!endpoint.serves(b"a") && !endpoint.serves(b"b"));
+    assert_eq!(
+        endpoint.start(identity(0), &[b"a", crate::relay::CONTEXT]),
+        Err(ResponderError::RelayContext)
+    );
+    assert!(endpoint.identity().is_none());
+    endpoint.start(identity(0), &[b"a", b"b"]).unwrap();
+    assert!(endpoint.serves(b"a") && endpoint.serves(b"b"));
 }

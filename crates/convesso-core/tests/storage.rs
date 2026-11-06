@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use convesso_core::storage::{CapacityExhausted, Config, FixedTable, Mcu, Table};
+use convesso_core::storage::{CapacityExhausted, Config, Empty, FixedTable, Mcu, Table, TableFull};
 use proptest::prelude::*;
 
 /// Scenario: insertion within capacity succeeds.
@@ -145,43 +145,103 @@ fn growable_storage_accepts_beyond_any_fixed_capacity() {
 enum Op {
     Insert(u8, u32),
     Remove(u8),
+    InsertEmpty(u8, u32),
+    Discard(u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
     // Keys from a small range, so that inserts collide, replace and fill up.
     prop_oneof![
         (0u8..8, any::<u32>()).prop_map(|(k, v)| Op::Insert(k, v)),
-        (0u8..8).prop_map(Op::Remove)
+        (0u8..8).prop_map(Op::Remove),
+        (0u8..8, any::<u32>()).prop_map(|(k, v)| Op::InsertEmpty(k, v)),
+        (0u8..8).prop_map(Op::Discard),
     ]
 }
 
-proptest! {
-    /// Any sequence of inserts and removes leaves a fixed table agreeing with a
-    /// model that holds at most its capacity, and never panics.
-    #[test]
-    fn a_fixed_table_agrees_with_its_model(ops in proptest::collection::vec(op(), 0..200)) {
-        const CAPACITY: usize = 4;
-        let mut table: FixedTable<u8, u32, CAPACITY> = FixedTable::new();
-        let mut model = std::collections::BTreeMap::new();
+/// A table's value with an empty state: what `insert_empty` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Value(u32);
 
-        for op in ops {
-            match op {
-                Op::Insert(k, v) => {
-                    let result = table.insert(k, v);
-                    if model.contains_key(&k) || model.len() < CAPACITY {
-                        prop_assert_eq!(result, Ok(model.insert(k, v)));
-                    } else {
-                        prop_assert_eq!(result, Err(CapacityExhausted { key: k, value: v, capacity: CAPACITY }));
+impl Empty for Value {
+    const EMPTY: Self = Self(0);
+}
+
+/// Applies `ops` to `table` and to a model holding at most `capacity`
+/// entries, and checks that they agree after each: what each operation
+/// returns, what the table holds, and that `insert_empty` makes an empty
+/// entry only for a new key that fits, which the caller then fills.
+fn agrees_with_its_model(
+    table: &mut impl Table<u8, Value>,
+    capacity: usize,
+    ops: Vec<Op>,
+) -> Result<(), TestCaseError> {
+    let mut model = std::collections::BTreeMap::new();
+    for op in ops {
+        match op {
+            Op::Insert(k, v) => {
+                let v = Value(v);
+                let result = table.insert(k, v);
+                if model.contains_key(&k) || model.len() < capacity {
+                    prop_assert_eq!(result, Ok(model.insert(k, v)));
+                } else {
+                    prop_assert_eq!(
+                        result,
+                        Err(CapacityExhausted {
+                            key: k,
+                            value: v,
+                            capacity
+                        })
+                    );
+                }
+            }
+            Op::Remove(k) => prop_assert_eq!(table.remove(&k), model.remove(&k)),
+            Op::InsertEmpty(k, v) => {
+                let held = model.get(&k).copied();
+                let room = model.len() < capacity;
+                match table.insert_empty(k) {
+                    Ok(entry) => {
+                        prop_assert!(held.is_some() || room);
+                        // A held entry comes back as it is; a new one empty,
+                        // and the caller fills it.
+                        prop_assert_eq!(*entry, held.unwrap_or(Value::EMPTY));
+                        if held.is_none() {
+                            *entry = Value(v);
+                            model.insert(k, Value(v));
+                        }
+                    }
+                    Err(full) => {
+                        prop_assert!(held.is_none() && !room);
+                        prop_assert_eq!(full, TableFull { capacity });
                     }
                 }
-                Op::Remove(k) => prop_assert_eq!(table.remove(&k), model.remove(&k)),
             }
-            prop_assert_eq!(table.len(), model.len());
-            prop_assert_eq!(table.first(), model.first_key_value());
-            for k in 0u8..8 {
-                prop_assert_eq!(table.get(&k), model.get(&k));
-            }
+            Op::Discard(k) => prop_assert_eq!(table.discard(&k), model.remove(&k).is_some()),
         }
+        prop_assert_eq!(table.len(), model.len());
+        prop_assert_eq!(table.first(), model.first_key_value());
+        for k in 0u8..8 {
+            prop_assert_eq!(table.get(&k), model.get(&k));
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    /// Any sequence of inserts and removes, made or dropped in place or not,
+    /// leaves a fixed table agreeing with a model that holds at most its
+    /// capacity, and never panics.
+    #[test]
+    fn a_fixed_table_agrees_with_its_model(ops in proptest::collection::vec(op(), 0..200)) {
+        agrees_with_its_model(&mut FixedTable::<u8, Value, 4>::new(), 4, ops)?;
+    }
+
+    /// The same for a growable table with a limit.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn a_growable_table_agrees_with_its_model(ops in proptest::collection::vec(op(), 0..200)) {
+        let mut table = convesso_core::storage::GrowableTable::<u8, Value, 4>::new();
+        agrees_with_its_model(&mut table, 4, ops)?;
     }
 }
 
@@ -250,4 +310,51 @@ fn a_fixed_table_gives_its_smallest_key() {
 #[test]
 fn a_growable_table_gives_its_smallest_key() {
     first_follows_the_keys(&mut convesso_core::storage::GrowableTable::<u32, char>::new());
+}
+
+/// A table built at compile time, in a `static`: what an integrator places
+/// its state in.
+static EMPTY_TABLE: FixedTable<u32, Value, 4> = FixedTable::EMPTY;
+
+#[test]
+fn a_table_is_built_empty_at_compile_time() {
+    assert!(EMPTY_TABLE.is_empty());
+    assert_eq!(EMPTY_TABLE.capacity(), Some(4));
+    let mut table = <FixedTable<u32, Value, 4> as Table<_, _>>::EMPTY;
+    let entry = table.insert_empty(1).unwrap();
+    assert_eq!(*entry, Value::EMPTY);
+    *entry = Value(7);
+    assert_eq!(table.get(&1), Some(&Value(7)));
+    assert!(table.discard(&1));
+    assert!(!table.discard(&1));
+    assert!(table.is_empty());
+}
+
+/// A full table refuses a new key without making its entry, and every entry
+/// it held is unchanged.
+#[test]
+fn a_full_table_refuses_without_making_the_entry() {
+    let mut table: FixedTable<u8, Value, 2> = FixedTable::new();
+    *table.insert_empty(1).unwrap() = Value(10);
+    *table.insert_empty(2).unwrap() = Value(20);
+    let refused = table.insert_empty(3);
+    assert_eq!(refused, Err(TableFull { capacity: 2 }));
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "table capacity exhausted: all 2 entries are in use"
+    );
+    assert_eq!(
+        (table.get(&1), table.get(&2), table.get(&3)),
+        (Some(&Value(10)), Some(&Value(20)), None)
+    );
+}
+
+/// A key already held gives its entry back, as it is, without emptying it.
+#[test]
+fn a_held_key_gives_its_entry_as_it_is() {
+    let mut table: FixedTable<u8, Value, 2> = FixedTable::new();
+    *table.insert_empty(1).unwrap() = Value(10);
+    table.insert_empty(1).unwrap().0 += 1;
+    assert_eq!(table.get(&1), Some(&Value(11)));
+    assert_eq!(table.len(), 1);
 }

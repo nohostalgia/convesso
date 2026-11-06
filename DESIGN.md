@@ -36,6 +36,18 @@ bytes and the next deadline come out.
   integrator who needs other sizes derives a configuration from either, naming only what changes
   (`convesso_core::profile!`, and `convesso_stream::config!` for the stream layer's buffers). When
   a table is full, the core returns a named error instead of growing.
+- **State lives where the integrator puts it, never on the stack.** A microcontroller's task gets
+  a few kilobytes of stack, and an endpoint of the `Mcu` profile is about 19 KB. So every table,
+  the endpoint, the stream layer's channels and the embedded driver's slot can be built at compile
+  time, in a `static`, and are started in place. An entry of a table is made from its type's
+  empty constant straight in its slot and filled there: the compiler copies a constant into its
+  destination, while it assembles a value made at run time on the stack first, whatever the code
+  that makes it. And every empty state is all zero bytes: a constant with one non-zero byte is
+  copied from flash, whole, where an all-zero one is a `memset`, and a `static` of it lands in
+  `.bss`. So a type built at compile time holds `Maybe`, an `Option` whose empty tag is a zero
+  byte, where an `Option` would mark `None` in a spare value of what it holds; and it takes the
+  values it needs to work (a channel's congestion window, say) when it is filled, not in its
+  empty state. The footprint check fails on any large constant left in flash.
 - **Time is passed in.** The core does not read a clock. Every call takes "now", and every poll
   returns the next deadline. This lets the tests drive every timer with a virtual clock, and lets
   a microcontroller drive the core from its own timer.
@@ -254,6 +266,12 @@ a device that does not need it does not carry it.
 - **Flash and RAM are budgeted.** The reference firmware is built for both embedded targets on
   every change, and compared with `footprint-budget.toml`. A change that grows either raises the
   budget in the same diff, where a reviewer can see it.
+- **So is the stack, chain by chain.** What a task needs is the deepest chain of frames below it,
+  not its largest frame. On every change, the reference firmware is built again with each
+  function's frame recorded, its calls are read from the disassembly, and the deepest chain from
+  each of its roots is compared with `stack-budget.toml`. A call through a trait object or a
+  function pointer counts as the deepest of the targets declared for it, and convesso's own are
+  counted, so that a new one is seen in review (`scripts/stack.py`).
 - **A check that the core needs no allocator** runs on every change.
 - **Every change reaches `main` through a pull request,** checked as merged with `main`. Each
   check runs when the files it covers change: the host checks always, the embedded ones for what

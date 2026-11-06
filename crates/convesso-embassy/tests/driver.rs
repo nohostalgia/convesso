@@ -19,7 +19,7 @@ use convesso_core::storage::Mcu;
 use convesso_embassy::rng::{RngFailed, SecureRng};
 use convesso_embassy::{
     Config, Context, ContextEvent, ContextEvents, ContextOptions, ContextSlot, Node, NodeError,
-    RelayLocation, Shared, StartError, Stats,
+    RelayLocation, Slot, StartError, Stats,
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use support::{MemDatagrams, MemInterfaces, Net, RelayHost};
@@ -37,7 +37,7 @@ struct Peer {
 
 impl Peer {
     async fn address(&self) -> Address {
-        self.node.address().await
+        self.node.address()
     }
 
     async fn send(&self, to: &Address, data: &[u8]) -> Result<(), NodeError> {
@@ -141,7 +141,7 @@ async fn node_with(
 ) -> (Peer, TestEvents, tokio::task::JoinHandle<()>) {
     let ips = interfaces.0.borrow().clone();
     let datagrams: &'static MemDatagrams = leak(net.bind(&ips, port));
-    let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
+    let slot: &'static Slot<'static, NoopRawMutex, Mcu> = leak(Slot::new());
     let (node, runner, _node_events) = convesso_embassy::start(
         support::identity(key),
         Config {
@@ -314,7 +314,7 @@ async fn a_generator_failure_stops_the_start() {
 async fn generator_failure() {
     let (net, relay) = world();
     let datagrams: &'static MemDatagrams = leak(net.bind(&[ip("10.0.0.1")], 7500));
-    let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
+    let slot: &'static Slot<'static, NoopRawMutex, Mcu> = leak(Slot::new());
     let result = convesso_embassy::start(
         support::identity(1),
         Config {
@@ -333,6 +333,74 @@ async fn generator_failure() {
     );
     assert!(matches!(result, Err(StartError::Rng(RngFailed))));
     assert_eq!(net.sent(|_, _| true), 0, "no packet left");
+}
+
+// --- the slot ----------------------------------------------------------------------------
+
+/// Starts node `key` at `port` on `slot`, with no relay and no runner: what a
+/// start alone does to its slot.
+fn start_on<M: embassy_sync::blocking_mutex::raw::RawMutex>(
+    net: &Net,
+    key: usize,
+    port: u16,
+    slot: &'static Slot<'static, M, Mcu>,
+) -> Result<Node<'static, M, Mcu, MemDatagrams>, StartError> {
+    let ips = [ip("10.0.0.1")];
+    let started = convesso_embassy::start(
+        support::identity(key),
+        Config { relay: None },
+        leak(net.bind(&ips, port)),
+        net.stream(ips[0]),
+        MemInterfaces::new(&ips),
+        leak(TestRng(key as u64)),
+        leak(vec![0u8; 64]).as_mut_slice(),
+        slot,
+    )?;
+    Ok(started.0)
+}
+
+/// Scenario: a slot started twice is refused, and the first node goes on.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slot_started_twice_is_refused() {
+    local(async {
+        let (net, _relay) = world();
+        let slot: &'static Slot<'static, NoopRawMutex, Mcu> = leak(Slot::new());
+        let first = start_on(&net, 1, 7501, slot).unwrap_or_else(|_| panic!("starts"));
+        assert!(matches!(
+            start_on(&net, 2, 7502, slot),
+            Err(StartError::SlotInUse)
+        ));
+        assert_eq!(first.address(), *support::identity(1).address());
+        let (app, _events) = open(first, b"app", 1024).await;
+        assert_eq!(app.name(), b"app");
+    })
+    .await;
+}
+
+/// A slot in a plain `static`: its mutex can be shared between threads.
+static SHARED_SLOT: Slot<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, Mcu> =
+    Slot::new();
+
+/// A slot for one executor: its mutex is not shared between threads, so the
+/// slot is not `Sync`, and goes in a cell, written once from its constant.
+static ONE_EXECUTOR: static_cell::StaticCell<Slot<'static, NoopRawMutex, Mcu>> =
+    static_cell::StaticCell::new();
+
+/// Scenario: a node starts from a static slot, in either form an integrator
+/// declares one.
+#[test]
+fn a_node_starts_from_a_static_slot() {
+    let net = Net::new();
+    let shared = start_on(&net, 1, 7503, &SHARED_SLOT).unwrap_or_else(|_| panic!("starts"));
+    assert_eq!(shared.address(), *support::identity(1).address());
+    let one = start_on(
+        &net,
+        2,
+        7504,
+        ONE_EXECUTOR.init_with(|| const { Slot::new() }),
+    )
+    .unwrap_or_else(|_| panic!("starts"));
+    assert_eq!(one.address(), *support::identity(2).address());
 }
 
 // --- the relay link ----------------------------------------------------------------------

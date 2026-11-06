@@ -104,6 +104,9 @@ impl Drop for CipherState {
 }
 
 impl CipherState {
+    /// No key: what an empty pending handshake holds.
+    pub(crate) const EMPTY: Self = Self { k: None, n: 0 };
+
     const fn empty() -> Self {
         Self { k: None, n: 0 }
     }
@@ -280,6 +283,17 @@ pub(crate) struct Transport {
 pub(crate) struct Completed {
     pub(crate) transport: Transport,
     pub(crate) handshake_hash: [u8; HASHLEN],
+}
+
+impl Completed {
+    /// Nothing completed: what an empty pending handshake holds.
+    pub(crate) const EMPTY: Self = Self {
+        transport: Transport {
+            send: CipherState::EMPTY,
+            recv: CipherState::EMPTY,
+        },
+        handshake_hash: [0; HASHLEN],
+    };
 }
 
 /// The initiator after writing `-> e, es, s, ss`, waiting for the response.

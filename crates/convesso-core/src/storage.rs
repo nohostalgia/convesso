@@ -15,8 +15,65 @@
 //! allocates, never panics, and never evicts an entry to make room, because an
 //! entry silently evicted is a session silently dropped.
 
+/// A value with an empty state, built at compile time: what a table makes in
+/// its own room ([`Table::insert_empty`]) before the caller fills it in place.
+///
+/// The compiler copies a constant straight into its destination, while it
+/// assembles a value made at run time on the stack first, whatever the code
+/// that makes it: so an entry of a few kilobytes is made from its `EMPTY`, and
+/// never crosses the stack.
+pub trait Empty {
+    /// The empty value.
+    const EMPTY: Self;
+}
+
+macro_rules! empty_is_zero {
+    ($($t:ty),*) => {$(
+        impl Empty for $t {
+            const EMPTY: Self = 0;
+        }
+    )*};
+}
+empty_is_zero!(u8, u16, u32, u64, usize);
+
+impl Empty for () {
+    const EMPTY: Self = ();
+}
+
+impl Empty for bool {
+    const EMPTY: Self = false;
+}
+
+impl Empty for char {
+    const EMPTY: Self = '\0';
+}
+
+impl Empty for &str {
+    const EMPTY: Self = "";
+}
+
+impl<T: Empty, const N: usize> Empty for [T; N] {
+    const EMPTY: Self = [const { T::EMPTY }; N];
+}
+
+impl<T> Empty for Maybe<T> {
+    const EMPTY: Self = Self::None;
+}
+
+impl Empty for crate::time::Instant {
+    const EMPTY: Self = Self::from_millis(0);
+}
+
 /// A key-value table the core keeps its state in.
+///
+/// A table is built empty at compile time ([`Table::EMPTY`]), so that it can
+/// live in a `static`, and its entries are made and dropped where they are
+/// held ([`Table::insert_empty`], [`Table::discard`]): on a microcontroller, an
+/// entry of a few kilobytes never crosses the stack on its way in or out.
 pub trait Table<K: Ord, V> {
+    /// An empty table: what a `static` holds before anything is inserted.
+    const EMPTY: Self;
+
     /// Inserts `value` under `key`.
     ///
     /// Returns the value previously under `key`, if any; replacing an entry
@@ -32,6 +89,22 @@ pub trait Table<K: Ord, V> {
 
     /// Removes and returns the value under `key`.
     fn remove(&mut self, key: &K) -> Option<V>;
+
+    /// The entry under `key`, made [`Empty`] in the table's own room when
+    /// there is none, for the caller to fill in place. An entry already under
+    /// `key` is returned as it is. A new key that does not fit is refused, and
+    /// no entry is made.
+    ///
+    /// # Errors
+    ///
+    /// [`TableFull`] when the key is new and the table holds as many entries
+    /// as its capacity.
+    fn insert_empty(&mut self, key: K) -> Result<&mut V, TableFull>
+    where
+        V: Empty;
+
+    /// Drops the entry under `key` where it is held; whether there was one.
+    fn discard(&mut self, key: &K) -> bool;
 
     /// How many entries the table holds.
     fn len(&self) -> usize;
@@ -81,40 +154,256 @@ impl<K, V> core::fmt::Display for CapacityExhausted<K, V> {
 
 impl<K: core::fmt::Debug, V: core::fmt::Debug> core::error::Error for CapacityExhausted<K, V> {}
 
-/// A table of at most `N` entries, held in an array.
-///
-/// Lookups scan the array: for the handful of entries a microcontroller holds,
-/// that is smaller and as fast as anything that indexes.
-pub struct FixedTable<K, V, const N: usize> {
-    slots: [Option<(K, V)>; N],
-    len: usize,
+/// A new key was refused by [`Table::insert_empty`] because the table is full;
+/// its entry was never made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableFull {
+    /// The capacity of the table that refused it.
+    pub capacity: usize,
 }
 
-impl<K, V, const N: usize> FixedTable<K, V, N> {
-    /// An empty table.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            slots: core::array::from_fn(|_| None),
-            len: 0,
+impl core::fmt::Display for TableFull {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "table capacity exhausted: all {} entries are in use",
+            self.capacity
+        )
+    }
+}
+
+impl core::error::Error for TableFull {}
+
+/// An `Option` whose tag is a byte of its own, `0` when empty: what a value
+/// built at compile time holds where it would hold an `Option`.
+///
+/// An `Option` marks `None` in a spare value of what it holds when it can (a
+/// `bool` set to 2, an enum's unused tag), and that byte is not zero. A
+/// constant with a non-zero byte is copied from flash, where an all-zero one
+/// is written with a `memset`, and a `static` of it lands in `.bss`: so the
+/// empty state of every type built at compile time is all zero bytes
+/// (`DESIGN.md §2`), and holds `Maybe`s. It offers `Option`'s methods, and
+/// converts to and from one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Maybe<T> {
+    /// Nothing: a zero byte.
+    #[default]
+    None = 0,
+    /// A value.
+    Some(T) = 1,
+}
+
+impl<T> From<Option<T>> for Maybe<T> {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Self::Some(value),
+            None => Self::None,
         }
     }
 }
 
-impl<K, V, const N: usize> Default for FixedTable<K, V, N> {
-    fn default() -> Self {
-        Self::new()
+impl<T> From<Maybe<T>> for Option<T> {
+    fn from(value: Maybe<T>) -> Self {
+        match value {
+            Maybe::Some(value) => Some(value),
+            Maybe::None => None,
+        }
     }
 }
 
-impl<K: Ord, V, const N: usize> Table<K, V> for FixedTable<K, V, N> {
+impl<T> IntoIterator for Maybe<T> {
+    type Item = T;
+    type IntoIter = core::option::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Option::from(self).into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Maybe<T> {
+    type Item = &'a T;
+    type IntoIter = core::option::IntoIter<&'a T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_ref().into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Maybe<T> {
+    type Item = &'a mut T;
+    type IntoIter = core::option::IntoIter<&'a mut T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut().into_iter()
+    }
+}
+
+impl<T> Maybe<T> {
+    /// As [`Option::as_ref`].
+    #[must_use]
+    pub const fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Some(value) => Some(value),
+            Self::None => None,
+        }
+    }
+
+    /// As [`Option::as_mut`].
+    pub const fn as_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Some(value) => Some(value),
+            Self::None => None,
+        }
+    }
+
+    /// As [`Option::is_some`].
+    #[must_use]
+    pub const fn is_some(&self) -> bool {
+        matches!(self, Self::Some(_))
+    }
+
+    /// As [`Option::is_none`].
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// As [`Option::take`].
+    pub fn take(&mut self) -> Option<T> {
+        core::mem::take(self).into()
+    }
+
+    /// As [`Option::replace`].
+    pub fn replace(&mut self, value: T) -> Option<T> {
+        core::mem::replace(self, Self::Some(value)).into()
+    }
+
+    /// As [`Option::insert`].
+    pub fn insert(&mut self, value: T) -> &mut T {
+        *self = Self::Some(value);
+        match self {
+            Self::Some(value) => value,
+            Self::None => unreachable!("just set"),
+        }
+    }
+
+    /// As [`Option::get_or_insert_with`].
+    pub fn get_or_insert_with(&mut self, make: impl FnOnce() -> T) -> &mut T {
+        if let Self::Some(value) = self {
+            return value;
+        }
+        self.insert(make())
+    }
+
+    /// The value, as an `Option` of it, for a value that is `Copy`.
+    #[must_use]
+    pub const fn get(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        match self {
+            Self::Some(value) => Some(*value),
+            Self::None => None,
+        }
+    }
+
+    /// As [`Option::is_some_and`].
+    pub fn is_some_and(self, f: impl FnOnce(T) -> bool) -> bool {
+        Option::from(self).is_some_and(f)
+    }
+
+    /// As [`Option::is_none_or`].
+    pub fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
+        Option::from(self).is_none_or(f)
+    }
+
+    /// As [`Option::map`].
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Option<U> {
+        Option::from(self).map(f)
+    }
+
+    /// As [`Option::and_then`].
+    pub fn and_then<U>(self, f: impl FnOnce(T) -> Option<U>) -> Option<U> {
+        Option::from(self).and_then(f)
+    }
+
+    /// As [`Option::map_or`].
+    pub fn map_or<U>(self, default: U, f: impl FnOnce(T) -> U) -> U {
+        Option::from(self).map_or(default, f)
+    }
+
+    /// As [`Option::filter`].
+    pub fn filter(self, keep: impl FnOnce(&T) -> bool) -> Option<T> {
+        Option::from(self).filter(keep)
+    }
+
+    /// As [`Option::unwrap_or`].
+    pub fn unwrap_or(self, default: T) -> T {
+        Option::from(self).unwrap_or(default)
+    }
+}
+
+/// A table of at most `N` entries, held in an array.
+///
+/// Lookups scan the array: for the handful of entries a microcontroller holds,
+/// that is smaller and as fast as anything that indexes. A key's position
+/// holds its value; a free position holds the value's [`Empty`] state, so
+/// that an empty table is all zero bytes, and an entry is made by copying
+/// that constant straight into its slot, a `memset` (`DESIGN.md §2`). A key
+/// and a value made together, or a value wrapped in an `Option`, would be
+/// assembled on the stack first.
+pub struct FixedTable<K, V, const N: usize> {
+    keys: [Maybe<K>; N],
+    values: [V; N],
+    len: usize,
+}
+
+impl<K, V: Empty, const N: usize> FixedTable<K, V, N> {
+    /// An empty table, built at compile time: all zero bytes.
+    pub const EMPTY: Self = Self {
+        keys: [const { Maybe::None }; N],
+        values: [const { V::EMPTY }; N],
+        len: 0,
+    };
+
+    /// An empty table.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl<K, V: Empty, const N: usize> Default for FixedTable<K, V, N> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl<K: Ord, V, const N: usize> FixedTable<K, V, N> {
+    /// Where `key` is held.
+    fn position(&self, key: &K) -> Option<usize> {
+        self.keys.iter().position(|k| k.as_ref() == Some(key))
+    }
+
+    /// A free slot.
+    fn free(&self) -> Option<usize> {
+        self.keys.iter().position(Maybe::is_none)
+    }
+}
+
+impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
+    const EMPTY: Self = Self::EMPTY;
+
     fn insert(&mut self, key: K, value: V) -> Result<Option<V>, CapacityExhausted<K, V>> {
         if let Some(existing) = self.get_mut(&key) {
             return Ok(Some(core::mem::replace(existing, value)));
         }
-        match self.slots.iter_mut().find(|slot| slot.is_none()) {
-            Some(slot) => {
-                *slot = Some((key, value));
+        let free = self.free();
+        match free.and_then(|at| Some((self.keys.get_mut(at)?, self.values.get_mut(at)?))) {
+            Some((slot, held)) => {
+                *slot = Maybe::Some(key);
+                *held = value;
                 self.len += 1;
                 Ok(None)
             }
@@ -127,29 +416,49 @@ impl<K: Ord, V, const N: usize> Table<K, V> for FixedTable<K, V, N> {
     }
 
     fn get(&self, key: &K) -> Option<&V> {
-        self.slots
-            .iter()
-            .flatten()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.values.get(self.position(key)?)
     }
 
     fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        let at = self.position(key)?;
+        self.values.get_mut(at)
     }
 
     fn remove(&mut self, key: &K) -> Option<V> {
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|slot| matches!(slot, Some((k, _)) if k == key))?;
-        let (_, value) = slot.take()?;
+        let at = self.position(key)?;
+        *self.keys.get_mut(at)? = Maybe::None;
         self.len -= 1;
-        Some(value)
+        Some(core::mem::replace(self.values.get_mut(at)?, V::EMPTY))
+    }
+
+    fn insert_empty(&mut self, key: K) -> Result<&mut V, TableFull> {
+        let full = TableFull { capacity: N };
+        if let Some(at) = self.position(&key) {
+            return self.values.get_mut(at).ok_or(full);
+        }
+        let at = self.free().ok_or(full)?;
+        let (Some(slot), Some(held)) = (self.keys.get_mut(at), self.values.get_mut(at)) else {
+            return Err(full);
+        };
+        *slot = Maybe::Some(key);
+        // The empty value, copied from its constant straight into the slot:
+        // all zero bytes, a `memset`, and nothing on the stack.
+        *held = V::EMPTY;
+        self.len += 1;
+        Ok(held)
+    }
+
+    fn discard(&mut self, key: &K) -> bool {
+        let Some(at) = self.position(key) else {
+            return false;
+        };
+        if let (Some(slot), Some(held)) = (self.keys.get_mut(at), self.values.get_mut(at)) {
+            *slot = Maybe::None;
+            // Dropped where it is held, and left empty.
+            *held = V::EMPTY;
+            self.len -= 1;
+        }
+        true
     }
 
     fn len(&self) -> usize {
@@ -161,30 +470,33 @@ impl<K: Ord, V, const N: usize> Table<K, V> for FixedTable<K, V, N> {
     }
 
     fn for_each(&self, mut f: impl FnMut(&K, &V)) {
-        for (k, v) in self.slots.iter().flatten() {
-            f(k, v);
+        for (k, v) in self.keys.iter().zip(&self.values) {
+            if let Some(k) = k.as_ref() {
+                f(k, v);
+            }
         }
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
-        for slot in &mut self.slots {
-            let drop = match slot.as_mut() {
-                Some((k, v)) => !keep(k, v),
+        for (slot, held) in self.keys.iter_mut().zip(&mut self.values) {
+            let drop = match slot.as_ref() {
+                Some(k) => !keep(k, held),
                 None => false,
             };
             if drop {
-                *slot = None;
+                *slot = Maybe::None;
+                *held = V::EMPTY;
                 self.len -= 1;
             }
         }
     }
 
     fn first(&self) -> Option<(&K, &V)> {
-        self.slots
+        self.keys
             .iter()
-            .flatten()
+            .zip(&self.values)
+            .filter_map(|(k, v)| Some((k.as_ref()?, v)))
             .min_by(|(a, _), (b, _)| a.cmp(b))
-            .map(|(k, v)| (k, v))
     }
 }
 
@@ -202,24 +514,29 @@ pub struct GrowableTable<K, V, const LIMIT: usize = { usize::MAX }> {
 
 #[cfg(feature = "alloc")]
 impl<K, V, const LIMIT: usize> GrowableTable<K, V, LIMIT> {
+    /// An empty table, built at compile time.
+    pub const EMPTY: Self = Self {
+        entries: alloc::collections::BTreeMap::new(),
+    };
+
     /// An empty table.
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            entries: alloc::collections::BTreeMap::new(),
-        }
+    pub const fn new() -> Self {
+        Self::EMPTY
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<K, V, const LIMIT: usize> Default for GrowableTable<K, V, LIMIT> {
     fn default() -> Self {
-        Self::new()
+        Self::EMPTY
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<K: Ord, V, const LIMIT: usize> Table<K, V> for GrowableTable<K, V, LIMIT> {
+    const EMPTY: Self = Self::EMPTY;
+
     fn insert(&mut self, key: K, value: V) -> Result<Option<V>, CapacityExhausted<K, V>> {
         if self.entries.len() >= LIMIT && !self.entries.contains_key(&key) {
             return Err(CapacityExhausted {
@@ -241,6 +558,20 @@ impl<K: Ord, V, const LIMIT: usize> Table<K, V> for GrowableTable<K, V, LIMIT> {
 
     fn remove(&mut self, key: &K) -> Option<V> {
         self.entries.remove(key)
+    }
+
+    fn insert_empty(&mut self, key: K) -> Result<&mut V, TableFull>
+    where
+        V: Empty,
+    {
+        if self.entries.len() >= LIMIT && !self.entries.contains_key(&key) {
+            return Err(TableFull { capacity: LIMIT });
+        }
+        Ok(self.entries.entry(key).or_insert(V::EMPTY))
+    }
+
+    fn discard(&mut self, key: &K) -> bool {
+        self.entries.remove(key).is_some()
     }
 
     fn len(&self) -> usize {
@@ -275,36 +606,36 @@ impl<K: Ord, V, const LIMIT: usize> Table<K, V> for GrowableTable<K, V, LIMIT> {
 pub trait Config {
     /// Where the contexts the endpoint serves are kept, the relay's included.
     /// Only the application fills it, never a peer.
-    type Contexts<K: Ord, V>: Table<K, V> + Default;
+    type Contexts<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where open sessions are kept.
-    type Sessions<K: Ord, V>: Table<K, V> + Default;
+    type Sessions<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where known peers are kept.
-    type Peers<K: Ord, V>: Table<K, V> + Default;
+    type Peers<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where a responder keeps handshakes it accepted and that are not yet
     /// confirmed. Strangers who know the address can fill it, so it is always
     /// bounded.
-    type Pending<K: Ord, V>: Table<K, V> + Default;
+    type Pending<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where a responder remembers the ephemeral keys of recent first contacts.
     /// Bounded: forgetting one costs at most one Diffie-Hellman.
-    type RecentEphemerals<K: Ord, V>: Table<K, V> + Default;
+    type RecentEphemerals<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where a responder under load keeps each source's rate. Bounded:
     /// forgetting one lets that source restart its burst.
-    type SourceRates<K: Ord, V>: Table<K, V> + Default;
+    type SourceRates<K: Ord, V: Empty>: Table<K, V> + Default;
     /// A receiver's anti-replay window, per key pair.
     type ReplayWindow: crate::transport::ReplayWindow;
     /// Datagrams a session holds while it has no keys, bounded in bytes.
     type Queue: crate::session::DatagramQueue;
     /// Where an endpoint keeps the dials it is making.
-    type Dials<K: Ord, V>: Table<K, V> + Default;
+    type Dials<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where an endpoint maps the indices peers put in packets to their session
     /// or dial.
-    type Indices<K: Ord, V>: Table<K, V> + Default;
+    type Indices<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where an endpoint keeps the direct address hints applications give for
     /// peers. Bounded: a full table forgets the hint used least recently.
-    type Hints<K: Ord, V>: Table<K, V> + Default;
+    type Hints<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where an endpoint keeps the IP prefixes an application excluded from
     /// direct paths (`PROTOCOL.md §7`). Bounded.
-    type Excluded<K: Ord, V>: Table<K, V> + Default;
+    type Excluded<K: Ord, V: Empty>: Table<K, V> + Default;
     /// First contacts a responder takes to the Diffie-Hellman per second before
     /// it is under load.
     const LOAD_RATE_PER_SECOND: u32;
@@ -402,20 +733,28 @@ macro_rules! profile {
 macro_rules! __fixed_config {
     ($name:ident) => {
         impl $crate::storage::Config for $name {
-            type Contexts<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.contexts }>;
-            type Sessions<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.sessions }>;
-            type Peers<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.peers }>;
-            type Pending<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.pending }>;
-            type RecentEphemerals<K: Ord, V> =
+            type Contexts<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.contexts }>;
+            type Sessions<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.sessions }>;
+            type Peers<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.peers }>;
+            type Pending<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.pending }>;
+            type RecentEphemerals<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::FixedTable<K, V, { $name::SIZES.recent_ephemerals }>;
-            type SourceRates<K: Ord, V> =
+            type SourceRates<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::FixedTable<K, V, { $name::SIZES.source_rates }>;
             type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
             type Queue = $crate::session::FixedQueue<{ $name::SIZES.queue_bytes }>;
-            type Dials<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.dials }>;
-            type Indices<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.indices }>;
-            type Hints<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.hints }>;
-            type Excluded<K: Ord, V> = $crate::storage::FixedTable<K, V, { $name::SIZES.excluded }>;
+            type Dials<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.dials }>;
+            type Indices<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.indices }>;
+            type Hints<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.hints }>;
+            type Excluded<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.excluded }>;
             const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
             const LOAD_BURST: u32 = $name::SIZES.load_burst;
         }
@@ -428,24 +767,27 @@ macro_rules! __fixed_config {
 macro_rules! __growable_config {
     ($name:ident) => {
         impl $crate::storage::Config for $name {
-            type Contexts<K: Ord, V> =
+            type Contexts<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.contexts }>;
-            type Sessions<K: Ord, V> =
+            type Sessions<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.sessions }>;
-            type Peers<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.peers }>;
-            type Pending<K: Ord, V> =
+            type Peers<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.peers }>;
+            type Pending<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.pending }>;
-            type RecentEphemerals<K: Ord, V> =
+            type RecentEphemerals<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.recent_ephemerals }>;
-            type SourceRates<K: Ord, V> =
+            type SourceRates<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.source_rates }>;
             type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
             type Queue = $crate::session::GrowableQueue<{ $name::SIZES.queue_bytes }>;
-            type Dials<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.dials }>;
-            type Indices<K: Ord, V> =
+            type Dials<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.dials }>;
+            type Indices<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.indices }>;
-            type Hints<K: Ord, V> = $crate::storage::GrowableTable<K, V, { $name::SIZES.hints }>;
-            type Excluded<K: Ord, V> =
+            type Hints<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.hints }>;
+            type Excluded<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.excluded }>;
             const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
             const LOAD_BURST: u32 = $name::SIZES.load_burst;

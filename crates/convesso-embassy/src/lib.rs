@@ -6,7 +6,10 @@
 //! so, and wakes the core at its deadlines. Every protocol decision is the
 //! core's, so this driver and the tokio one behave alike.
 //!
-//! It allocates nothing: every buffer is the integrator's. It reaches the
+//! It allocates nothing: every buffer is the integrator's, and the node's
+//! state is a [`Slot`] the integrator declares as a `static`, built at compile
+//! time and filled in place by [`start`], so that it never crosses the stack
+//! (`DESIGN.md §2`). It reaches the
 //! network through the [`socket`] interface, implemented over `embassy-net`
 //! (feature `embassy-net`, on by default), so that a network with its own
 //! TCP/IP stack can be plugged in later. The device is given its identity, as
@@ -26,5 +29,5 @@ pub mod socket;
 pub use events::{ContextEvent, ENTRIES, HELD, NODE_ENTRIES, NODE_HELD, NodeError, NodeEvent};
 pub use node::{
     Access, Config, Context, ContextEvents, ContextOptions, ContextSlot, DIRECT_PATH_MAX, DROPPED,
-    EVENTS_LEN, Events, Node, RelayLocation, Runner, Shared, StartError, Stats, start,
+    EVENTS_LEN, Events, Node, RelayLocation, Runner, Slot, StartError, Stats, start,
 };

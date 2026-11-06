@@ -78,7 +78,7 @@ impl<C: CoreConfig, S: StreamConfig> Node<C, S> {
     }
 
     fn address(&self) -> Address {
-        *self.endpoint.identity().address()
+        *self.endpoint.identity().unwrap().address()
     }
 
     fn core_event(&mut self, event: CoreEvent<'_>, now: Instant) {
@@ -275,7 +275,7 @@ fn client(i: u32) -> Node<CoreMcu, Mcu> {
 fn met(n: u32, spacing: u64) -> (Node<Wide, Server>, Node<CoreMcu, Mcu>) {
     let server_source = [192, 0, 2, 1, 0x1f, 0x40];
     let mut server: Node<Wide, Server> = Node::new(seeded(1_000_000), server_source, 1);
-    let server_peer = server.endpoint.identity().peer_id();
+    let server_peer = server.endpoint.identity().unwrap().peer_id();
     let server_address = server.address();
     let mut last = None;
     for i in 0..n {

@@ -1,0 +1,131 @@
+# The stack budget: the deepest chain of stack frames below each root of the
+# reference firmware, in bytes, per embedded target. Checked by scripts/stack.py
+# on every change; a change that deepens a chain raises its figure in the same
+# diff, so the growth is seen in review.
+#
+# Each [[indirect]] class says where calls through a register may go: a call
+# made in a function whose name matches `callers` counts as the deepest chain
+# of the functions whose names match `targets` (demangled names, regexes).
+# A class `optional` may find no target in the reference firmware.
+#
+# Each firmware's `indirect` table counts the calls through a register in each
+# of convesso's functions: one more, or one in a function not listed, fails
+# until it is recorded, so that a new call through a trait object or a
+# function pointer is seen in review, with the class that covers it.
+
+[[indirect]]
+name = 'the executor polls its tasks'
+callers = '^<embassy_executor::platform::[a-z_:]+Executor>::run'
+targets = '^<embassy_executor::raw::TaskStorage<.*>>::poll$'
+
+[[indirect]]
+name = 'the driver wakes a task'
+callers = '^<?convesso_embassy::'
+targets = '^embassy_executor::raw::waker::(clone|wake|wake_by_ref|drop)$'
+
+[[indirect]]
+name = 'the generator'
+callers = 'dyn convesso_embassy::rng::SecureRng|^convesso_embassy::node::start::'
+targets = '^<(?!core::|convesso_)\S+ as convesso_embassy::rng::SecureRng>::try_fill$'
+
+[[indirect]]
+name = 'an application admission policy'
+callers = ' as convesso_core::handshake::Admission>::(admit|psk)$'
+targets = '^<(?!convesso_)[^ ]+ as convesso_core::handshake::Admission>::(admit|psk)$'
+optional = true
+
+["reference-embassy/riscv32imc-unknown-none-elf"]
+"main" = 12368
+"task application" = 12320
+"task driver" = 10608
+"task network" = 3200
+
+["reference-embassy/riscv32imc-unknown-none-elf".indirect]
+"<convesso_core::dos::CookieSecret>::at::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::first_contact::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::start_dial::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>> as convesso_core::handshake::Admission>::admit" = 1
+"<convesso_core::handshake::initiator::Dial>::send_attempt::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::cookie_reply::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::make_room::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_embassy::net::NetDatagrams as convesso_embassy::socket::Datagrams>::send_to::{closure#0}" = 9
+"<convesso_embassy::net::NetStream as embedded_io_async::Write>::write_all::{closure#0}" = 3
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::send_target::{closure#0}" = 1
+"<convesso_embassy::node::Inner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>::deliver" = 1
+"<convesso_embassy::node::Runner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams, convesso_embassy::net::NetStream, convesso_embassy::net::NetInterfaces>>::run::{closure#0}" = 10
+
+["reference-embassy/thumbv7em-none-eabihf"]
+"main" = 11976
+"task application" = 11952
+"task driver" = 10264
+"task network" = 3240
+
+["reference-embassy/thumbv7em-none-eabihf".indirect]
+"<convesso_core::dos::CookieSecret>::at::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::first_contact::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::start_dial::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>> as convesso_core::handshake::Admission>::admit" = 1
+"<convesso_core::handshake::initiator::Dial>::send_attempt::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::cookie_reply::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::make_room::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_embassy::net::NetDatagrams as convesso_embassy::socket::Datagrams>::send_to::{closure#0}" = 9
+"<convesso_embassy::net::NetStream as embedded_io_async::Write>::write_all::{closure#0}" = 3
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::send_target::{closure#0}" = 1
+"<convesso_embassy::node::Runner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams, convesso_embassy::net::NetStream, convesso_embassy::net::NetInterfaces>>::run::{closure#0}" = 9
+
+["reference-stream/riscv32imc-unknown-none-elf"]
+"main" = 12192
+"start" = 2304
+"task application" = 12144
+"task driver" = 10688
+"task network" = 3200
+
+["reference-stream/riscv32imc-unknown-none-elf".indirect]
+"<convesso_core::dos::CookieSecret>::at::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::first_contact::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::start_dial::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>> as convesso_core::handshake::Admission>::admit" = 1
+"<convesso_core::handshake::initiator::Dial>::send_attempt::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::cookie_reply::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::make_room::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_embassy::net::NetDatagrams as convesso_embassy::socket::Datagrams>::send_to::{closure#0}" = 9
+"<convesso_embassy::net::NetStream as embedded_io_async::Write>::write_all::{closure#0}" = 3
+"<convesso_embassy::net::NetStream>::new" = 2
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::offer::{closure#0}" = 2
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::send_target::{closure#0}" = 1
+"<convesso_embassy::node::ContextSlot<embassy_sync::blocking_mutex::raw::NoopRawMutex>>::push" = 1
+"<convesso_embassy::node::Runner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams, convesso_embassy::net::NetStream, convesso_embassy::net::NetInterfaces>>::drain::{closure#0}" = 4
+"<convesso_stream::channel::Channel<convesso_stream::config::Mcu>>::session_ended::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+
+["reference-stream/thumbv7em-none-eabihf"]
+"main" = 11704
+"start" = 2376
+"task application" = 11680
+"task driver" = 10344
+"task network" = 3240
+
+["reference-stream/thumbv7em-none-eabihf".indirect]
+"<convesso_core::dos::CookieSecret>::at::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::first_contact::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::endpoint::Endpoint<convesso_core::storage::Mcu>>::start_dial::<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>>, convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::endpoint::relayed::RelayAware<convesso_embassy::node::Policies<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu>> as convesso_core::handshake::Admission>::admit" = 1
+"<convesso_core::handshake::initiator::Dial>::send_attempt::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 2
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::cookie_reply::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_core::handshake::responder::Responder<convesso_core::storage::Mcu>>::make_room::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+"<convesso_embassy::net::NetDatagrams as convesso_embassy::socket::Datagrams>::send_to::{closure#0}" = 9
+"<convesso_embassy::net::NetStream as embedded_io_async::Write>::write_all::{closure#0}" = 3
+"<convesso_embassy::net::NetStream>::new" = 2
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::offer::{closure#0}" = 2
+"<convesso_embassy::node::Context<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams>>::send_target::{closure#0}" = 1
+"<convesso_embassy::node::Runner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams, convesso_embassy::net::NetStream, convesso_embassy::net::NetInterfaces>>::drain::{closure#0}" = 4
+"<convesso_stream::channel::Channel<convesso_stream::config::Mcu>>::session_ended::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
+
+["reference/riscv32imc-unknown-none-elf"]
+"main" = 24608
+
+["reference/riscv32imc-unknown-none-elf".indirect]
+
+["reference/thumbv7em-none-eabihf"]
+"main" = 24144
+
+["reference/thumbv7em-none-eabihf".indirect]

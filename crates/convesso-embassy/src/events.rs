@@ -22,6 +22,7 @@ use convesso_core::handshake::{DialError, ResponderError};
 use convesso_core::identity::PeerId;
 use convesso_core::paths::PathKind;
 use convesso_core::relay::Link;
+use convesso_core::storage::Maybe;
 
 /// How many events can wait at once in a context's queue, datagrams
 /// included.
@@ -227,34 +228,61 @@ enum Entry {
 /// A queue of `E` events over the integrator's byte buffer, with `H` events
 /// waiting aside at most.
 pub(crate) struct EventQueue<'d, const E: usize, const H: usize> {
-    entries: [Option<Entry>; E],
+    entries: [Maybe<Entry>; E],
     first: usize,
     count: usize,
-    bytes: &'d mut [u8],
+    /// The integrator's buffer, once given: `None` in a slot not yet opened,
+    /// whose empty state is all zero bytes (`DESIGN.md §2`).
+    bytes: Option<&'d mut [u8]>,
     start: usize,
     used: usize,
     /// Events waiting aside, oldest first.
-    held: [Option<Event<'static>>; H],
+    held: [Maybe<Event<'static>>; H],
     held_count: usize,
 }
 
 impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
-    pub(crate) fn new(bytes: &'d mut [u8]) -> Self {
+    pub(crate) const fn new(bytes: Option<&'d mut [u8]>) -> Self {
         Self {
-            entries: [None; E],
+            entries: [const { Maybe::None }; E],
             first: 0,
             count: 0,
             bytes,
             start: 0,
             used: 0,
-            held: [None; H],
+            held: [const { Maybe::None }; H],
             held_count: 0,
         }
     }
 
+    /// Empties the queue in place, and gives it `bytes` to hold its events'
+    /// data: the queue of a slot opened again.
+    fn buffer(&self) -> &[u8] {
+        self.bytes.as_deref().unwrap_or_default()
+    }
+
+    fn buffer_mut(&mut self) -> &mut [u8] {
+        self.bytes.as_deref_mut().unwrap_or_default()
+    }
+
+    pub(crate) fn reset(&mut self, bytes: &'d mut [u8]) {
+        for entry in &mut self.entries {
+            *entry = Maybe::None;
+        }
+        for held in &mut self.held {
+            *held = Maybe::None;
+        }
+        self.first = 0;
+        self.count = 0;
+        self.bytes = Some(bytes);
+        self.start = 0;
+        self.used = 0;
+        self.held_count = 0;
+    }
+
     /// Whether an event with up to `data` bytes of data fits.
     pub(crate) fn has_room(&self, data: usize) -> bool {
-        self.count < E && self.bytes.len() - self.used >= data
+        self.count < E && self.buffer().len() - self.used >= data
     }
 
     /// Whether a message of up to `data` bytes may be taken from the stream
@@ -293,7 +321,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
     fn hold(&mut self, event: Event<'static>) {
         let wanted = key(&event);
         let same = (0..self.held_count)
-            .find(|&i| self.held.get(i).copied().flatten().map(|e| key(&e)) == Some(wanted));
+            .find(|&i| self.held.get(i).and_then(Maybe::get).map(|e| key(&e)) == Some(wanted));
         // The table holds every peer and kind the tables can name; were it
         // full all the same, the oldest change of state goes before a close.
         let evicted = same.or_else(|| {
@@ -301,7 +329,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
                 (0..self.held_count)
                     .find(|&i| {
                         !matches!(
-                            self.held.get(i).copied().flatten(),
+                            self.held.get(i).and_then(Maybe::get),
                             Some(Event::Context(ContextEvent::Closed { .. }))
                         )
                     })
@@ -313,7 +341,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
             self.held_count -= 1;
         }
         if let Some(slot) = self.held.get_mut(self.held_count) {
-            *slot = Some(event);
+            *slot = Maybe::Some(event);
             self.held_count += 1;
         }
     }
@@ -321,7 +349,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
     /// Moves what waits aside into the queue, in order, as far as it fits.
     fn flush(&mut self) {
         while self.held_count > 0 && self.count < E {
-            if let Some(event) = self.held.first().copied().flatten() {
+            if let Some(event) = self.held.first().and_then(Maybe::get) {
                 self.push_entry(Entry::Other(event));
             }
             self.held.copy_within(1..self.held_count, 0);
@@ -337,7 +365,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
     fn push_entry(&mut self, entry: Entry) {
         let at = (self.first + self.count) % E;
         if let Some(slot) = self.entries.get_mut(at) {
-            *slot = Some(entry);
+            *slot = Maybe::Some(entry);
             self.count += 1;
         }
     }
@@ -348,9 +376,11 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
         if !self.has_room(data.len()) {
             return false;
         }
-        let capacity = self.bytes.len();
+        let at = self.start + self.used;
+        let buffer = self.buffer_mut();
+        let capacity = buffer.len();
         for (i, byte) in data.iter().enumerate() {
-            if let Some(slot) = self.bytes.get_mut((self.start + self.used + i) % capacity) {
+            if let Some(slot) = buffer.get_mut((at + i) % capacity) {
                 *slot = *byte;
             }
         }
@@ -409,7 +439,7 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
         if self.count == 0 {
             return None;
         }
-        let entry = self.entries.get_mut(self.first).and_then(Option::take)?;
+        let entry = self.entries.get_mut(self.first).and_then(Maybe::take)?;
         self.first = (self.first + 1) % E;
         self.count -= 1;
         self.flush();
@@ -447,12 +477,13 @@ impl<'d, const E: usize, const H: usize> EventQueue<'d, E, H> {
     /// Copies the oldest `len` bytes of the ring into `buf`, as many as fit,
     /// and releases them; returns how many were copied.
     fn pop_bytes(&mut self, len: usize, buf: &mut [u8]) -> usize {
-        let capacity = self.bytes.len();
+        let capacity = self.buffer().len();
         let kept = len.min(buf.len());
         for i in 0..kept {
-            if let (Some(slot), Some(byte)) =
-                (buf.get_mut(i), self.bytes.get((self.start + i) % capacity))
-            {
+            if let (Some(slot), Some(byte)) = (
+                buf.get_mut(i),
+                self.buffer().get((self.start + i) % capacity),
+            ) {
                 *slot = *byte;
             }
         }
@@ -647,7 +678,7 @@ mod tests {
     #[test]
     fn events_come_out_in_order_and_datagrams_whole() {
         let mut bytes = [0u8; 10];
-        let mut queue = Queue::new(&mut bytes);
+        let mut queue = Queue::new(Some(&mut bytes));
         assert!(queue.push(context(ContextEvent::Connected { peer: peer(1) })));
         assert!(queue.push(context(ContextEvent::Datagram {
             peer: peer(1),
@@ -694,7 +725,7 @@ mod tests {
     #[test]
     fn the_entries_are_bounded_too() {
         let mut bytes = [0u8; 4];
-        let mut queue = Queue::new(&mut bytes);
+        let mut queue = Queue::new(Some(&mut bytes));
         for _ in 0..ENTRIES {
             assert!(queue.push(not_at_relay(1)));
         }
@@ -715,7 +746,7 @@ mod tests {
     #[test]
     fn events_wait_aside_coalesced_and_come_after_the_queue() {
         let mut bytes = [0u8; 64];
-        let mut queue = Queue::new(&mut bytes);
+        let mut queue = Queue::new(Some(&mut bytes));
         full(&mut queue);
         let relayed = context(ContextEvent::PathChanged {
             peer: peer(2),
@@ -760,7 +791,7 @@ mod tests {
     #[test]
     fn the_relays_events_coalesce_as_one_state() {
         let mut bytes = [0u8; 4];
-        let mut queue: EventQueue<'_, NODE_ENTRIES, NODE_HELD> = EventQueue::new(&mut bytes);
+        let mut queue: EventQueue<'_, NODE_ENTRIES, NODE_HELD> = EventQueue::new(Some(&mut bytes));
         for _ in 0..NODE_ENTRIES {
             assert!(queue.push(not_at_relay(1)));
         }
@@ -786,7 +817,7 @@ mod tests {
     #[test]
     fn a_new_event_never_overtakes_one_waiting_aside() {
         let mut bytes = [0u8; 4];
-        let mut queue = Queue::new(&mut bytes);
+        let mut queue = Queue::new(Some(&mut bytes));
         full(&mut queue);
         let first = context(ContextEvent::Connected { peer: peer(2) });
         queue.push_or_hold(first);
@@ -807,7 +838,7 @@ mod tests {
     #[test]
     fn a_full_table_keeps_its_closes() {
         let mut bytes = [0u8; 4];
-        let mut queue = Queue::new(&mut bytes);
+        let mut queue = Queue::new(Some(&mut bytes));
         full(&mut queue);
         let closed = context(ContextEvent::Closed {
             peer: peer(1),

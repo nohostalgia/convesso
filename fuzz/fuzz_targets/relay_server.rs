@@ -174,7 +174,7 @@ fuzz_target!(|data: &[u8]| {
                 let mut out = [0u8; 2048];
                 out[..packet.len()].copy_from_slice(packet);
                 let peer =
-                    Address::parse(recipient).map_or(client.identity().peer_id(), |a| a.peer_id());
+                    Address::parse(recipient).map_or(client.identity().unwrap().peer_id(), |a| a.peer_id());
                 if let Ok(Output::Transmit { len, .. }) = client.through_relay(
                     peer,
                     packet.len(),

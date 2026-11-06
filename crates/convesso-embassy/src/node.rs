@@ -32,7 +32,7 @@ use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::paths::{Candidate, PathInfo};
 use convesso_core::relay::Link;
 use convesso_core::relay::framing::{self, Deframed, Deframer, KEEPALIVE, MAX_FRAME, PREAMBLE};
-use convesso_core::storage::{Config as Tables, Table};
+use convesso_core::storage::{Config as Tables, Maybe, Table};
 use convesso_core::time::Instant;
 use embassy_futures::select::{Either4, select, select4};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
@@ -96,7 +96,7 @@ pub enum Access<'d> {
     #[default]
     Everyone,
     /// The peers this policy admits, asked for each first contact.
-    Admit(&'d mut dyn Admission),
+    Admit(&'d mut (dyn Admission + Send)),
     /// This peer alone: a first contact from any other meets silence.
     Bound(PeerId),
     /// No one: the context is not served, and only dialled in.
@@ -135,9 +135,10 @@ pub struct ContextOptions<'d, M: RawMutex> {
 }
 
 /// A context's state, which its handle, its events and the runner share:
-/// given by the integrator when the context is opened.
+/// given by the integrator when the context is opened, and built at compile
+/// time, so that opening a context fills it in place.
 pub struct ContextSlot<'d, M: RawMutex> {
-    state: BlockingMutex<M, RefCell<Option<SlotState<'d>>>>,
+    state: BlockingMutex<M, RefCell<SlotState<'d>>>,
     /// An event was queued, or the context closed.
     ready: Signal<M, ()>,
     /// Room opened in one of its channels' send buffers (feature `stream`).
@@ -146,6 +147,8 @@ pub struct ContextSlot<'d, M: RawMutex> {
 }
 
 struct SlotState<'d> {
+    /// Whether a context is open in the slot, or was and has events left.
+    open: bool,
     events: EventQueue<'d, ENTRIES, HELD>,
     /// The handle asked for the context to be closed, with this code.
     close: Option<u16>,
@@ -163,17 +166,32 @@ impl<'d, M: RawMutex> ContextSlot<'d, M> {
     /// An empty slot.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            state: BlockingMutex::new(RefCell::new(None)),
-            ready: Signal::new(),
-            #[cfg(feature = "stream")]
-            writable: Signal::new(),
-        }
+        // A constant: called at run time, it is one copy into its place.
+        Self::EMPTY
     }
+
+    #[allow(
+        clippy::declare_interior_mutable_const,
+        reason = "each use is a fresh slot, which is what `new` returns"
+    )]
+    const EMPTY: Self = Self {
+        state: BlockingMutex::new(RefCell::new(SlotState {
+            open: false,
+            events: EventQueue::new(None),
+            close: None,
+            closed: false,
+        })),
+        ready: Signal::new(),
+        #[cfg(feature = "stream")]
+        writable: Signal::new(),
+    };
 
     /// `f` on the state, if the slot is in use.
     fn with<R>(&self, f: impl FnOnce(&mut SlotState<'d>) -> R) -> Option<R> {
-        self.state.lock(|state| state.borrow_mut().as_mut().map(f))
+        self.state.lock(|state| {
+            let mut state = state.borrow_mut();
+            state.open.then(|| f(&mut state))
+        })
     }
 
     /// Queues an event; returns whether it was dropped for want of room.
@@ -193,6 +211,8 @@ pub enum StartError {
     Rng(RngFailed),
     /// The core refused the configuration.
     Core(ResponderError),
+    /// The slot holds a node started already.
+    SlotInUse,
 }
 
 impl core::fmt::Display for StartError {
@@ -200,6 +220,7 @@ impl core::fmt::Display for StartError {
         match self {
             Self::Rng(error) => error.fmt(f),
             Self::Core(error) => write!(f, "the core: {error:?}"),
+            Self::SlotInUse => f.write_str("the slot holds a node started already"),
         }
     }
 }
@@ -223,17 +244,20 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Nothing counted yet.
+    const ZERO: Self = Self {
+        datagrams_sent: 0,
+        datagrams_not_sent: 0,
+        link_frames_sent: 0,
+        keepalives_sent: 0,
+        datagrams_dropped: 0,
+    };
+
     fn count(&mut self, sent: Result<(), crate::socket::SocketError>) {
         match sent {
             Ok(()) => self.datagrams_sent += 1,
             Err(_) => self.datagrams_not_sent += 1,
         }
-    }
-}
-
-impl SecureRng for &mut dyn SecureRng {
-    fn try_fill(&mut self, dest: &mut [u8]) -> Result<(), RngFailed> {
-        (**self).try_fill(dest)
     }
 }
 
@@ -247,10 +271,21 @@ const MAX_MESSAGE: usize = <StreamConfig as convesso_stream::config::StreamConfi
 
 /// An open context, as the driver keeps it.
 struct Open<'d, M: RawMutex> {
-    slot: &'d ContextSlot<'d, M>,
-    policy: Option<&'d mut dyn Admission>,
+    /// Its slot; `None` only in a free slot of the contexts' table, whose
+    /// empty state is all zero bytes (`DESIGN.md §2`).
+    slot: Option<&'d ContextSlot<'d, M>>,
+    policy: Option<&'d mut (dyn Admission + Send)>,
     #[cfg(feature = "stream")]
     max_message: usize,
+}
+
+impl<M: RawMutex> convesso_core::storage::Empty for Open<'_, M> {
+    const EMPTY: Self = Self {
+        slot: None,
+        policy: None,
+        #[cfg(feature = "stream")]
+        max_message: 0,
+    };
 }
 
 /// The open contexts, in a table of the storage profile's.
@@ -262,7 +297,7 @@ type Contexts<'d, M, T> = <T as Tables>::Contexts<Name, Open<'d, M>>;
 struct Policies<'a, 'd, M: RawMutex, T: Tables>(&'a mut Contexts<'d, M, T>);
 
 impl<'d, M: RawMutex, T: Tables> Policies<'_, 'd, M, T> {
-    fn of(&mut self, context: &[u8]) -> Option<&mut (dyn Admission + 'd)> {
+    fn of(&mut self, context: &[u8]) -> Option<&mut (dyn Admission + Send + 'd)> {
         let context = Name::new(context).ok()?;
         self.0
             .get_mut(&context)
@@ -288,13 +323,14 @@ impl<M: RawMutex, T: Tables> Admission for Policies<'_, '_, M, T> {
 struct Inner<'d, M: RawMutex, T: Tables> {
     endpoint: Endpoint<T>,
     contexts: Contexts<'d, M, T>,
-    entropy: Checked<&'d mut dyn SecureRng>,
+    /// No generator until the start gives it one.
+    entropy: Checked<Option<&'d mut (dyn SecureRng + Send)>>,
     out: [u8; OUT_LEN],
     /// The node's own events.
     events: EventQueue<'d, NODE_ENTRIES, NODE_HELD>,
-    relay: Option<RelayLocation>,
+    relay: Maybe<RelayLocation>,
     /// The source of the packet handled last, for `To::Source`.
-    last_from: Option<SocketAddr>,
+    last_from: Maybe<SocketAddr>,
     /// Whether the runner owes the core its interfaces again: the network
     /// changed, or excluded prefixes were replaced.
     report_interfaces: bool,
@@ -331,8 +367,8 @@ impl<'d, M: RawMutex, T: Tables> Inner<'d, M, T> {
                 node_ready.signal(());
             }
             Some(context) => {
-                if let Some(open) = self.contexts.get(&context)
-                    && open.slot.push(event)
+                if let Some(slot) = self.contexts.get(&context).and_then(|open| open.slot)
+                    && slot.push(event)
                 {
                     self.stats.datagrams_dropped += 1;
                 }
@@ -395,12 +431,13 @@ impl<'d, M: RawMutex, T: Tables> Inner<'d, M, T> {
         };
         let _ = self.endpoint.close_context(context.as_bytes(), code);
         #[cfg(feature = "stream")]
-        {
-            self.channels.context_closed(context, code);
-            open.slot.writable.signal(());
+        self.channels.context_closed(context, code);
+        if let Some(slot) = open.slot {
+            #[cfg(feature = "stream")]
+            slot.writable.signal(());
+            slot.with(|state| state.closed = true);
+            slot.ready.signal(());
         }
-        open.slot.with(|state| state.closed = true);
-        open.slot.ready.signal(());
     }
 
     /// The first context whose handle asked for it to be closed.
@@ -408,7 +445,8 @@ impl<'d, M: RawMutex, T: Tables> Inner<'d, M, T> {
         let mut asked = None;
         self.contexts.for_each(|context, open| {
             if asked.is_none()
-                && let Some(code) = open.slot.with(|state| state.close).flatten()
+                && let Some(slot) = open.slot
+                && let Some(code) = slot.with(|state| state.close).flatten()
             {
                 asked = Some((*context, code));
             }
@@ -423,12 +461,41 @@ struct LinkOut {
     len: usize,
 }
 
-/// The state the runner, the handles and the events share. Lives in a slot
-/// the integrator gives (a `static` on a microcontroller).
-pub struct Shared<'d, M: RawMutex, T: Tables, D: Datagrams> {
+/// What the runner reads into, its own for its life: kept in the slot, so
+/// that the runner's task is small.
+struct RunnerBuffers {
+    rx: [u8; OUT_LEN],
+    link_rx: [u8; 512],
+    deframer: Deframer,
+}
+
+/// The node's state, which the runner, the handles and the events share:
+/// built at compile time, in a `static` on a microcontroller, and filled in
+/// place by [`start`], so that nothing of it crosses the stack.
+///
+/// A `static` must be `Sync`, which the slot is when its mutex is, as
+/// `CriticalSectionRawMutex` is:
+///
+/// ```ignore
+/// static SLOT: Slot<'static, CriticalSectionRawMutex, Mcu> = Slot::new();
+/// ```
+///
+/// With `NoopRawMutex`, for one executor, the slot is not `Sync`: it holds
+/// the context slots, which are not either. It goes in a `StaticCell`,
+/// written once from its constant, which the compiler copies straight into
+/// the cell:
+///
+/// ```ignore
+/// static SLOT: StaticCell<Slot<'static, NoopRawMutex, Mcu>> = StaticCell::new();
+/// let slot = SLOT.init_with(|| const { Slot::new() });
+/// ```
+///
+/// `StaticCell::init(Slot::new())` would build it on the stack first: avoid
+/// it. The same holds for a [`ContextSlot`].
+pub struct Slot<'d, M: RawMutex, T: Tables> {
     inner: Mutex<M, Inner<'d, M, T>>,
     link_out: Mutex<M, LinkOut>,
-    datagrams: &'d D,
+    runner: Mutex<M, RunnerBuffers>,
     /// A handle asks the runner to look again.
     wake: Signal<M, ()>,
     /// An event of the node's was queued.
@@ -436,6 +503,78 @@ pub struct Shared<'d, M: RawMutex, T: Tables, D: Datagrams> {
     /// The application read an event: room, perhaps, for a message.
     events_room: Signal<M, ()>,
     link_room: Signal<M, ()>,
+}
+
+impl<M: RawMutex, T: Tables> Default for Slot<'_, M, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'d, M: RawMutex, T: Tables> Slot<'d, M, T> {
+    /// An empty slot, for [`start`] to fill.
+    #[must_use]
+    pub const fn new() -> Self {
+        // A constant: called at run time, it is one copy into its place.
+        Self::EMPTY
+    }
+
+    #[allow(
+        clippy::declare_interior_mutable_const,
+        reason = "each use is a fresh slot, which is what `new` returns"
+    )]
+    const EMPTY: Self = Self {
+        inner: Mutex::new(Inner {
+            endpoint: Endpoint::EMPTY,
+            contexts: <Contexts<'d, M, T> as Table<Name, Open<'d, M>>>::EMPTY,
+            entropy: Checked(None),
+            out: [0; OUT_LEN],
+            events: EventQueue::new(None),
+            relay: Maybe::None,
+            last_from: Maybe::None,
+            report_interfaces: false,
+            stats: Stats::ZERO,
+            #[cfg(feature = "stream")]
+            channels: convesso_stream::Channels::new(),
+            #[cfg(feature = "stream")]
+            frame: [0; convesso_stream::frame::MAX_DATA_LEN],
+        }),
+        link_out: Mutex::new(LinkOut {
+            bytes: [0; MAX_FRAME + 2],
+            len: 0,
+        }),
+        runner: Mutex::new(RunnerBuffers {
+            rx: [0; OUT_LEN],
+            link_rx: [0; 512],
+            deframer: Deframer::EMPTY,
+        }),
+        wake: Signal::new(),
+        events_ready: Signal::new(),
+        events_room: Signal::new(),
+        link_room: Signal::new(),
+    };
+}
+
+/// What the handles hold: the slot, and the socket the integrator gave.
+struct Shared<'d, M: RawMutex, T: Tables, D: Datagrams> {
+    slot: &'d Slot<'d, M, T>,
+    datagrams: &'d D,
+}
+
+impl<M: RawMutex, T: Tables, D: Datagrams> Clone for Shared<'_, M, T, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M: RawMutex, T: Tables, D: Datagrams> Copy for Shared<'_, M, T, D> {}
+
+impl<'d, M: RawMutex, T: Tables, D: Datagrams> core::ops::Deref for Shared<'d, M, T, D> {
+    type Target = Slot<'d, M, T>;
+
+    fn deref(&self) -> &Slot<'d, M, T> {
+        self.slot
+    }
 }
 
 /// How a packet the core output goes.
@@ -472,13 +611,15 @@ fn now() -> Instant {
 /// Starts the driver for `identity`: the handle, the runner to spawn, and the
 /// node's events. It serves no context until the application opens one with
 /// [`Node::context`]. Every buffer is the integrator's: `events` holds the
-/// node's events (they carry no data, so it may be empty), `slot` the shared
-/// state.
+/// node's events (they carry no data, so it may be empty), `slot` the node's
+/// state, which the start fills in place.
 ///
 /// # Errors
 ///
 /// [`StartError::Rng`] before anything else, when the generator cannot be
-/// read; [`StartError::Core`] when the core refuses the relay.
+/// read; [`StartError::SlotInUse`] for a slot that holds a node started
+/// already, which is left as it was; [`StartError::Core`] when the core
+/// refuses the relay.
 #[allow(
     clippy::too_many_arguments,
     reason = "the integrator's parts: identity, sockets, generator, buffers"
@@ -493,9 +634,9 @@ pub fn start<'d, M, T, D, L, I>(
     datagrams: &'d D,
     link: L,
     interfaces: I,
-    rng: &'d mut dyn SecureRng,
+    rng: &'d mut (dyn SecureRng + Send),
     events: &'d mut [u8],
-    slot: &'d mut Option<Shared<'d, M, T, D>>,
+    slot: &'d Slot<'d, M, T>,
 ) -> Result<
     (
         Node<'d, M, T, D>,
@@ -511,51 +652,47 @@ where
     L: Streams,
     I: Interfaces,
 {
-    let entropy = Checked::new(rng).map_err(StartError::Rng)?;
-    let mut endpoint = Endpoint::<T>::new(identity, &[]).map_err(StartError::Core)?;
+    let entropy = Checked::new(Some(rng)).map_err(StartError::Rng)?;
+    // No handle exists for a slot not started, so the locks are free; a
+    // slot started already may be locked, or holds an identity.
+    let (Ok(mut inner), Ok(buffers)) = (slot.inner.try_lock(), slot.runner.try_lock()) else {
+        return Err(StartError::SlotInUse);
+    };
+    if inner.endpoint.identity().is_some() {
+        return Err(StartError::SlotInUse);
+    }
+    let address = *identity.address();
+    // Filled in place, field by field: the endpoint's configuration first,
+    // and its identity last, once nothing can fail.
     if let Some(relay) = config.relay {
-        endpoint
+        inner
+            .endpoint
             .pin_relay(relay.address, now())
             .map_err(StartError::Core)?;
-        endpoint.set_relay_families(relay.primary.is_ipv6(), relay.other.is_some());
+        inner
+            .endpoint
+            .set_relay_families(relay.primary.is_ipv6(), relay.other.is_some());
     }
-    endpoint.set_local_addresses(&local_addresses(&interfaces, datagrams.local_port()).0[..]);
-    let shared = &*slot.insert(Shared {
-        inner: Mutex::new(Inner {
-            endpoint,
-            contexts: Default::default(),
-            entropy,
-            out: [0; OUT_LEN],
-            events: EventQueue::new(events),
-            relay: config.relay,
-            last_from: None,
-            report_interfaces: false,
-            stats: Stats::default(),
-            #[cfg(feature = "stream")]
-            channels: convesso_stream::Channels::new(),
-            #[cfg(feature = "stream")]
-            frame: [0; convesso_stream::frame::MAX_DATA_LEN],
-        }),
-        link_out: Mutex::new(LinkOut {
-            bytes: [0; MAX_FRAME + 2],
-            len: 0,
-        }),
-        datagrams,
-        wake: Signal::new(),
-        events_ready: Signal::new(),
-        events_room: Signal::new(),
-        link_room: Signal::new(),
-    });
+    inner
+        .endpoint
+        .set_local_addresses(&local_addresses(&interfaces, datagrams.local_port()).0[..]);
+    inner
+        .endpoint
+        .start(identity, &[])
+        .map_err(StartError::Core)?;
+    inner.entropy = entropy;
+    inner.events.reset(events);
+    inner.relay = config.relay.into();
+    drop(inner);
+    let shared = Shared { slot, datagrams };
     Ok((
-        Node { shared },
+        Node { shared, address },
         Runner {
             shared,
             link,
             interfaces,
             link_state: LinkState::Closed,
-            deframer: Deframer::default(),
-            rx: [0; OUT_LEN],
-            link_rx: [0; 512],
+            buffers,
             link_pending: (0, 0),
         },
         Events { shared },
@@ -584,7 +721,8 @@ fn local_addresses<I: Interfaces>(interfaces: &I, port: u16) -> Locals {
 
 /// The application's handle on the node: cheap to copy.
 pub struct Node<'d, M: RawMutex, T: Tables, D: Datagrams> {
-    shared: &'d Shared<'d, M, T, D>,
+    shared: Shared<'d, M, T, D>,
+    address: Address,
 }
 
 impl<M: RawMutex, T: Tables, D: Datagrams> Clone for Node<'_, M, T, D> {
@@ -597,8 +735,8 @@ impl<M: RawMutex, T: Tables, D: Datagrams> Copy for Node<'_, M, T, D> {}
 
 impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
     /// This node's address, which peers send to.
-    pub async fn address(&self) -> Address {
-        *self.shared.inner.lock().await.endpoint.identity().address()
+    pub fn address(&self) -> Address {
+        self.address
     }
 
     /// Opens the context `name` while the node runs: serves it under the
@@ -655,7 +793,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
             Access::DialOnly => (None, None),
         };
         let open = Open {
-            slot,
+            slot: Some(slot),
             policy,
             #[cfg(feature = "stream")]
             max_message: largest,
@@ -690,12 +828,13 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
             let _ = inner.endpoint.close_context(name, DROPPED);
             return Err(NodeError::Message(error));
         }
+        // Filled in place: the slot's queue is emptied and given its buffer.
         slot.state.lock(|state| {
-            *state.borrow_mut() = Some(SlotState {
-                events: EventQueue::new(events),
-                close: None,
-                closed: false,
-            });
+            let mut state = state.borrow_mut();
+            state.events.reset(events);
+            state.close = None;
+            state.closed = false;
+            state.open = true;
         });
         drop(guard);
         Ok((
@@ -772,7 +911,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
                 .endpoint
                 .set_relay_families(location.primary.is_ipv6(), location.other.is_some());
         }
-        inner.relay = relay;
+        inner.relay = relay.into();
         drop(inner);
         self.shared.wake.signal(());
         Ok(())
@@ -877,7 +1016,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Node<'d, M, T, D> {
 
     /// The pinned relay, as the node was last given it; `None` without one.
     pub async fn relay(&self) -> Option<RelayLocation> {
-        self.shared.inner.lock().await.relay
+        self.shared.inner.lock().await.relay.get()
     }
 
     /// Sets how long the relay link may stay silent before a keep-alive: 60
@@ -906,7 +1045,7 @@ enum Op<'a> {
 
 /// The node's own events, in order.
 pub struct Events<'d, M: RawMutex, T: Tables, D: Datagrams> {
-    shared: &'d Shared<'d, M, T, D>,
+    shared: Shared<'d, M, T, D>,
 }
 
 impl<M: RawMutex, T: Tables, D: Datagrams> Events<'_, M, T, D> {
@@ -926,7 +1065,7 @@ impl<M: RawMutex, T: Tables, D: Datagrams> Events<'_, M, T, D> {
 /// [`ContextEvents`] carry its events alone. Dropping it closes the context,
 /// as [`Self::close_context`] does with [`DROPPED`].
 pub struct Context<'d, M: RawMutex, T: Tables, D: Datagrams> {
-    shared: &'d Shared<'d, M, T, D>,
+    shared: Shared<'d, M, T, D>,
     name: Name,
     slot: &'d ContextSlot<'d, M>,
 }
@@ -957,7 +1096,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
 
     /// The lock on the core, while the context is open.
     async fn open(&self) -> Result<MutexGuard<'d, M, Inner<'d, M, T>>, NodeError> {
-        let guard = self.shared.inner.lock().await;
+        let guard = self.shared.slot.inner.lock().await;
         if guard.contexts.get(&self.name).is_none() {
             return Err(NodeError::ContextClosed);
         }
@@ -1086,7 +1225,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
         match output {
             Output::Transmit { to, len } => {
                 let packet = inner.out.get(..len).unwrap_or_default();
-                match plan(inner.relay.as_ref(), inner.last_from, to) {
+                match plan(inner.relay.as_ref(), inner.last_from.get(), to) {
                     Plan::Udp(at) => {
                         inner
                             .stats
@@ -1122,7 +1261,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
     /// The link's outgoing slot, once it is free.
     async fn link_out(&self) -> MutexGuard<'d, M, LinkOut> {
         loop {
-            let link_out = self.shared.link_out.lock().await;
+            let link_out = self.shared.slot.link_out.lock().await;
             if link_out.len == 0 {
                 return link_out;
             }
@@ -1144,7 +1283,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
                 .close(peer, self.name.as_bytes(), code, now(), &mut inner.out)
         {
             let packet = inner.out.get(..len).unwrap_or_default();
-            match plan(inner.relay.as_ref(), inner.last_from, to) {
+            match plan(inner.relay.as_ref(), inner.last_from.get(), to) {
                 Plan::Udp(at) | Plan::UdpAndTcp(at) => {
                     inner
                         .stats
@@ -1263,7 +1402,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
 
 /// A context's events, in order.
 pub struct ContextEvents<'d, M: RawMutex, T: Tables, D: Datagrams> {
-    shared: &'d Shared<'d, M, T, D>,
+    shared: Shared<'d, M, T, D>,
     slot: &'d ContextSlot<'d, M>,
 }
 
@@ -1284,13 +1423,14 @@ impl<M: RawMutex, T: Tables, D: Datagrams> ContextEvents<'_, M, T, D> {
             }
             self.slot.ready.wait().await;
         }
-        let popped = self
-            .slot
-            .state
-            .lock(|state| match state.borrow_mut().as_mut() {
-                Some(state) => state.events.pop(buf),
-                None => None,
-            });
+        let popped = self.slot.state.lock(|state| {
+            let mut state = state.borrow_mut();
+            if state.open {
+                state.events.pop(buf)
+            } else {
+                None
+            }
+        });
         self.shared.events_room.signal(());
         match popped {
             Some(Event::Context(event)) => Some(event),
@@ -1308,13 +1448,12 @@ enum LinkState {
 
 /// The driver's task: spawn [`Runner::run`] from a task of the integrator's.
 pub struct Runner<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces> {
-    shared: &'d Shared<'d, M, T, D>,
+    shared: Shared<'d, M, T, D>,
     link: L,
     interfaces: I,
     link_state: LinkState,
-    deframer: Deframer,
-    rx: [u8; OUT_LEN],
-    link_rx: [u8; 512],
+    /// What it reads into, in the slot, held for the runner's life.
+    buffers: MutexGuard<'d, M, RunnerBuffers>,
     /// The link's bytes read and not yet given to the deframer.
     link_pending: (usize, usize),
 }
@@ -1366,15 +1505,15 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
     /// whatever the application reads.
     async fn wait(&mut self, deadline: Option<Instant>) -> Woken {
         let link_idle = self.link_pending.0 >= self.link_pending.1;
-        let relay = self.shared.inner.lock().await.relay;
+        let relay = self.shared.inner.lock().await.relay.get();
         let Self {
             shared,
             link,
             link_state,
-            rx,
-            link_rx,
+            buffers,
             ..
         } = self;
+        let RunnerBuffers { rx, link_rx, .. } = &mut **buffers;
         let datagrams = shared.datagrams;
         let recv = datagrams.recv_from(rx);
         let link_op = async {
@@ -1409,11 +1548,11 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         let from = canonical(from);
         let mut guard = self.shared.inner.lock().await;
         let inner = &mut *guard;
-        inner.last_from = Some(from);
+        inner.last_from = Maybe::Some(from);
         let is_relay = inner
             .relay
             .is_some_and(|relay| relay.primary == from || relay.other == Some(from));
-        let packet = self.rx.get_mut(..len).unwrap_or_default();
+        let packet = self.buffers.rx.get_mut(..len).unwrap_or_default();
         let output = if is_relay {
             with_policies!(inner, handle_relay_packet(packet, Link::Udp, now()))
         } else {
@@ -1439,7 +1578,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
 
     /// Carries out one output of a handled packet.
     async fn execute(
-        shared: &'d Shared<'d, M, T, D>,
+        shared: Shared<'d, M, T, D>,
         link: &mut L,
         link_state: &mut LinkState,
         inner: &mut Inner<'d, M, T>,
@@ -1447,7 +1586,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
     ) {
         match output {
             Output::Transmit { to, len } => {
-                let plan = plan(inner.relay.as_ref(), inner.last_from, to);
+                let plan = plan(inner.relay.as_ref(), inner.last_from.get(), to);
                 Self::carry(shared, link, link_state, inner, plan, len).await;
             }
             #[cfg(feature = "stream")]
@@ -1490,7 +1629,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
 
     /// Sends `inner.out[..len]` as `plan` says.
     async fn carry(
-        shared: &'d Shared<'d, M, T, D>,
+        shared: Shared<'d, M, T, D>,
         link: &mut L,
         link_state: &mut LinkState,
         inner: &mut Inner<'d, M, T>,
@@ -1509,13 +1648,13 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         }
         let bytes_ok = match plan {
             Plan::Tcp | Plan::UdpAndTcp(_) if *link_state == LinkState::Open => {
-                let mut framed = [0u8; MAX_FRAME + 2];
-                match framing::frame(packet, &mut framed) {
-                    Some(n) => {
+                match framing::prefix(packet) {
+                    Some(prefix) => {
                         inner.stats.link_frames_sent += 1;
-                        link.write_all(framed.get(..n).unwrap_or_default())
-                            .await
-                            .is_ok()
+                        // The frame's prefix, then the packet from where it
+                        // lies: one stream, and no copy of it on the stack.
+                        link.write_all(&prefix).await.is_ok()
+                            && link.write_all(packet).await.is_ok()
                     }
                     None => true,
                 }
@@ -1562,9 +1701,10 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             let contexts = &inner.contexts;
             let deliver = |context: &Name| {
                 contexts.get(context).is_some_and(|open| {
-                    open.slot
-                        .with(|state| state.events.deliverable(open.max_message))
-                        .unwrap_or(false)
+                    open.slot.is_some_and(|slot| {
+                        slot.with(|state| state.events.deliverable(open.max_message))
+                            .unwrap_or(false)
+                    })
                 })
             };
             let output = match inner.channels.poll_with(now(), deliver, &mut inner.frame) {
@@ -1608,9 +1748,8 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     context,
                     data,
                 }) => {
-                    if let Some(open) = inner.contexts.get(&context) {
-                        open.slot
-                            .push(Event::Context(ContextEvent::Message { peer, data }));
+                    if let Some(slot) = inner.contexts.get(&context).and_then(|open| open.slot) {
+                        slot.push(Event::Context(ContextEvent::Message { peer, data }));
                     }
                     None
                 }
@@ -1619,15 +1758,14 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                     context,
                     reason,
                 }) => {
-                    if let Some(open) = inner.contexts.get(&context) {
-                        open.slot
-                            .push(Event::Context(ContextEvent::ChannelReset { peer, reason }));
+                    if let Some(slot) = inner.contexts.get(&context).and_then(|open| open.slot) {
+                        slot.push(Event::Context(ContextEvent::ChannelReset { peer, reason }));
                     }
                     None
                 }
                 StreamPoll::Event(StreamEvent::Writable { context, .. }) => {
-                    if let Some(open) = inner.contexts.get(&context) {
-                        open.slot.writable.signal(());
+                    if let Some(slot) = inner.contexts.get(&context).and_then(|open| open.slot) {
+                        slot.writable.signal(());
                     }
                     None
                 }
@@ -1636,7 +1774,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             };
             worked = true;
             if let Some(Output::Transmit { to, len }) = output {
-                let plan = plan(inner.relay.as_ref(), inner.last_from, to);
+                let plan = plan(inner.relay.as_ref(), inner.last_from.get(), to);
                 Self::carry(
                     self.shared,
                     &mut self.link,
@@ -1658,7 +1796,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
             let poll = with_policies!(inner, poll(now()));
             match poll {
                 Poll::Transmit { to, len } => {
-                    let plan = plan(inner.relay.as_ref(), inner.last_from, to);
+                    let plan = plan(inner.relay.as_ref(), inner.last_from.get(), to);
                     Self::carry(
                         self.shared,
                         &mut self.link,
@@ -1696,7 +1834,7 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
         let mut inner = self.shared.inner.lock().await;
         if opened {
             self.link_state = LinkState::Open;
-            self.deframer = Deframer::default();
+            self.buffers.deframer.reset();
             self.link_pending = (0, 0);
             inner.endpoint.relay_link_opened(now());
         } else {
@@ -1723,9 +1861,12 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
     async fn deframe(&mut self) {
         while self.link_pending.0 < self.link_pending.1 {
             let (start, end) = self.link_pending;
-            let (used, result) = self
-                .deframer
-                .feed(self.link_rx.get(start..end).unwrap_or_default());
+            let RunnerBuffers {
+                rx,
+                link_rx,
+                deframer,
+            } = &mut *self.buffers;
+            let (used, result) = deframer.feed(link_rx.get(start..end).unwrap_or_default());
             self.link_pending.0 = start + used;
             match result {
                 Deframed::NeedMore => break,
@@ -1743,12 +1884,12 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams, L: Streams, I: Interfaces>
                 }
                 Deframed::Packet(packet) => {
                     let len = packet.len();
-                    if let Some(rx) = self.rx.get_mut(..len) {
-                        rx.copy_from_slice(packet);
+                    if let Some(slot) = rx.get_mut(..len) {
+                        slot.copy_from_slice(packet);
                     }
-                    let mut guard = self.shared.inner.lock().await;
+                    let mut guard = self.shared.slot.inner.lock().await;
                     let inner = &mut *guard;
-                    let packet = self.rx.get_mut(..len).unwrap_or_default();
+                    let packet = rx.get_mut(..len).unwrap_or_default();
                     let output =
                         with_policies!(inner, handle_relay_packet(packet, Link::Tcp, now()));
                     Self::execute(

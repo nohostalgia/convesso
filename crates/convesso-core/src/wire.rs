@@ -116,6 +116,9 @@ pub fn carried_mac1(packet: &[u8]) -> Option<Mac> {
 pub struct Mac1Key([u8; 32]);
 
 impl Mac1Key {
+    /// No key: a responder without an identity holds it, and answers nothing.
+    pub(crate) const EMPTY: Self = Self([0; 32]);
+
     /// The `mac1` key of the responder whose Ed25519 address is `address`.
     #[must_use]
     pub fn for_address(address: &[u8; 32]) -> Self {

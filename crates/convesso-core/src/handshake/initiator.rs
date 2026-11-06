@@ -32,6 +32,7 @@ use super::{
 use crate::dos::{self, COOKIE_LIFETIME, Cookie};
 use crate::identity::{Address, Identity, PeerId};
 use crate::noise::{self, Completed, InitiatorAwaiting};
+use crate::storage::Maybe;
 use crate::time::Instant;
 use crate::wire::{
     self, Classified, Mac, Mac1Key, PendingFirstContact, UnsupportedVersion, Version,
@@ -170,9 +171,11 @@ pub struct Dial {
     context: Context,
     psk: Psk,
     started: Instant,
-    attempts: [Option<Attempt>; ATTEMPT_OFFSETS.len()],
+    attempts: [Maybe<Attempt>; ATTEMPT_OFFSETS.len()],
     sent: usize,
-    over: bool,
+    /// Whether it is in progress: opened, not yet over. False in an empty
+    /// dial, which sends nothing (`DESIGN.md §2`).
+    live: bool,
     cookie: Option<(Cookie, Instant)>,
     /// The next attempt is due at this instant instead of at its offset: the
     /// peer was given new address hints (`PROTOCOL.md §3`).
@@ -180,6 +183,25 @@ pub struct Dial {
     /// Whether it renews keys the initiator holds: its first contacts are of
     /// type `0x06`, and carry no payload.
     renewal: bool,
+}
+
+impl crate::storage::Empty for Dial {
+    /// A dial to nobody, not live: what the dials' table makes in its own
+    /// room before [`Dial::open`] fills it. It sends nothing, and is all zero
+    /// bytes (`DESIGN.md §2`).
+    const EMPTY: Self = Self {
+        remote: Address::UNSET,
+        mac1_key: Mac1Key::EMPTY,
+        context: Context::EMPTY,
+        psk: NO_PSK,
+        started: Instant::from_millis(0),
+        attempts: [const { Maybe::None }; ATTEMPT_OFFSETS.len()],
+        sent: 0,
+        live: false,
+        cookie: None,
+        hurry: None,
+        renewal: false,
+    };
 }
 
 impl Dial {
@@ -272,24 +294,57 @@ impl Dial {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Result<(Self, usize), DialError> {
-        if payload.len() > MAX_PAYLOAD || out.len() < super::FIRST_CONTACT_LEN + payload.len() {
+        if !Self::fits(payload.len(), out.len()) {
             return Err(DialError::PayloadTooLong);
         }
-        let mut dial = Self {
-            remote: *remote,
-            mac1_key: Mac1Key::for_address(remote.as_bytes()),
-            context: Context::new(context).map_err(DialError::ContextTooLong)?,
-            psk: psk.unwrap_or(NO_PSK),
-            started: now,
-            attempts: [const { None }; ATTEMPT_OFFSETS.len()],
-            sent: 0,
-            over: false,
-            cookie: None,
-            hurry: None,
-            renewal,
-        };
-        let len = dial.send_attempt(identity, payload, now, entropy, out);
+        let context = Context::new(context).map_err(DialError::ContextTooLong)?;
+        let mut dial = <Self as crate::storage::Empty>::EMPTY;
+        dial.open(remote, context, psk, renewal, now);
+        let len = dial.first_attempt(identity, payload, now, entropy, out);
         Ok((dial, len))
+    }
+
+    /// Whether a first contact with a payload of `payload` bytes fits
+    /// [`MAX_PAYLOAD`] and an output of `out` bytes.
+    pub(crate) const fn fits(payload: usize, out: usize) -> bool {
+        payload <= MAX_PAYLOAD && out >= super::FIRST_CONTACT_LEN + payload
+    }
+
+    /// Makes this dial, in place, one to `remote` in `context` that has sent
+    /// nothing yet; [`Self::first_attempt`] sends its first contact.
+    pub(crate) fn open(
+        &mut self,
+        remote: &Address,
+        context: Context,
+        psk: Option<Psk>,
+        renewal: bool,
+        now: Instant,
+    ) {
+        self.remote = *remote;
+        self.mac1_key = Mac1Key::for_address(remote.as_bytes());
+        self.context = context;
+        self.psk = psk.unwrap_or(NO_PSK);
+        self.started = now;
+        self.attempts = [const { Maybe::None }; ATTEMPT_OFFSETS.len()];
+        self.sent = 0;
+        self.live = true;
+        self.cookie = None;
+        self.hurry = None;
+        self.renewal = renewal;
+    }
+
+    /// Writes the first contact of a dial made by [`Self::unsent`] in
+    /// `out[..len]`, carrying `payload` unless it is a renewal, and returns
+    /// `len`. The payload and `out` are those [`Self::fits`] accepted.
+    pub(crate) fn first_attempt(
+        &mut self,
+        identity: &Identity,
+        payload: &[u8],
+        now: Instant,
+        entropy: &mut impl Entropy,
+        out: &mut [u8],
+    ) -> usize {
+        self.send_attempt(identity, payload, now, entropy, out)
     }
 
     /// What to do at `now`: send a retry, wait, or give up.
@@ -314,7 +369,7 @@ impl Dial {
         out: &mut [u8],
     ) -> DialPoll {
         let give_up = self.started.saturating_add(GIVE_UP_AFTER);
-        if self.over || now >= give_up {
+        if !self.live || now >= give_up {
             self.finish();
             return DialPoll::Failed(DialError::NoResponse);
         }
@@ -333,7 +388,7 @@ impl Dial {
 
     /// Handles a packet received at `now`.
     pub fn handle(&mut self, identity: &Identity, packet: &[u8], now: Instant) -> DialEvent {
-        if self.over {
+        if !self.live {
             return DialEvent::Ignored;
         }
         if now >= self.started.saturating_add(GIVE_UP_AFTER) {
@@ -512,7 +567,7 @@ impl Dial {
             return 0;
         };
         if let Some(slot) = self.attempts.get_mut(attempt) {
-            *slot = Some(Attempt {
+            *slot = Maybe::Some(Attempt {
                 index,
                 mac1,
                 awaiting,
@@ -522,8 +577,8 @@ impl Dial {
     }
 
     fn finish(&mut self) {
-        self.over = true;
-        self.attempts = [const { None }; ATTEMPT_OFFSETS.len()];
+        self.live = false;
+        self.attempts = [const { Maybe::None }; ATTEMPT_OFFSETS.len()];
     }
 
     /// When the dial started.
@@ -545,7 +600,7 @@ impl Dial {
     /// When [`Self::poll`] next has something to do, or `None` once the dial is
     /// over. Asking changes nothing.
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        if self.over {
+        if !self.live {
             return None;
         }
         let give_up = self.started.saturating_add(GIVE_UP_AFTER);
@@ -561,7 +616,7 @@ impl Dial {
     /// keep their offsets; a dial with its four attempts sent sends nothing
     /// more.
     pub(crate) fn hurry(&mut self, now: Instant) {
-        if !self.over && self.sent > 0 && self.sent < ATTEMPT_OFFSETS.len() {
+        if self.live && self.sent > 0 && self.sent < ATTEMPT_OFFSETS.len() {
             self.hurry = Some(now);
         }
     }

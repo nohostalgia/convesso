@@ -15,6 +15,7 @@ use core::time::Duration;
 
 use convesso_core::handshake::{DialError, Entropy};
 use convesso_core::identity::Address;
+use convesso_core::storage::{Empty, Maybe};
 use convesso_core::time::Instant;
 
 use crate::config::{Arena, ByteQueue, Slots, StreamConfig};
@@ -86,6 +87,29 @@ pub struct Stored {
     /// With FIRST, the message's length; otherwise 0.
     length: u32,
     last: bool,
+}
+
+impl Empty for Sent {
+    const EMPTY: Self = Self {
+        at: 0,
+        len: 0,
+        length: 0,
+        last: false,
+        sent_at: Instant::from_millis(0),
+        retransmitted: false,
+        sacked: false,
+        lost: false,
+    };
+}
+
+impl Empty for Stored {
+    const EMPTY: Self = Self {
+        seq: 0,
+        at: 0,
+        len: 0,
+        length: 0,
+        last: false,
+    };
 }
 
 /// Why a channel was reset.
@@ -233,9 +257,9 @@ pub(crate) struct Channel<C: StreamConfig> {
     cwnd: usize,
     ssthresh: usize,
     recovery_until: Option<u32>,
-    srtt: Option<Duration>,
+    srtt: Maybe<Duration>,
     rttvar: Duration,
-    latest_rtt: Option<Duration>,
+    latest_rtt: Maybe<Duration>,
     rto: Duration,
     rto_deadline: Option<Instant>,
     /// When a fragment overtaken by a later acknowledged one becomes lost by
@@ -282,74 +306,88 @@ pub(crate) struct Channel<C: StreamConfig> {
     /// The peer's incarnation this side reset on its own: its frames are
     /// answered with RESET, in case the first answer was lost.
     given_up: Option<Incarnation>,
-    event: Option<Reason>,
+    event: Maybe<Reason>,
     ever_reset: bool,
 
     /// Its entry in the index of deadlines.
     pub(crate) indexed: Option<Instant>,
 }
 
+impl<C: StreamConfig> Empty for Channel<C> {
+    /// A channel holding nothing, not yet opened: what the channels' table
+    /// makes in its own room, all zero bytes (`DESIGN.md §2`), before
+    /// [`Channel::open`] gives it its starting state and its context's
+    /// limits.
+    const EMPTY: Self = Self {
+        address: None,
+        send_incarnation: None,
+        acked_any: false,
+        queue: C::SendQueue::EMPTY,
+        lengths: C::Lengths::EMPTY,
+        popped: 0,
+        in_flight: C::InFlight::EMPTY,
+        una: 0,
+        next_seq: 0,
+        next_msg: 0,
+        next_off: 0,
+        next_abs: 0,
+        cwnd: 0,
+        ssthresh: 0,
+        recovery_until: None,
+        srtt: Maybe::None,
+        rttvar: Duration::ZERO,
+        latest_rtt: Maybe::None,
+        rto: Duration::ZERO,
+        rto_deadline: None,
+        loss_deadline: None,
+        probe_deadline: None,
+        probe_now: false,
+        probe_backoff: Duration::ZERO,
+        waiting_since: None,
+        peer_window: 0,
+        peer_max: None,
+        blocked: false,
+        writable: false,
+        keys_retry: None,
+        keys_backoff: Duration::ZERO,
+        dialled: false,
+        dial_due: false,
+        receive_incarnation: None,
+        rcv_next: 0,
+        arena: C::ReceiveArena::EMPTY,
+        asm_len: 0,
+        asm_length: None,
+        early: C::Stored::EMPTY,
+        early_len: 0,
+        ready: None,
+        delivered: false,
+        credit: None,
+        max_message: 0,
+        unacked: 0,
+        ack_now: false,
+        ack_deadline: None,
+        advertised_closed: false,
+        retired: [None; RETIRED],
+        reset_answer: None,
+        answered: [None; 2],
+        given_up: None,
+        event: Maybe::None,
+        ever_reset: false,
+        indexed: None,
+    };
+}
+
 impl<C: StreamConfig> Channel<C> {
-    /// A channel taking messages up to `max_message`; with `credit`, it
-    /// hands out nothing until credit is granted.
-    pub(crate) fn new(credit: bool, max_message: usize) -> Self {
-        Self {
-            address: None,
-            send_incarnation: None,
-            acked_any: false,
-            queue: C::SendQueue::default(),
-            lengths: C::Lengths::default(),
-            popped: 0,
-            in_flight: C::InFlight::default(),
-            una: 0,
-            next_seq: 0,
-            next_msg: 0,
-            next_off: 0,
-            next_abs: 0,
-            cwnd: INITIAL_WINDOW * MSS,
-            ssthresh: usize::MAX,
-            recovery_until: None,
-            srtt: None,
-            rttvar: Duration::ZERO,
-            latest_rtt: None,
-            rto: INITIAL_RTO,
-            rto_deadline: None,
-            loss_deadline: None,
-            probe_deadline: None,
-            probe_now: false,
-            probe_backoff: INITIAL_RTO,
-            waiting_since: None,
-            peer_window: INITIAL_PEER_WINDOW,
-            peer_max: None,
-            blocked: false,
-            writable: false,
-            keys_retry: None,
-            keys_backoff: KEYS_RETRY,
-            dialled: false,
-            dial_due: false,
-            receive_incarnation: None,
-            rcv_next: 0,
-            arena: C::ReceiveArena::default(),
-            asm_len: 0,
-            asm_length: None,
-            early: C::Stored::default(),
-            early_len: 0,
-            ready: None,
-            delivered: false,
-            credit: credit.then_some(0),
-            max_message: max_message.min(C::MAX_MESSAGE),
-            unacked: 0,
-            ack_now: false,
-            ack_deadline: None,
-            advertised_closed: false,
-            retired: [None; RETIRED],
-            reset_answer: None,
-            answered: [None; 2],
-            given_up: None,
-            event: None,
-            ever_reset: false,
-            indexed: None,
-        }
+    /// Opens a channel made empty: the starting state of its congestion
+    /// control and windows, and its context's limits.
+    pub(crate) fn open(&mut self, credit: bool, max_message: usize) {
+        self.cwnd = INITIAL_WINDOW * MSS;
+        self.ssthresh = usize::MAX;
+        self.rto = INITIAL_RTO;
+        self.probe_backoff = INITIAL_RTO;
+        self.peer_window = INITIAL_PEER_WINDOW;
+        self.keys_backoff = KEYS_RETRY;
+        self.set_limits(credit, max_message);
     }
 
     pub(crate) fn set_address(&mut self, address: Address) {
@@ -691,16 +729,16 @@ impl<C: StreamConfig> Channel<C> {
 
     fn sample_rtt(&mut self, now: Instant, sent_at: Instant) {
         let r = Duration::from_millis(now.as_millis().saturating_sub(sent_at.as_millis()));
-        self.latest_rtt = Some(r);
+        self.latest_rtt = Maybe::Some(r);
         match self.srtt {
-            None => {
-                self.srtt = Some(r);
+            Maybe::None => {
+                self.srtt = Maybe::Some(r);
                 self.rttvar = r / 2;
             }
-            Some(srtt) => {
+            Maybe::Some(srtt) => {
                 let delta = srtt.abs_diff(r);
                 self.rttvar = self.rttvar * 3 / 4 + delta / 4;
-                self.srtt = Some(srtt * 7 / 8 + r / 8);
+                self.srtt = Maybe::Some(srtt * 7 / 8 + r / 8);
             }
         }
         self.rto = self.computed_rto();
@@ -1257,7 +1295,7 @@ impl<C: StreamConfig> Channel<C> {
 
         self.ever_reset = true;
         if self.event.is_none() && had {
-            self.event = Some(reason);
+            self.event = Maybe::Some(reason);
         }
     }
 
@@ -1270,7 +1308,7 @@ impl<C: StreamConfig> Channel<C> {
         // A reset already waiting to be reported is still reported.
         let pending = self.event.take();
         self.reset(Reason::ResetByPeer);
-        self.event = pending;
+        self.event = pending.into();
         if let Some(incarnation) = peer {
             self.given_up = Some(incarnation);
             self.answer_reset(incarnation, now);

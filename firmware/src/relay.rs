@@ -15,6 +15,8 @@ use convesso_core::relay::{self, Frame, Link};
 use convesso_core::storage::Mcu;
 use convesso_core::time::Instant;
 
+use static_cell::StaticCell;
+
 use crate::handshake::{AcceptAll, Sequence, hex32};
 
 const RELAY_SCALAR: [u8; 32] =
@@ -98,7 +100,7 @@ fn deliver<'a>(
     )
     .ok()?;
     let Ok(Output::Transmit { len, .. }) = relay_ep.send(
-        Target::Peer(client.identity().peer_id()),
+        Target::Peer(client.identity()?.peer_id()),
         relay::CONTEXT,
         frame.get(..len)?,
         1500,
@@ -129,11 +131,19 @@ fn run() -> Option<()> {
     let (client_identity, client_address) = identity(CLIENT_SCALAR, CLIENT_ADDRESS)?;
     let (peer_identity, peer_address) = identity(PEER_SCALAR, PEER_ADDRESS)?;
     let now = Instant::from_millis(black_box(0));
-    let mut relay_ep = Endpoint::<Mcu>::new(relay_identity, &[]).ok()?;
+    // Each endpoint built at compile time and started in place, as a device
+    // keeps one: none crosses the stack.
+    static RELAY: StaticCell<Endpoint<Mcu>> = StaticCell::new();
+    static CLIENT: StaticCell<Endpoint<Mcu>> = StaticCell::new();
+    static PEER: StaticCell<Endpoint<Mcu>> = StaticCell::new();
+    let relay_ep = RELAY.init_with(|| const { Endpoint::EMPTY });
+    relay_ep.start(relay_identity, &[]).ok()?;
     relay_ep.serve_relay_context().ok()?;
-    let mut client = Endpoint::<Mcu>::new(client_identity, &[b"session"]).ok()?;
+    let client = CLIENT.init_with(|| const { Endpoint::EMPTY });
+    client.start(client_identity, &[b"session"]).ok()?;
     client.pin_relay(relay_address, now).ok()?;
-    let mut peer = Endpoint::<Mcu>::new(peer_identity, &[b"session"]).ok()?;
+    let peer = PEER.init_with(|| const { Endpoint::EMPTY });
+    peer.start(peer_identity, &[b"session"]).ok()?;
     let (mut er, mut ec, mut ep) = (
         Sequence(black_box(5)),
         Sequence(black_box(6)),
@@ -161,13 +171,7 @@ fn run() -> Option<()> {
         return None;
     };
     wire.get_mut(..302)?.copy_from_slice(out.get(..302)?);
-    let first = relay_receives(
-        &mut relay_ep,
-        wire.get_mut(..302)?,
-        now,
-        &mut er,
-        &mut carried,
-    )?;
+    let first = relay_receives(relay_ep, wire.get_mut(..302)?, now, &mut er, &mut carried)?;
     // The relay's response, then the client's confirmation.
     let Poll::Transmit { len, .. } = relay_ep.poll(now, &mut AcceptAll, &mut er, &mut wire) else {
         return None;
@@ -216,8 +220,8 @@ fn run() -> Option<()> {
     let response = out;
     let mut client_out = [0u8; 2048];
     let Some(Output::Event(Event::Connected { .. })) = deliver(
-        &mut relay_ep,
-        &mut client,
+        relay_ep,
+        client,
         &peer_address,
         response.get(..len)?,
         now,
@@ -247,13 +251,7 @@ fn run() -> Option<()> {
         return None;
     };
     wire.get_mut(..len)?.copy_from_slice(out.get(..len)?);
-    let carried_len = relay_receives(
-        &mut relay_ep,
-        wire.get_mut(..len)?,
-        now,
-        &mut er,
-        &mut carried,
-    )?;
+    let carried_len = relay_receives(relay_ep, wire.get_mut(..len)?, now, &mut er, &mut carried)?;
     packet
         .get_mut(..carried_len)?
         .copy_from_slice(carried.get(..carried_len)?);
@@ -290,8 +288,8 @@ fn run() -> Option<()> {
         relayed: true,
         ..
     })) = deliver(
-        &mut relay_ep,
-        &mut client,
+        relay_ep,
+        client,
         &peer_address,
         reply.get(..len)?,
         now,

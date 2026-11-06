@@ -401,6 +401,8 @@ impl<P: Policy> Admission for Admitting<'_, P> {
 /// A relay.
 pub struct Relay<P, E> {
     endpoint: Endpoint<Server>,
+    /// The relay's own address, which its endpoint holds too.
+    address: Address,
     policy: P,
     entropy: E,
     config: Config,
@@ -448,10 +450,12 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         config: Config,
         now: Instant,
     ) -> Result<Self, ResponderError> {
+        let address = *identity.address();
         let mut endpoint = Endpoint::new(identity, &[])?;
         endpoint.serve_relay_context()?;
         Ok(Self {
             endpoint,
+            address,
             policy,
             entropy,
             config,
@@ -474,7 +478,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
     /// The relay's address, which clients pin.
     #[must_use]
     pub fn address(&self) -> Address {
-        *self.endpoint.identity().address()
+        self.address
     }
 
     /// The next thing to do, if any.

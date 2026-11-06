@@ -20,7 +20,7 @@
 //!                  one per 30 s
 //! ```
 
-use core::net::{IpAddr, Ipv6Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use super::{Context, Endpoint, Event, Hop, Key, PeerId, Poll};
@@ -31,7 +31,7 @@ use crate::paths::{
     DIRECT_FRESH_FOR, Direct, MAX_CANDIDATES, Nonce, PathInfo, PathKind, PeerPaths,
 };
 use crate::session::{KeyPair, Session};
-use crate::storage::{Config, Table};
+use crate::storage::{Config, Maybe, Table};
 use crate::time::Instant;
 use crate::transport::{self, ReplayWindow, inner};
 
@@ -65,11 +65,11 @@ impl core::error::Error for ExcludeError {}
 pub(crate) struct Own {
     local: [SocketAddr; MAX_CANDIDATES],
     local_len: u8,
-    public_v4: Option<SocketAddr>,
-    public_v6: Option<SocketAddr>,
+    public_v4: Maybe<SocketAddr>,
+    public_v6: Maybe<SocketAddr>,
     /// Addresses a peer saw this endpoint at that nothing else names.
-    seen_v4: Option<SocketAddr>,
-    seen_v6: Option<SocketAddr>,
+    seen_v4: Maybe<SocketAddr>,
+    seen_v6: Maybe<SocketAddr>,
     /// The list peers are sent, with its generation.
     pub(crate) list: CandidateList,
 }
@@ -77,12 +77,14 @@ pub(crate) struct Own {
 impl Own {
     pub(crate) const fn new() -> Self {
         Self {
-            local: [SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0); MAX_CANDIDATES],
+            // Zero bytes, as an empty state is (`DESIGN.md §2`); only the
+            // first `local_len` are read.
+            local: [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); MAX_CANDIDATES],
             local_len: 0,
-            public_v4: None,
-            public_v6: None,
-            seen_v4: None,
-            seen_v6: None,
+            public_v4: Maybe::None,
+            public_v6: Maybe::None,
+            seen_v4: Maybe::None,
+            seen_v6: Maybe::None,
             list: CandidateList::new(0),
         }
     }
@@ -102,9 +104,9 @@ impl Own {
     /// The public address the relay observed in `address`'s family.
     const fn public_like(&self, address: SocketAddr) -> Option<SocketAddr> {
         if address.is_ipv4() {
-            self.public_v4
+            self.public_v4.get()
         } else {
-            self.public_v6
+            self.public_v6.get()
         }
     }
 }
@@ -146,7 +148,7 @@ fn ip_of(source: Source<'_>) -> Option<SocketAddr> {
 
 /// Seals a path message under the session's current keys, if they live.
 fn seal<W: ReplayWindow>(
-    pair: &mut Option<KeyPair<W>>,
+    pair: &mut Maybe<KeyPair<W>>,
     now: Instant,
     inner_type: u8,
     data: &[u8],
@@ -178,7 +180,7 @@ fn may_attempt(paths: &PeerPaths, now: Instant) -> bool {
 /// When a check probe sent at `sent` is unanswered for good.
 fn check_lost_at(paths: &PeerPaths) -> Option<Instant> {
     match paths.check {
-        Some(Some((_, sent))) => Some(sent.saturating_add(CHECK_WITHIN)),
+        Maybe::Some(Some((_, sent))) => Some(sent.saturating_add(CHECK_WITHIN)),
         _ => None,
     }
 }
@@ -192,7 +194,7 @@ pub(super) fn path_wants<W: ReplayWindow, Q>(session: &Session<W, Q>, now: Insta
         .and_then(|attempt| attempt.next_due())
         .is_some_and(|due| due <= now);
     let ended = paths.attempt.is_some_and(|attempt| now >= attempt.ends());
-    (live && (paths.start_attempt || probe_due || paths.check == Some(None)))
+    (live && (paths.start_attempt || probe_due || paths.check == Maybe::Some(None)))
         || ended
         || check_lost_at(paths).is_some_and(|at| now >= at)
         || (paths.exchanged && paths.reported() != paths.announced)
@@ -203,7 +205,7 @@ pub(super) fn path_deadline<W: ReplayWindow, Q>(session: &Session<W, Q>) -> Opti
     let probe = session
         .current
         .as_ref()
-        .and(session.paths.attempt)
+        .and(Option::<Attempt>::from(session.paths.attempt))
         .and_then(|attempt| attempt.next_due());
     let end = session.paths.attempt.map(|attempt| attempt.ends());
     [probe, end, check_lost_at(&session.paths)]
@@ -220,13 +222,13 @@ pub(super) fn note_use(paths: &mut PeerPaths, now: Instant) {
         return;
     }
     match paths.direct {
-        Some(direct) if now >= direct.fresh_until => {
+        Maybe::Some(direct) if now >= direct.fresh_until => {
             if paths.check.is_none() {
-                paths.check = Some(None);
+                paths.check = Maybe::Some(None);
             }
         }
-        Some(_) => {}
-        None => {
+        Maybe::Some(_) => {}
+        Maybe::None => {
             let running = paths
                 .attempt
                 .is_some_and(|attempt| attempt.answers_open(now));
@@ -249,7 +251,7 @@ pub(super) fn finish_attempt(paths: &mut PeerPaths, now: Instant) -> bool {
         if silent {
             paths.sent = None;
         }
-        paths.attempt = None;
+        paths.attempt = Maybe::None;
         paths.heard_probe = false;
     }
     silent
@@ -369,15 +371,15 @@ impl<C: Config> Endpoint<C> {
             }
             if list != paths.candidates {
                 // The nonces follow the list's order: the attempt is over.
-                paths.attempt = None;
+                paths.attempt = Maybe::None;
                 paths.candidates = list;
             }
             if paths
                 .direct
                 .is_some_and(|direct| covered(excluded, direct.address.ip()))
             {
-                paths.direct = None;
-                paths.check = None;
+                paths.direct = Maybe::None;
+                paths.check = Maybe::None;
             }
             if session
                 .last_source
@@ -451,7 +453,7 @@ impl<C: Config> Endpoint<C> {
         Some(PathInfo {
             path,
             changed_at: paths.changed_at,
-            validated_after: paths.validated_after,
+            validated_after: paths.validated_after.into(),
             probes_sent: paths.probes_sent,
             own_symmetric: paths.own_symmetric,
             peer_symmetric: paths.peer_symmetric,
@@ -467,15 +469,15 @@ impl<C: Config> Endpoint<C> {
         } else {
             &mut self.own.public_v6
         };
-        *slot = Some(address);
+        *slot = Maybe::Some(address);
         self.refresh_candidates();
     }
 
     /// The relay that reported this endpoint's public addresses is gone: they
     /// are candidates no more, until the next relay reports them.
     pub(super) fn forget_public(&mut self) {
-        self.own.public_v4 = None;
-        self.own.public_v6 = None;
+        self.own.public_v4 = Maybe::None;
+        self.own.public_v6 = Maybe::None;
         self.refresh_candidates();
     }
 
@@ -494,9 +496,9 @@ impl<C: Config> Endpoint<C> {
             return;
         }
         if seen.is_ipv4() {
-            self.own.seen_v4 = Some(seen);
+            self.own.seen_v4 = Maybe::Some(seen);
         } else {
-            self.own.seen_v6 = Some(seen);
+            self.own.seen_v6 = Maybe::Some(seen);
         }
         self.refresh_candidates();
     }
@@ -520,10 +522,10 @@ impl<C: Config> Endpoint<C> {
         let mut list = CandidateList::new(self.own.list.generation);
         let locals = self.own.locals();
         let others = [
-            (CandidateKind::Public, self.own.public_v6),
-            (CandidateKind::Public, self.own.public_v4),
-            (CandidateKind::SeenByPeer, self.own.seen_v6),
-            (CandidateKind::SeenByPeer, self.own.seen_v4),
+            (CandidateKind::Public, self.own.public_v6.get()),
+            (CandidateKind::Public, self.own.public_v4.get()),
+            (CandidateKind::SeenByPeer, self.own.seen_v6.get()),
+            (CandidateKind::SeenByPeer, self.own.seen_v4.get()),
         ];
         let mut kept = [None; 4];
         for (slot, (kind, address)) in kept.iter_mut().zip(others) {
@@ -590,7 +592,7 @@ impl<C: Config> Endpoint<C> {
             direct.fresh_until = direct.fresh_until.min(now);
         }
         if list != paths.candidates {
-            paths.attempt = None;
+            paths.attempt = Maybe::None;
             paths.candidates = list;
         }
         if paths.fresh(now).is_none() && !paths.candidates.as_slice().is_empty() {
@@ -655,7 +657,7 @@ impl<C: Config> Endpoint<C> {
             return;
         };
         let paths = &mut session.paths;
-        let checked = matches!(paths.check, Some(Some((n, _))) if n == nonce)
+        let checked = matches!(paths.check, Maybe::Some(Some((n, _))) if n == nonce)
             && paths.direct.is_some_and(|direct| direct.address == from);
         let attempt = paths.attempt.filter(|attempt| attempt.answers_open(now));
         let probed = attempt.is_some_and(|attempt| {
@@ -669,7 +671,7 @@ impl<C: Config> Endpoint<C> {
         let fresh_until = now.saturating_add(DIRECT_FRESH_FOR);
         if checked && let Some(direct) = paths.direct.as_mut() {
             direct.fresh_until = fresh_until;
-            paths.check = None;
+            paths.check = Maybe::None;
         }
         if probed && let Some(attempt) = attempt {
             let rank = paths.rank_of(from);
@@ -684,17 +686,17 @@ impl<C: Config> Endpoint<C> {
                 let carried = paths
                     .direct
                     .is_some_and(|direct| direct.address == from && direct.carried);
-                paths.direct = Some(Direct {
+                paths.direct = Maybe::Some(Direct {
                     address: from,
                     validated: true,
                     rank,
                     fresh_until,
                     carried,
                 });
-                paths.check = None;
+                paths.check = Maybe::None;
             }
             if paths.validated_after.is_none() {
-                paths.validated_after = Some(Duration::from_millis(
+                paths.validated_after = Maybe::Some(Duration::from_millis(
                     now.as_millis().saturating_sub(attempt.started.as_millis()),
                 ));
             }
@@ -723,8 +725,8 @@ impl<C: Config> Endpoint<C> {
         let session = self.sessions.get_mut(&key)?;
         let paths = &mut session.paths;
         if check_lost_at(paths).is_some_and(|at| now >= at) {
-            paths.check = None;
-            paths.direct = None;
+            paths.check = Maybe::None;
+            paths.direct = Maybe::None;
             if may_attempt(paths, now) {
                 paths.start_attempt = true;
             }
@@ -737,7 +739,7 @@ impl<C: Config> Endpoint<C> {
                 for nonce in &mut nonces {
                     entropy.fill(nonce);
                 }
-                paths.attempt = Some(Attempt {
+                paths.attempt = Maybe::Some(Attempt {
                     started: now,
                     round: 0,
                     next: 0,
@@ -745,7 +747,7 @@ impl<C: Config> Endpoint<C> {
                     nonces,
                 });
                 paths.last_attempt = Some(now);
-                paths.validated_after = None;
+                paths.validated_after = Maybe::None;
             }
         }
         if live
@@ -771,12 +773,12 @@ impl<C: Config> Endpoint<C> {
             return Some(Poll::Transmit { to, len });
         }
         if live
-            && paths.check == Some(None)
-            && let Some(direct) = paths.direct
+            && paths.check == Maybe::Some(None)
+            && let Maybe::Some(direct) = paths.direct
         {
             let mut nonce = [0u8; 8];
             entropy.fill(&mut nonce);
-            paths.check = Some(Some((nonce, now)));
+            paths.check = Maybe::Some(Some((nonce, now)));
             paths.probes_sent += 1;
             let len = seal(&mut session.current, now, inner::PROBE, &nonce, out)?;
             return Some(Poll::Transmit {

@@ -7,7 +7,7 @@
 
 use convesso_core::handshake::Context;
 use convesso_core::identity::PeerId;
-use convesso_core::storage::Table;
+use convesso_core::storage::{Empty, Table};
 use convesso_core::time::Instant;
 
 use crate::channel::{Sent, Stored};
@@ -31,13 +31,13 @@ pub trait StreamConfig {
     /// The fragments that came early.
     type Stored: Slots<Stored>;
     /// The channels, by session.
-    type Channels<V>: Table<Key, V> + Default;
+    type Channels<V: Empty>: Table<Key, V> + Default;
     /// The channels' deadlines, in order: one entry per channel, so sized
     /// as the channels.
-    type Deadlines<V>: Table<(Instant, Key), V> + Default;
+    type Deadlines<V: Empty>: Table<(Instant, Key), V> + Default;
     /// What each context's channels take, for the contexts given limits of
     /// their own.
-    type Contexts<V>: Table<Context, V> + Default;
+    type Contexts<V: Empty>: Table<Context, V> + Default;
 }
 
 /// Every size of a configuration. A configuration derived with
@@ -123,17 +123,17 @@ macro_rules! __fixed_stream_config {
             type InFlight = $crate::config::FixedSlots<$crate::Sent, { $name::SIZES.in_flight }>;
             type ReceiveArena = $crate::config::FixedArena<{ $name::SIZES.receive_bytes }>;
             type Stored = $crate::config::FixedSlots<$crate::Stored, { $name::SIZES.stored }>;
-            type Channels<V> = $crate::__core::storage::FixedTable<
+            type Channels<V: $crate::__core::storage::Empty> = $crate::__core::storage::FixedTable<
                 $crate::config::Key,
                 V,
                 { $name::SIZES.channels },
             >;
-            type Deadlines<V> = $crate::__core::storage::FixedTable<
+            type Deadlines<V: $crate::__core::storage::Empty> = $crate::__core::storage::FixedTable<
                 ($crate::__core::time::Instant, $crate::config::Key),
                 V,
                 { $name::SIZES.channels },
             >;
-            type Contexts<V> = $crate::__core::storage::FixedTable<
+            type Contexts<V: $crate::__core::storage::Empty> = $crate::__core::storage::FixedTable<
                 $crate::__core::handshake::Context,
                 V,
                 { $name::SIZES.contexts },
@@ -154,21 +154,24 @@ macro_rules! __growable_stream_config {
             type InFlight = $crate::config::GrowableSlots<$crate::Sent, { $name::SIZES.in_flight }>;
             type ReceiveArena = $crate::config::GrowableArena<{ $name::SIZES.receive_bytes }>;
             type Stored = $crate::config::GrowableSlots<$crate::Stored, { $name::SIZES.stored }>;
-            type Channels<V> = $crate::__core::storage::GrowableTable<
-                $crate::config::Key,
-                V,
-                { $name::SIZES.channels },
-            >;
-            type Deadlines<V> = $crate::__core::storage::GrowableTable<
-                ($crate::__core::time::Instant, $crate::config::Key),
-                V,
-                { $name::SIZES.channels },
-            >;
-            type Contexts<V> = $crate::__core::storage::GrowableTable<
-                $crate::__core::handshake::Context,
-                V,
-                { $name::SIZES.contexts },
-            >;
+            type Channels<V: $crate::__core::storage::Empty> =
+                $crate::__core::storage::GrowableTable<
+                    $crate::config::Key,
+                    V,
+                    { $name::SIZES.channels },
+                >;
+            type Deadlines<V: $crate::__core::storage::Empty> =
+                $crate::__core::storage::GrowableTable<
+                    ($crate::__core::time::Instant, $crate::config::Key),
+                    V,
+                    { $name::SIZES.channels },
+                >;
+            type Contexts<V: $crate::__core::storage::Empty> =
+                $crate::__core::storage::GrowableTable<
+                    $crate::__core::handshake::Context,
+                    V,
+                    { $name::SIZES.contexts },
+                >;
         }
     };
 }
@@ -224,6 +227,8 @@ crate::__growable_stream_config!(Server);
 /// A queue of bytes: appended at the back, read anywhere, released from the
 /// front.
 pub trait ByteQueue: Default {
+    /// An empty queue, built at compile time.
+    const EMPTY: Self;
     /// The most bytes it ever holds.
     fn capacity(&self) -> usize;
     /// The bytes it holds.
@@ -243,6 +248,8 @@ pub trait ByteQueue: Default {
 
 /// A byte arena of bounded capacity, written and read anywhere.
 pub trait Arena: Default {
+    /// An empty arena, built at compile time.
+    const EMPTY: Self;
     /// The most bytes it ever holds.
     fn capacity(&self) -> usize;
     /// The first `len` bytes, if held.
@@ -256,6 +263,8 @@ pub trait Arena: Default {
 
 /// An ordered list of bounded length.
 pub trait Slots<T: Copy>: Default {
+    /// No items, built at compile time.
+    const EMPTY: Self;
     /// The most items it ever holds.
     fn capacity(&self) -> usize;
     /// The items it holds.
@@ -306,6 +315,12 @@ impl<const N: usize> Default for FixedQueue<N> {
 }
 
 impl<const N: usize> ByteQueue for FixedQueue<N> {
+    const EMPTY: Self = Self {
+        bytes: [0; N],
+        head: 0,
+        len: 0,
+    };
+
     fn capacity(&self) -> usize {
         N
     }
@@ -372,6 +387,8 @@ impl<const N: usize> Default for FixedArena<N> {
 }
 
 impl<const N: usize> Arena for FixedArena<N> {
+    const EMPTY: Self = Self { bytes: [0; N] };
+
     fn capacity(&self) -> usize {
         N
     }
@@ -403,7 +420,12 @@ impl<T: Copy + Default, const N: usize> Default for FixedSlots<T, N> {
     }
 }
 
-impl<T: Copy + Default, const N: usize> Slots<T> for FixedSlots<T, N> {
+impl<T: Copy + Default + Empty, const N: usize> Slots<T> for FixedSlots<T, N> {
+    const EMPTY: Self = Self {
+        items: [T::EMPTY; N],
+        len: 0,
+    };
+
     fn capacity(&self) -> usize {
         N
     }
@@ -469,6 +491,10 @@ pub struct GrowableQueue<const CAP: usize> {
 
 #[cfg(feature = "alloc")]
 impl<const CAP: usize> ByteQueue for GrowableQueue<CAP> {
+    const EMPTY: Self = Self {
+        bytes: alloc::collections::VecDeque::new(),
+    };
+
     fn capacity(&self) -> usize {
         CAP
     }
@@ -515,6 +541,10 @@ pub struct GrowableArena<const CAP: usize> {
 
 #[cfg(feature = "alloc")]
 impl<const CAP: usize> Arena for GrowableArena<CAP> {
+    const EMPTY: Self = Self {
+        bytes: alloc::vec::Vec::new(),
+    };
+
     fn capacity(&self) -> usize {
         CAP
     }
@@ -557,6 +587,10 @@ impl<T, const CAP: usize> Default for GrowableSlots<T, CAP> {
 
 #[cfg(feature = "alloc")]
 impl<T: Copy, const CAP: usize> Slots<T> for GrowableSlots<T, CAP> {
+    const EMPTY: Self = Self {
+        items: alloc::vec::Vec::new(),
+    };
+
     fn capacity(&self) -> usize {
         CAP
     }

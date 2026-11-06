@@ -14,6 +14,10 @@ small-data variants (.srodata, .sdata, .sbss). Sections are counted by name, so
 the runtime's stack and heap reservations, which are not code or data the core
 brings, are never counted. The budget lives in footprint-budget.toml at the
 repository root; a change that grows the core raises it in the same diff.
+
+It also fails on a constant of the compiler's own, an anonymous read-only
+object, larger than 512 bytes: what an empty state with a non-zero byte
+leaves in flash, copied from there wherever it is built (`DESIGN.md §2`).
 """
 
 import pathlib
@@ -35,6 +39,7 @@ FLASH = (".text", ".rodata", ".srodata")
 RAM = (".data", ".sdata", ".bss", ".sbss")
 
 SHF_ALLOC = 0x2
+LARGEST_CONSTANT = 512
 
 
 def counted(name, prefixes):
@@ -58,6 +63,30 @@ def sections(elf):
     return [(name(h[0]), h[5]) for h in headers if h[2] & SHF_ALLOC]
 
 
+def large_constants(elf):
+    """(name, size) of the anonymous read-only objects over the limit."""
+    data = elf.read_bytes()
+    (shoff,) = struct.unpack_from("<I", data, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x2E)
+    headers = [struct.unpack_from("<10I", data, shoff + i * shentsize) for i in range(shnum)]
+
+    def string(table, offset):
+        start = table + offset
+        return data[start : data.index(b"\0", start)].decode()
+
+    names = [string(headers[shstrndx][4], h[0]) for h in headers]
+    rodata = {i for i, name in enumerate(names) if counted(name, (".rodata", ".srodata"))}
+    symtab = headers[names.index(".symtab")]
+    strings = headers[symtab[6]][4]
+    found = []
+    for off in range(symtab[4], symtab[4] + symtab[5], 16):
+        name, _, size, _, _, section = struct.unpack_from("<IIIBBH", data, off)
+        name = string(strings, name)
+        if section in rodata and size > LARGEST_CONSTANT and "anon" in name:
+            found.append((name, size))
+    return found
+
+
 def measure(target, binary="reference"):
     elf = ROOT / "firmware" / "target" / target / "release" / binary
     if not elf.exists():
@@ -66,6 +95,7 @@ def measure(target, binary="reference"):
     return {
         "flash": sum(size for name, size in found if counted(name, FLASH)),
         "ram": sum(size for name, size in found if counted(name, RAM)),
+        "constants": large_constants(elf),
     }
 
 
@@ -100,6 +130,11 @@ def main():
 
     budget = tomllib.loads(BUDGET.read_text(encoding="ascii"))
     over = []
+    for (binary, target), figures in measured.items():
+        for name, size in figures["constants"]:
+            print(f"A {size}-BYTE CONSTANT: {binary} {target} {name}: an empty state with a "
+                  "non-zero byte is copied from flash (DESIGN.md §2)", file=sys.stderr)
+            over.append(None)
     for (binary, target), figures in measured.items():
         limits = budget.get(BINARIES[binary] + target)
         if limits is None:
