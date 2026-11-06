@@ -1,6 +1,9 @@
 # The runtimes' linker scripts. `memory.x` is chosen per architecture by build.rs.
+# Symbols in the v0 mangling, which scripts/stack.py's own build gets anyway,
+# so that both builds lay out the same code the same way, and its names carry
+# their generic parameters.
 [target.thumbv7em-none-eabihf]
-rustflags = ["-C", "link-arg=-Tlink.x"]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "symbol-mangling-version=v0"]
 
 [target.riscv32imc-unknown-none-elf]
-rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x"]
+rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x", "-C", "symbol-mangling-version=v0"]

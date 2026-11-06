@@ -1806,3 +1806,33 @@ fn behind_a_message_waiting_for_credit_the_next_arrives_whole() {
     pair.run_for(5);
     assert_eq!(pair.b.messages(), vec![first, second]);
 }
+
+// --- channels built at compile time ------------------------------------------------
+
+/// Channels of the microcontroller configuration, built at compile time in
+/// a `static`, as an integrator places them.
+static IN_PLACE: std::sync::Mutex<Channels<Mcu>> = std::sync::Mutex::new(Channels::new());
+
+/// Channels built at compile time make a channel in place, with its
+/// context's limits, as channels made at run time do.
+#[test]
+fn channels_built_at_compile_time_make_their_channels_in_place() {
+    let mut channels = IN_PLACE.lock().unwrap();
+    assert_eq!(channels.channel_count(), 0);
+    let peer = address(1).peer_id();
+    let now = Instant::from_millis(0);
+    channels.set_context(b"small", Some(1024), true).unwrap();
+    channels
+        .send_message(peer, None, b"small", &[7; 1024], now, &mut Counter(1))
+        .unwrap();
+    assert_eq!(
+        channels.send_message(peer, None, b"small", &[7; 1025], now, &mut Counter(1)),
+        Err(SendError::TooLarge {
+            size: 1025,
+            max: 1024
+        })
+    );
+    let context = Context::new(b"small").unwrap();
+    assert_eq!(channels.inspect(peer, context).unwrap().credit, Some(0));
+    assert_eq!(channels.channel_count(), 1);
+}

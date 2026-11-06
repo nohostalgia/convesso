@@ -36,16 +36,19 @@ pub(super) struct Sessions<C: Config> {
 
 impl<C: Config> Default for Sessions<C> {
     fn default() -> Self {
-        Self {
-            table: Default::default(),
-            touched: Default::default(),
-            ready: Default::default(),
-            due: Default::default(),
-        }
+        Self::EMPTY
     }
 }
 
 impl<C: Config> Sessions<C> {
+    /// No session, built at compile time.
+    pub(super) const EMPTY: Self = Self {
+        table: <C::Sessions<Key, SessionOf<C>> as Table<Key, SessionOf<C>>>::EMPTY,
+        touched: <C::Sessions<Key, ()> as Table<Key, ()>>::EMPTY,
+        ready: <C::Sessions<Key, ()> as Table<Key, ()>>::EMPTY,
+        due: <C::Sessions<(Instant, Key), ()> as Table<(Instant, Key), ()>>::EMPTY,
+    };
+
     pub(super) fn get(&self, key: &Key) -> Option<&SessionOf<C>> {
         self.table.get(key)
     }
@@ -59,21 +62,26 @@ impl<C: Config> Sessions<C> {
     }
 
     /// Inserts `session` under `key`; false when the table is full.
-    pub(super) fn insert(&mut self, key: Key, session: SessionOf<C>) -> bool {
-        let Ok(replaced) = self.table.insert(key, session) else {
-            return false;
-        };
-        if let Some(old) = replaced.as_ref() {
-            self.unindex(&key, old);
-        }
+    /// The session for `key`, made empty in its slot when there is none;
+    /// `None` when the table is full.
+    pub(super) fn insert_empty(&mut self, key: Key) -> Option<&mut SessionOf<C>> {
+        let session = self.table.insert_empty(key).ok()?;
+        // Room: one entry per session, and this one exists.
         let _ = self.touched.insert(key, ());
-        true
+        Some(session)
     }
 
-    pub(super) fn remove(&mut self, key: &Key) -> Option<SessionOf<C>> {
-        let session = self.table.remove(key)?;
-        self.unindex(key, &session);
-        Some(session)
+    /// Drops the session for `key` where it is held; whether there was one.
+    pub(super) fn discard(&mut self, key: &Key) -> bool {
+        let Some(deadline) = self.table.get(key).map(|session| session.deadline) else {
+            return false;
+        };
+        self.touched.remove(key);
+        self.ready.remove(key);
+        if let Some(at) = deadline {
+            self.due.remove(&(at, *key));
+        }
+        self.table.discard(key)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -151,7 +159,7 @@ impl<C: Config> Sessions<C> {
             };
             match look(&key, session) {
                 Look::Forget => {
-                    let _ = self.remove(&key);
+                    let _ = self.discard(&key);
                 }
                 Look::Keep { deadline, ready } => {
                     if session.deadline != deadline {
@@ -192,14 +200,6 @@ impl<C: Config> Sessions<C> {
     /// The earliest deadline of any session.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.due.first().map(|(&(at, _), ())| at)
-    }
-
-    fn unindex(&mut self, key: &Key, session: &SessionOf<C>) {
-        self.touched.remove(key);
-        self.ready.remove(key);
-        if let Some(at) = session.deadline {
-            self.due.remove(&(at, *key));
-        }
     }
 
     /// Asserts that the index finds what a walk of every session finds, as

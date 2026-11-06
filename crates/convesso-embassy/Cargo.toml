@@ -48,6 +48,8 @@ proptest.workspace = true
 tokio = { version = "1.53.3", features = ["macros", "rt", "time"] }
 embedded-io-async = "0.7.0"
 serde_json.workspace = true
+# A slot built at compile time, handed out once, as an integrator keeps one.
+static_cell = "2.1.1"
 
 [lints]
 workspace = true

@@ -7,7 +7,7 @@
 //! deadline came, and makes them ready. A poll searches the ready ones, and a
 //! channel that has nothing leaves them.
 
-use convesso_core::storage::{CapacityExhausted, Table};
+use convesso_core::storage::{Table, TableFull};
 use convesso_core::time::Instant;
 
 use crate::channel::Channel;
@@ -26,16 +26,19 @@ pub(crate) struct Indexed<C: StreamConfig> {
 
 impl<C: StreamConfig> Default for Indexed<C> {
     fn default() -> Self {
-        Self {
-            table: Default::default(),
-            touched: Default::default(),
-            ready: Default::default(),
-            due: Default::default(),
-        }
+        Self::EMPTY
     }
 }
 
 impl<C: StreamConfig> Indexed<C> {
+    /// No channel, built at compile time.
+    pub(crate) const EMPTY: Self = Self {
+        table: <C::Channels<Channel<C>> as Table<Key, Channel<C>>>::EMPTY,
+        touched: <C::Channels<()> as Table<Key, ()>>::EMPTY,
+        ready: <C::Channels<()> as Table<Key, ()>>::EMPTY,
+        due: <C::Deadlines<()> as Table<(Instant, Key), ()>>::EMPTY,
+    };
+
     pub(crate) fn get(&self, key: &Key) -> Option<&Channel<C>> {
         self.table.get(key)
     }
@@ -48,27 +51,26 @@ impl<C: StreamConfig> Indexed<C> {
         Some(channel)
     }
 
-    #[allow(
-        clippy::result_large_err,
-        reason = "as `Table::insert`: the refused channel comes back, to take a spent one's slot"
-    )]
-    pub(crate) fn insert(
-        &mut self,
-        key: Key,
-        channel: Channel<C>,
-    ) -> Result<Option<Channel<C>>, CapacityExhausted<Key, Channel<C>>> {
-        let replaced = self.table.insert(key, channel)?;
-        if let Some(old) = replaced.as_ref() {
-            self.unindex(&key, old);
-        }
+    /// The channel for `key`, made empty in its slot when there is none, for
+    /// the caller to give its limits.
+    pub(crate) fn insert_empty(&mut self, key: Key) -> Result<&mut Channel<C>, TableFull> {
+        let channel = self.table.insert_empty(key)?;
+        // Room: one entry per channel, and this one exists.
         let _ = self.touched.insert(key, ());
-        Ok(replaced)
+        Ok(channel)
     }
 
-    pub(crate) fn remove(&mut self, key: &Key) -> Option<Channel<C>> {
-        let channel = self.table.remove(key)?;
-        self.unindex(key, &channel);
-        Some(channel)
+    /// Drops the channel for `key` where it is held; whether there was one.
+    pub(crate) fn discard(&mut self, key: &Key) -> bool {
+        let Some(indexed) = self.table.get(key).map(|channel| channel.indexed) else {
+            return false;
+        };
+        self.touched.remove(key);
+        self.ready.remove(key);
+        if let Some(at) = indexed {
+            self.due.remove(&(at, *key));
+        }
+        self.table.discard(key)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -162,14 +164,6 @@ impl<C: StreamConfig> Indexed<C> {
     /// The earliest deadline of any channel.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.due.first().map(|(&(at, _), ())| at)
-    }
-
-    fn unindex(&mut self, key: &Key, channel: &Channel<C>) {
-        self.touched.remove(key);
-        self.ready.remove(key);
-        if let Some(at) = channel.indexed {
-            self.due.remove(&(at, *key));
-        }
     }
 
     /// Asserts that a walk of every channel finds what the index found, when

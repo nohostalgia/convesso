@@ -200,6 +200,12 @@ pub struct Context {
 const PROLOGUE_MAX: usize = 8 + 1 + 1 + MAX_CONTEXT_LEN;
 
 impl Context {
+    /// The empty context, built at compile time.
+    pub(crate) const EMPTY: Self = Self {
+        bytes: [0; MAX_CONTEXT_LEN],
+        len: 0,
+    };
+
     /// A context, at most [`MAX_CONTEXT_LEN`] bytes.
     ///
     /// # Errors

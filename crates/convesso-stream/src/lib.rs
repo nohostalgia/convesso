@@ -56,7 +56,7 @@ pub use convesso_core as __core;
 use convesso_core::endpoint::FrameKind;
 use convesso_core::handshake::{Context, DialError, Entropy};
 use convesso_core::identity::{Address, PeerId};
-use convesso_core::storage::Table;
+use convesso_core::storage::{Maybe, Table};
 use convesso_core::time::Instant;
 
 pub use channel::{
@@ -136,6 +136,13 @@ struct Limits {
     credit: bool,
 }
 
+impl convesso_core::storage::Empty for Limits {
+    const EMPTY: Self = Self {
+        max_message: 0,
+        credit: false,
+    };
+}
+
 /// Every channel of an endpoint.
 pub struct Channels<C: StreamConfig> {
     /// The channels, with the index of what is due among them.
@@ -143,7 +150,7 @@ pub struct Channels<C: StreamConfig> {
     /// The contexts given limits of their own.
     contexts: C::Contexts<Limits>,
     /// The frame handed out by the last poll, until the next call.
-    emitted: Option<(Key, Emitted)>,
+    emitted: Maybe<(Key, Emitted)>,
     /// Where the last poll stopped, so that every channel gets its turn.
     cursor: Option<Key>,
     /// Whether delivery credit is on.
@@ -160,11 +167,11 @@ impl<C: StreamConfig> Channels<C> {
     /// No channel yet; every message is handed out as soon as the driver can
     /// deliver it.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            table: Indexed::default(),
-            contexts: <C::Contexts<Limits> as Default>::default(),
-            emitted: None,
+            table: Indexed::EMPTY,
+            contexts: <C::Contexts<Limits> as Table<Context, Limits>>::EMPTY,
+            emitted: Maybe::None,
             cursor: None,
             credit: false,
         }
@@ -175,10 +182,13 @@ impl<C: StreamConfig> Channels<C> {
     /// [`ELEMENT_COST`], and spends that. A channel starts with no credit,
     /// and returns to none when it is reset or its session closes.
     #[must_use]
-    pub fn with_credit() -> Self {
+    pub const fn with_credit() -> Self {
         Self {
+            table: Indexed::EMPTY,
+            contexts: <C::Contexts<Limits> as Table<Context, Limits>>::EMPTY,
+            emitted: Maybe::None,
+            cursor: None,
             credit: true,
-            ..Self::new()
         }
     }
 
@@ -265,26 +275,29 @@ impl<C: StreamConfig> Channels<C> {
     }
 
     /// The channel of `key`, made if there is none: in a free slot, or in
-    /// the slot of a channel that holds nothing but a past reset.
+    /// the slot of a channel that holds nothing but a past reset. It is made
+    /// empty where it is kept, and then given its context's limits: a
+    /// channel's buffers never cross the stack.
     fn channel(&mut self, key: Key) -> Result<&mut Channel<C>, SendError> {
         let limits = self.limits(&key.1);
-        if self.table.get(&key).is_none()
-            && let Err(full) = self
-                .table
-                .insert(key, Channel::new(limits.credit, limits.max_message))
-        {
-            let mut spent = None;
-            self.table.for_each(|k, channel| {
-                if spent.is_none() && channel.is_spent() {
-                    spent = Some(*k);
-                }
-            });
-            let Some(spent) = spent else {
-                return Err(SendError::TableFull);
-            };
-            let _ = self.table.remove(&spent);
-            if self.table.insert(full.key, full.value).is_err() {
-                return Err(SendError::TableFull);
+        if self.table.get(&key).is_none() {
+            if self.table.insert_empty(key).is_err() {
+                let mut spent = None;
+                self.table.for_each(|k, channel| {
+                    if spent.is_none() && channel.is_spent() {
+                        spent = Some(*k);
+                    }
+                });
+                let Some(spent) = spent else {
+                    return Err(SendError::TableFull);
+                };
+                self.table.discard(&spent);
+                self.table
+                    .insert_empty(key)
+                    .map_err(|_| SendError::TableFull)?;
+            }
+            if let Some(channel) = self.table.get_mut(&key) {
+                channel.open(limits.credit, limits.max_message);
             }
         }
         self.table.get_mut(&key).ok_or(SendError::TableFull)
@@ -428,7 +441,7 @@ impl<C: StreamConfig> Channels<C> {
             channel.is_idle()
         });
         if forget {
-            let _ = self.table.remove(&key);
+            self.table.discard(&key);
         }
     }
 
@@ -506,7 +519,7 @@ impl<C: StreamConfig> Channels<C> {
         self.cursor = Some((peer, context));
         match output {
             Output::Frame { kind, len, emitted } => {
-                self.emitted = Some(((peer, context), emitted));
+                self.emitted = Maybe::Some(((peer, context), emitted));
                 Poll::SendFrame {
                     peer,
                     context,

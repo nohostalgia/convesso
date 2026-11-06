@@ -74,6 +74,7 @@ jobs:
               - 'crates/convesso-vectors/**'
               - 'firmware/**'
               - 'footprint-budget.toml'
+              - 'stack-budget.toml'
             core:
               - 'crates/convesso-core/**'
             stream:
@@ -143,8 +144,8 @@ jobs:
 
   # Embedded targets: the core builds without an allocator, a core that needs
   # one is refused, the primitives reproduce their vectors under QEMU, and the
-  # footprint stays within the committed budget. Only what the firmware links
-  # can change any of it.
+  # footprint and the stack stay within their committed budgets. Only what the
+  # firmware links can change any of it.
   embedded:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.embedded == 'true'
@@ -198,6 +199,13 @@ jobs:
         run: sh scripts/run-vectors-qemu.sh riscv32imc-unknown-none-elf
       - name: Footprint within budget
         run: python3 scripts/footprint.py
+      - name: Stack within budget
+        # llvm-objdump reads the calls; the script builds the firmware again
+        # with each function's frame recorded, and compares its code with the
+        # build above.
+        run: |
+          rustup component add llvm-tools
+          python3 scripts/stack.py
 
   # Every decoder of network input, fuzzed for a bounded time: the targets of
   # the crates that changed. Sixteen of them fuzz the core, so a change to it

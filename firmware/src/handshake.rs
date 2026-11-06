@@ -194,12 +194,16 @@ pub fn endpoints() -> bool {
     ) else {
         return false;
     };
-    let (Ok(mut a), Ok(mut b)) = (
-        Endpoint::<Mcu>::new(a_identity, &[b"session"]),
-        Endpoint::<Mcu>::new(b_identity, &[b"session"]),
-    ) else {
+    // Built at compile time and started in place, as a device keeps them.
+    static A: static_cell::StaticCell<Endpoint<Mcu>> = static_cell::StaticCell::new();
+    static B: static_cell::StaticCell<Endpoint<Mcu>> = static_cell::StaticCell::new();
+    let (a, b) = (
+        A.init_with(|| const { Endpoint::EMPTY }),
+        B.init_with(|| const { Endpoint::EMPTY }),
+    );
+    if a.start(a_identity, &[b"session"]).is_err() || b.start(b_identity, &[b"session"]).is_err() {
         return false;
-    };
+    }
     let (mut ea, mut eb) = (Sequence(black_box(3)), Sequence(black_box(4)));
     let now = Instant::from_millis(black_box(0));
     let a_source = Source::Direct(black_box(&[10, 0, 0, 1, 0, 1]));

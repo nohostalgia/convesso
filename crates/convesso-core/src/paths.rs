@@ -18,6 +18,7 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
+use crate::storage::Maybe;
 use crate::time::Instant;
 
 /// The most candidates a list carries.
@@ -313,12 +314,16 @@ pub const ATTEMPT_EVERY: Duration = Duration::from_secs(30);
 pub const CHECK_WITHIN: Duration = Duration::from_millis(2000);
 
 /// The path a session's packets take, as an application is told it.
+///
+/// Its tag is a byte of its own, `Relayed` being 0, so that a session's empty
+/// state is all zero bytes (`DESIGN.md §2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PathKind {
     /// Through the pinned relay.
-    Relayed,
+    Relayed = 0,
     /// Directly, to this address: its family is the path's.
-    Direct(SocketAddr),
+    Direct(SocketAddr) = 1,
 }
 
 /// A session's path and how it got there (`PROTOCOL.md §7`).
@@ -412,16 +417,16 @@ pub(crate) struct PeerPaths {
     pub(crate) exchanged: bool,
     /// An attempt is to start at the next poll, which draws its nonces.
     pub(crate) start_attempt: bool,
-    pub(crate) attempt: Option<Attempt>,
+    pub(crate) attempt: Maybe<Attempt>,
     pub(crate) last_attempt: Option<Instant>,
-    pub(crate) direct: Option<Direct>,
+    pub(crate) direct: Maybe<Direct>,
     /// A probe to check a stale direct path is owed (`None` sent), or was
     /// sent with this nonce at this instant.
-    pub(crate) check: Option<Option<(Nonce, Instant)>>,
+    pub(crate) check: Maybe<Option<(Nonce, Instant)>>,
     /// The path the application was last told of.
     pub(crate) announced: PathKind,
     pub(crate) changed_at: Option<Instant>,
-    pub(crate) validated_after: Option<Duration>,
+    pub(crate) validated_after: Maybe<Duration>,
     pub(crate) probes_sent: u32,
     pub(crate) own_symmetric: bool,
     pub(crate) peer_symmetric: bool,
@@ -438,13 +443,13 @@ impl PeerPaths {
             sent: None,
             exchanged: false,
             start_attempt: false,
-            attempt: None,
+            attempt: Maybe::None,
             last_attempt: None,
-            direct: None,
-            check: None,
+            direct: Maybe::None,
+            check: Maybe::None,
             announced: PathKind::Relayed,
             changed_at: None,
-            validated_after: None,
+            validated_after: Maybe::None,
             probes_sent: 0,
             own_symmetric: false,
             peer_symmetric: false,
@@ -475,18 +480,18 @@ impl PeerPaths {
             Some(direct) if direct.address == address => {
                 direct.fresh_until = fresh_until;
                 direct.carried = true;
-                self.check = None;
+                self.check = Maybe::None;
             }
             Some(direct) if now < direct.fresh_until => {}
             _ => {
-                self.direct = Some(Direct {
+                self.direct = Maybe::Some(Direct {
                     address,
                     validated: false,
                     rank: self.rank_of(address),
                     fresh_until,
                     carried: true,
                 });
-                self.check = None;
+                self.check = Maybe::None;
             }
         }
     }

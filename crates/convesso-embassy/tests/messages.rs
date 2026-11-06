@@ -19,7 +19,7 @@ use convesso_core::storage::Mcu;
 use convesso_embassy::rng::{RngFailed, SecureRng};
 use convesso_embassy::{
     Access, Config, Context, ContextEvent, ContextEvents, ContextOptions, ContextSlot, Node,
-    NodeError, RelayLocation, Shared,
+    NodeError, RelayLocation, Slot,
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use support::{MemDatagrams, MemInterfaces, Net, RelayHost};
@@ -37,7 +37,7 @@ struct Peer {
 
 impl Peer {
     async fn address(&self) -> Address {
-        self.node.address().await
+        self.node.address()
     }
 
     async fn set_hint(&self, peer: PeerId, at: SocketAddr) -> Result<(), NodeError> {
@@ -112,7 +112,7 @@ async fn node_with(
 ) -> (&'static Peer, TestEvents) {
     let ips = [ip(ip_text)];
     let datagrams: &'static MemDatagrams = leak(net.bind(&ips, 7500));
-    let slot: &'static mut Option<Shared<'static, NoopRawMutex, Mcu, MemDatagrams>> = leak(None);
+    let slot: &'static Slot<'static, NoopRawMutex, Mcu> = leak(Slot::new());
     let (node, runner, _node_events) = convesso_embassy::start(
         support::identity(key),
         Config {

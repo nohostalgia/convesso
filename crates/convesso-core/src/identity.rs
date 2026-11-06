@@ -154,6 +154,13 @@ pub struct Address {
 }
 
 impl Address {
+    /// No address: what an empty dial or fan holds until it is filled. Never
+    /// handed out.
+    pub(crate) const UNSET: Self = Self {
+        bytes: [0; 32],
+        peer_id: PeerId([0; 32]),
+    };
+
     /// Parses an address, refusing anything but the canonical encoding of a
     /// point of the prime-order subgroup.
     ///

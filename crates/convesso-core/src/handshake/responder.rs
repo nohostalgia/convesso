@@ -63,6 +63,8 @@ pub enum ResponderError {
     RelayContext,
     /// The context is not one this responder serves.
     NotServed,
+    /// The endpoint was started already, with an identity of its own.
+    Started,
 }
 
 impl core::fmt::Display for ResponderError {
@@ -79,6 +81,7 @@ impl core::fmt::Display for ResponderError {
                 f.write_str("the relay context is served only by pinning a relay, or by a relay")
             }
             Self::NotServed => f.write_str("the context is not served"),
+            Self::Started => f.write_str("the endpoint is started already"),
         }
     }
 }
@@ -100,6 +103,13 @@ pub enum Access {
 pub struct Served {
     access: Access,
     accepts_payload: bool,
+}
+
+impl crate::storage::Empty for Served {
+    const EMPTY: Self = Self {
+        access: Access::Policy,
+        accepts_payload: false,
+    };
 }
 
 impl core::error::Error for ResponderError {}
@@ -150,6 +160,20 @@ pub struct Pending {
     accepted: u64,
     completed: Completed,
     opens: bool,
+}
+
+impl crate::storage::Empty for Pending {
+    /// What a free slot of the pending handshakes holds, never read.
+    const EMPTY: Self = Self {
+        peer: crate::identity::Address::UNSET.peer_id(),
+        initiator_index: 0,
+        responder_index: 0,
+        context: Context::EMPTY,
+        expires_at: Instant::from_millis(0),
+        accepted: 0,
+        completed: Completed::EMPTY,
+        opens: false,
+    };
 }
 
 impl Pending {
@@ -223,7 +247,8 @@ impl Pending {
 
 /// The responder's side: answers first contacts addressed to this identity.
 pub struct Responder<C: Config> {
-    identity: Identity,
+    /// `None` until started: a responder without one answers nothing.
+    identity: Option<Identity>,
     mac1_key: Mac1Key,
     contexts: C::Contexts<Context, Served>,
     pending: C::Pending<u32, Pending>,
@@ -244,23 +269,34 @@ impl<C: Config> Responder<C> {
     ///
     /// As [`Self::serve`].
     pub fn new(identity: Identity, contexts: &[&[u8]]) -> Result<Self, ResponderError> {
-        let mut responder = Self {
-            mac1_key: Mac1Key::for_address(identity.address().as_bytes()),
-            identity,
-            contexts: Default::default(),
-            pending: Default::default(),
-            accepted: 0,
-            load: None,
-            cookie_secret: CookieSecret::default(),
-            recent: Default::default(),
-            rates: Default::default(),
-            #[cfg(test)]
-            diffie_hellmans: 0,
-        };
+        let mut responder = Self::EMPTY;
+        responder.start(identity);
         for context in contexts {
             responder.serve(context, Access::Policy)?;
         }
         Ok(responder)
+    }
+
+    /// A responder with no identity, built at compile time: it answers
+    /// nothing until [`Self::start`] gives it one.
+    pub const EMPTY: Self = Self {
+        identity: None,
+        mac1_key: Mac1Key::EMPTY,
+        contexts: <C::Contexts<Context, Served> as Table<Context, Served>>::EMPTY,
+        pending: <C::Pending<u32, Pending> as Table<u32, Pending>>::EMPTY,
+        accepted: 0,
+        load: None,
+        cookie_secret: CookieSecret::EMPTY,
+        recent: <C::RecentEphemerals<[u8; 32], Instant> as Table<[u8; 32], Instant>>::EMPTY,
+        rates: <C::SourceRates<SourceKey, Bucket> as Table<SourceKey, Bucket>>::EMPTY,
+        #[cfg(test)]
+        diffie_hellmans: 0,
+    };
+
+    /// Gives the responder its identity, in place.
+    pub(crate) fn start(&mut self, identity: Identity) {
+        self.mac1_key = Mac1Key::for_address(identity.address().as_bytes());
+        self.identity = Some(identity);
     }
 
     /// Serves `context`, reached under `access`. A first contact in a context
@@ -403,6 +439,11 @@ impl<C: Config> Responder<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> ResponderOutput {
+        // Without an identity, nothing is answered: not even a `mac1` under
+        // the empty key.
+        if self.identity.is_none() {
+            return ResponderOutput::Silent;
+        }
         match wire::classify(packet) {
             Classified::Version(Version::V1) => {
                 self.first_contact(packet, source, now, admission, standing, entropy, out)
@@ -488,7 +529,10 @@ impl<C: Config> Responder<C> {
         {
             self.diffie_hellmans += 1;
         }
-        let Ok((re, es)) = noise::initiation_es(self.identity.secret(), first.noise) else {
+        let Some(identity) = self.identity.as_ref() else {
+            return Silent;
+        };
+        let Ok((re, es)) = noise::initiation_es(identity.secret(), first.noise) else {
             return Silent;
         };
         let mut initiation = [0u8; INITIATION_NOISE_LEN + MAX_PAYLOAD];
@@ -600,11 +644,14 @@ impl<C: Config> Responder<C> {
         let Some(mac1) = wire::carried_mac1(packet) else {
             return ResponderOutput::Silent;
         };
+        let Some(identity) = self.identity.as_ref() else {
+            return ResponderOutput::Silent;
+        };
         let mut nonce = [0u8; 24];
         entropy.fill(&mut nonce);
         let (Some(reply), Some(out)) = (
             dos::write_cookie_reply(
-                self.identity.address().as_bytes(),
+                identity.address().as_bytes(),
                 initiator_index,
                 &nonce,
                 cookie,
@@ -641,6 +688,7 @@ impl<C: Config> Responder<C> {
         es: &[u8; 32],
         buffer: &mut [u8; INITIATION_NOISE_LEN + MAX_PAYLOAD],
     ) -> Option<(noise::ResponderRead, Context, Access, usize)> {
+        let identity = self.identity.as_ref()?;
         let expected = message.len().checked_sub(INITIATION_NOISE_LEN)?;
         let buffer = buffer.get_mut(..message.len())?;
         let mut found = None;
@@ -652,7 +700,7 @@ impl<C: Config> Responder<C> {
             let mut prologue = [0u8; PROLOGUE_MAX];
             let prologue = context.prologue(&mut prologue);
             buffer.copy_from_slice(message);
-            match noise::read_initiation(self.identity.secret(), prologue, re, es, buffer) {
+            match noise::read_initiation(identity.secret(), prologue, re, es, buffer) {
                 Ok((read, len)) if len == expected => {
                     found = Some((read, *context, served.access, len));
                     done = true;
@@ -776,9 +824,10 @@ impl<C: Config> Responder<C> {
         self.pending.retain(|_, pending| keep(pending));
     }
 
-    /// This responder's identity, which a dial from the same endpoint uses.
-    pub(crate) const fn identity(&self) -> &Identity {
-        &self.identity
+    /// This responder's identity, which a dial from the same endpoint uses;
+    /// `None` until started.
+    pub(crate) const fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
     }
 }
 

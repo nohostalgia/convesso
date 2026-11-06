@@ -19,7 +19,7 @@ use convesso_embassy::net::{
 };
 use convesso_embassy::rng::{RngFailed, SecureRng};
 use convesso_embassy::{
-    Access, ContextEvent, ContextOptions, ContextSlot, EVENTS_LEN, RelayLocation, Shared,
+    Access, ContextEvent, ContextOptions, ContextSlot, EVENTS_LEN, RelayLocation, Slot,
 };
 use critical_section::Mutex as CsMutex;
 use embassy_executor::{Executor, Spawner};
@@ -29,7 +29,7 @@ use embassy_net::{Config, StackResources};
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use panic_halt as _;
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 // The critical sections of a single-core chip, which embassy-sync uses.
 #[cfg(target_arch = "arm")]
@@ -131,20 +131,24 @@ type Runner = convesso_embassy::Runner<
     NetInterfaces<'static>,
 >;
 
+// Built at compile time, in .bss: taken once, never copied through the stack.
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
-static RX_META: StaticCell<[PacketMetadata; UDP_RX_PACKETS]> = StaticCell::new();
-static TX_META: StaticCell<[PacketMetadata; UDP_TX_PACKETS]> = StaticCell::new();
-static RX: StaticCell<[u8; UDP_RX_LEN]> = StaticCell::new();
-static TX: StaticCell<[u8; UDP_TX_LEN]> = StaticCell::new();
-static TCP_RX: StaticCell<[u8; TCP_LEN]> = StaticCell::new();
-static TCP_TX: StaticCell<[u8; TCP_LEN]> = StaticCell::new();
+static RESOURCES: ConstStaticCell<StackResources<4>> = ConstStaticCell::new(StackResources::new());
+static RX_META: ConstStaticCell<[PacketMetadata; UDP_RX_PACKETS]> =
+    ConstStaticCell::new([PacketMetadata::EMPTY; UDP_RX_PACKETS]);
+static TX_META: ConstStaticCell<[PacketMetadata; UDP_TX_PACKETS]> =
+    ConstStaticCell::new([PacketMetadata::EMPTY; UDP_TX_PACKETS]);
+static RX: ConstStaticCell<[u8; UDP_RX_LEN]> = ConstStaticCell::new([0; UDP_RX_LEN]);
+static TX: ConstStaticCell<[u8; UDP_TX_LEN]> = ConstStaticCell::new([0; UDP_TX_LEN]);
+static TCP_RX: ConstStaticCell<[u8; TCP_LEN]> = ConstStaticCell::new([0; TCP_LEN]);
+static TCP_TX: ConstStaticCell<[u8; TCP_LEN]> = ConstStaticCell::new([0; TCP_LEN]);
 static DATAGRAMS: StaticCell<Datagrams> = StaticCell::new();
 static GENERATOR: StaticCell<Generator> = StaticCell::new();
-static EVENTS: StaticCell<[u8; EVENTS_LEN]> = StaticCell::new();
-static APP: StaticCell<ContextSlot<'static, NoopRawMutex>> = StaticCell::new();
-static SHARED: StaticCell<Option<Shared<'static, NoopRawMutex, Mcu, Datagrams>>> =
-    StaticCell::new();
+static EVENTS: ConstStaticCell<[u8; EVENTS_LEN]> = ConstStaticCell::new([0; EVENTS_LEN]);
+static APP: ConstStaticCell<ContextSlot<'static, NoopRawMutex>> =
+    ConstStaticCell::new(ContextSlot::new());
+// The node's slot: built at compile time, written once from its constant.
+static SHARED: StaticCell<Slot<'static, NoopRawMutex, Mcu>> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn network(mut runner: embassy_net::Runner<'static, Silent>) -> ! {
@@ -162,27 +166,17 @@ async fn application(spawner: Spawner) {
     let Ok(identity) = convesso_embassy::record::identity(&record) else {
         return;
     };
-    let (stack, net_runner) = embassy_net::new(
-        Silent,
-        Config::default(),
-        RESOURCES.init(StackResources::new()),
-        black_box(7),
-    );
+    let (stack, net_runner) =
+        embassy_net::new(Silent, Config::default(), RESOURCES.take(), black_box(7));
     if let Ok(token) = network(net_runner) {
         spawner.spawn(token);
     }
-    let mut udp = UdpSocket::new(
-        stack,
-        RX_META.init([PacketMetadata::EMPTY; UDP_RX_PACKETS]),
-        RX.init([0; UDP_RX_LEN]),
-        TX_META.init([PacketMetadata::EMPTY; UDP_TX_PACKETS]),
-        TX.init([0; UDP_TX_LEN]),
-    );
+    let mut udp = UdpSocket::new(stack, RX_META.take(), RX.take(), TX_META.take(), TX.take());
     if udp.bind(7500).is_err() {
         return;
     }
     let datagrams = DATAGRAMS.init(NetDatagrams::new(udp));
-    let tcp = TcpSocket::new(stack, TCP_RX.init([0; TCP_LEN]), TCP_TX.init([0; TCP_LEN]));
+    let tcp = TcpSocket::new(stack, TCP_RX.take(), TCP_TX.take());
     let relay = black_box([1u8; 32]);
     let Ok(relay) = Address::parse(relay) else {
         return;
@@ -202,7 +196,7 @@ async fn application(spawner: Spawner) {
         GENERATOR.init(Generator),
         // The node's own events carry no data.
         &mut [],
-        SHARED.init(None),
+        SHARED.init_with(|| const { Slot::new() }),
     );
     let Ok((node, runner, _node_events)) = started else {
         return;
@@ -215,8 +209,8 @@ async fn application(spawner: Spawner) {
             b"app",
             ContextOptions {
                 access: Access::Everyone,
-                events: EVENTS.init([0; EVENTS_LEN]),
-                slot: APP.init(ContextSlot::new()),
+                events: EVENTS.take(),
+                slot: APP.take(),
                 #[cfg(feature = "stream")]
                 credit: false,
                 #[cfg(feature = "stream")]

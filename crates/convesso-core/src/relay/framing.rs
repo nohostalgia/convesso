@@ -62,14 +62,22 @@ pub struct Deframer {
 
 impl Default for Deframer {
     fn default() -> Self {
-        Self {
-            state: State::Preamble(0),
-            buffer: [0; MAX_FRAME],
-        }
+        Self::EMPTY
     }
 }
 
 impl Deframer {
+    /// A deframer at the start of a link, built at compile time.
+    pub const EMPTY: Self = Self {
+        state: State::Preamble(0),
+        buffer: [0; MAX_FRAME],
+    };
+
+    /// Starts over, in place, for a new link: what it held is no longer read.
+    pub fn reset(&mut self) {
+        self.state = State::Preamble(0);
+    }
+
     /// Reads from `input`, returning how many bytes it consumed and what they
     /// produced. Call again with the rest of the input while it produces
     /// something other than [`Deframed::NeedMore`] and input remains.
@@ -153,13 +161,21 @@ impl Deframer {
 /// fit.
 #[must_use]
 pub fn frame(packet: &[u8], out: &mut [u8]) -> Option<usize> {
+    let header = prefix(packet)?;
+    let out = out.get_mut(..2 + packet.len())?;
+    let (head, body) = out.split_at_mut(2);
+    head.copy_from_slice(&header);
+    body.copy_from_slice(packet);
+    Some(2 + packet.len())
+}
+
+/// The two bytes that come before `packet` in its frame, or `None` when the
+/// packet is empty or longer than [`MAX_FRAME`]: for a writer that sends the
+/// packet from where it lies, after them.
+#[must_use]
+pub fn prefix(packet: &[u8]) -> Option<[u8; 2]> {
     if packet.is_empty() || packet.len() > MAX_FRAME {
         return None;
     }
-    let len = u16::try_from(packet.len()).ok()?;
-    let out = out.get_mut(..2 + packet.len())?;
-    let (prefix, body) = out.split_at_mut(2);
-    prefix.copy_from_slice(&len.to_le_bytes());
-    body.copy_from_slice(packet);
-    Some(2 + packet.len())
+    Some(u16::try_from(packet.len()).ok()?.to_le_bytes())
 }

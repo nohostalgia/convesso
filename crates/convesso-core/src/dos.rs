@@ -155,6 +155,13 @@ pub fn decode_ip(bytes: &[u8]) -> Option<SocketAddr> {
 }
 
 impl SourceKey {
+    /// No source: what a free slot holds.
+    pub(crate) const EMPTY: Self = Self {
+        tag: 0,
+        len: 0,
+        bytes: [0; MAX_DIRECT_SOURCE_LEN],
+    };
+
     /// The source an IP address and port are, in the core's encoding.
     #[must_use]
     pub fn from_ip(address: SocketAddr) -> Self {
@@ -370,6 +377,9 @@ impl Drop for CookieSecret {
 }
 
 impl CookieSecret {
+    /// No secret yet: one is drawn when first needed.
+    pub(crate) const EMPTY: Self = Self { current: None };
+
     /// The secret in force at `now`, drawing a fresh one if there is none or it
     /// has lived [`COOKIE_LIFETIME`].
     pub(crate) fn at(&mut self, now: Instant, entropy: &mut impl Entropy) -> &[u8; 32] {
@@ -393,6 +403,13 @@ impl CookieSecret {
 pub(crate) struct Bucket {
     millitokens: u64,
     at: Instant,
+}
+
+impl crate::storage::Empty for Bucket {
+    const EMPTY: Self = Self {
+        millitokens: 0,
+        at: Instant::from_millis(0),
+    };
 }
 
 impl Bucket {

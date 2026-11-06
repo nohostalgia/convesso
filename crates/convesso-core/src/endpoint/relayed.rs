@@ -46,7 +46,7 @@ use crate::handshake::messages::is_first_contact_type;
 use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::session::DatagramQueue;
-use crate::storage::{Config, Table};
+use crate::storage::{Config, Maybe, Table};
 use crate::transport::{self, DATA_AT, OVERHEAD, TAG_LEN, inner};
 
 /// How long an authenticated packet of the relay session received over UDP
@@ -439,6 +439,13 @@ pub(crate) struct Hint {
     used: Instant,
 }
 
+impl crate::storage::Empty for Hint {
+    const EMPTY: Self = Self {
+        address: SourceKey::EMPTY,
+        used: Instant::from_millis(0),
+    };
+}
+
 /// A peer's hints, in order: at most [`MAX_HINTS`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Hints([Option<SourceKey>; MAX_HINTS], usize);
@@ -522,6 +529,17 @@ pub(crate) struct Fan {
     /// When it goes through the relay, if it does: while the dial is still
     /// unanswered then.
     relay_at: Option<Instant>,
+}
+
+impl crate::storage::Empty for Fan {
+    /// Made in the fans' table, then filled.
+    const EMPTY: Self = Self {
+        peer: crate::identity::Address::UNSET.peer_id(),
+        bytes: [0; MAX_FIRST_CONTACT_LEN],
+        len: 0,
+        next: 0,
+        relay_at: None,
+    };
 }
 
 /// The path the rule chose. It lives on the stack for one routing step, and
@@ -709,12 +727,14 @@ impl<C: Config> Endpoint<C> {
         }
         match (relay, self.relay.as_mut()) {
             (Some(address), Some(client)) => client.replace(address, now),
-            (Some(address), None) => self.relay = Some(RelayClient::new(address, context, now)),
+            (Some(address), None) => {
+                self.relay = Maybe::Some(RelayClient::new(address, context, now))
+            }
             (None, Some(client)) => {
                 if matches!(client.link, LinkState::Opening(_) | LinkState::Open { .. }) {
                     self.link_close_owed = true;
                 }
-                self.relay = None;
+                self.relay = Maybe::None;
             }
             (None, None) => {}
         }
@@ -1033,6 +1053,9 @@ impl<C: Config> Endpoint<C> {
         entropy: &mut impl Entropy,
         out: &mut [u8],
     ) -> Result<Output<'static>, SendError> {
+        if self.responder.identity().is_none() {
+            return Err(SendError::NotStarted);
+        }
         let mut policy = self.aware(policy);
         Ok(
             match self.forward_in_place(peer, len, now, &mut policy, entropy, out)? {
@@ -1060,6 +1083,9 @@ impl<C: Config> Endpoint<C> {
         let Some(relay_key) = self.relay.as_ref().map(RelayClient::key) else {
             return Output::Nothing;
         };
+        if self.responder.identity().is_none() {
+            return Output::Nothing;
+        }
         let mut policy = self.aware(policy);
         if link == Link::Tcp
             && let Some(relay) = self.relay.as_mut()
@@ -1424,19 +1450,15 @@ impl<C: Config> Endpoint<C> {
             && let Some(packet) = out.get(..len)
             && len <= MAX_FIRST_CONTACT_LEN
         {
-            let mut bytes = [0u8; MAX_FIRST_CONTACT_LEN];
-            if let Some(slot) = bytes.get_mut(..len) {
-                slot.copy_from_slice(packet);
-            }
             self.fan_seq = self.fan_seq.wrapping_add(1);
-            let fan = Fan {
-                peer,
-                bytes,
-                len,
-                next: 1,
-                relay_at,
-            };
-            let _ = self.fans.insert(self.fan_seq, fan);
+            // Made where it is kept, the packet copied in: a fan never
+            // crosses the stack.
+            if let Ok(fan) = self.fans.insert_empty(self.fan_seq) {
+                (fan.peer, fan.len, fan.next, fan.relay_at) = (peer, len, 1, relay_at);
+                if let Some(slot) = fan.bytes.get_mut(..len) {
+                    slot.copy_from_slice(packet);
+                }
+            }
         }
         Some((To::Direct(first), len))
     }
@@ -1506,16 +1528,17 @@ impl<C: Config> Endpoint<C> {
                         return None;
                     }
                     Some(_) if self.dialling(&peer) => {
-                        let fan = self.fans.remove(&seq)?;
+                        let fan = self.fans.get(&seq)?;
                         let len = fan.len;
                         out.get_mut(..len)?.copy_from_slice(fan.bytes.get(..len)?);
+                        self.fans.discard(&seq);
                         return self
                             .forward_in_place(peer, len, now, policy, entropy, out)
                             .ok()
                             .flatten();
                     }
                     _ => {
-                        self.fans.remove(&seq);
+                        self.fans.discard(&seq);
                         continue;
                     }
                 }
@@ -1531,7 +1554,7 @@ impl<C: Config> Endpoint<C> {
                 _ => false,
             };
             if (fan.next >= hints.1 && fan.relay_at.is_none()) || !sent {
-                self.fans.remove(&seq);
+                self.fans.discard(&seq);
             }
             if sent {
                 return Some((To::Direct(hint), len));
@@ -1953,7 +1976,7 @@ impl<C: Config> Endpoint<C> {
                     relay.register_due = false;
                 }
                 let frame = Frame::Register {
-                    address: *self.responder.identity().address().as_bytes(),
+                    address: *self.responder.identity()?.address().as_bytes(),
                 };
                 let len = relay::encode(&frame, out.get_mut(DATA_AT..)?).ok()?;
                 let (to, len) = self
