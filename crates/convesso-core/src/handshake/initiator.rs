@@ -576,9 +576,11 @@ impl Dial {
         len
     }
 
+    /// Marks the dial over. Its attempts stay, so that whoever holds the dial
+    /// can still free the indices they registered when it discards it; a dial
+    /// that is over handles nothing.
     fn finish(&mut self) {
         self.live = false;
-        self.attempts = [const { Maybe::None }; ATTEMPT_OFFSETS.len()];
     }
 
     /// When the dial started.
@@ -587,7 +589,8 @@ impl Dial {
         self.started
     }
 
-    /// The indices of the attempts in progress, which responses name.
+    /// The indices its attempts registered, which responses name: kept once
+    /// the dial is over, until whoever holds it discards it.
     pub(crate) fn attempt_indices(&self) -> impl Iterator<Item = u32> + '_ {
         self.attempts.iter().flatten().map(|attempt| attempt.index)
     }

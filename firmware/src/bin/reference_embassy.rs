@@ -190,6 +190,7 @@ async fn application(spawner: Spawner) {
                 primary: black_box(core::net::SocketAddr::from(([192, 0, 2, 1], 7400))),
                 other: None,
             }),
+            ..Default::default()
         },
         datagrams,
         NetStream::new(tcp),

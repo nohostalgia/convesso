@@ -186,7 +186,7 @@ fn check_lost_at(paths: &PeerPaths) -> Option<Instant> {
 }
 
 /// Whether a session has path work due at `now`.
-pub(super) fn path_wants<W: ReplayWindow, Q>(session: &Session<W, Q>, now: Instant) -> bool {
+pub(super) fn path_wants<W: ReplayWindow>(session: &Session<W>, now: Instant) -> bool {
     let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
     let paths = &session.paths;
     let probe_due = paths
@@ -201,7 +201,7 @@ pub(super) fn path_wants<W: ReplayWindow, Q>(session: &Session<W, Q>, now: Insta
 }
 
 /// The next instant a session has path work, if any.
-pub(super) fn path_deadline<W: ReplayWindow, Q>(session: &Session<W, Q>) -> Option<Instant> {
+pub(super) fn path_deadline<W: ReplayWindow>(session: &Session<W>) -> Option<Instant> {
     let probe = session
         .current
         .as_ref()
@@ -260,9 +260,9 @@ pub(super) fn finish_attempt(paths: &mut PeerPaths, now: Instant) -> bool {
 /// Where a packet of a session goes, before the relay rule: its fresh direct
 /// path, when it exchanged candidates; else, for such a session, the relay
 /// when one is pinned; else where it was last authenticated from.
-pub(super) fn route_source<W, Q>(
+pub(super) fn route_source<W>(
     peer: PeerId,
-    session: &Session<W, Q>,
+    session: &Session<W>,
     now: Instant,
     relay: bool,
 ) -> Option<SourceKey> {

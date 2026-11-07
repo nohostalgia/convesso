@@ -22,6 +22,10 @@ rand_core = ["dep:rand_core"]
 # Reliable messages (convesso-stream, the `Mcu` configuration), beside the
 # datagrams: off by default, the application's choice. No allocator.
 stream = ["dep:convesso-stream"]
+# The channels' count given when the node starts (`Config::channels`), each
+# with `Mcu`'s buffers, allocated once then: for a library shipped built.
+# Needs an allocator.
+stream-boot = ["stream", "convesso-stream/alloc"]
 
 [dependencies]
 embassy-futures = "0.1.2"

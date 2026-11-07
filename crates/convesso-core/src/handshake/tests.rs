@@ -2449,3 +2449,68 @@ fn a_crossing_opening_that_loses_meets_silence() {
     assert_eq!((decision, opens), (None, None));
     assert!(matches!(event, DialEvent::Ignored));
 }
+
+/// Scenario: the relay wakes a board whose pending table is full. A first
+/// contact in a context bound to one peer, the pinned relay's, takes the
+/// place of the oldest pending handshake of another context.
+#[test]
+fn a_bound_context_is_never_refused_for_room() {
+    const BOUND: &[u8] = b"bound";
+    let relay = identity(4);
+    let mut entropy = TestEntropy(1450);
+    let mut responder = responder();
+    responder
+        .serve(BOUND, Access::Bound(relay.peer_id()))
+        .unwrap();
+    let mut admission = Fixed::accept();
+    // Two initiators, two pending each: the four slots.
+    for key in [1, 1, 2, 2] {
+        let mut out = [0u8; 256];
+        let (_, len) = Dial::start(
+            &identity(key),
+            &responder_address(),
+            CONTEXT,
+            None,
+            t(0),
+            &mut entropy,
+            &mut out,
+        )
+        .unwrap();
+        answer(
+            &mut responder,
+            &out[..len],
+            t(0),
+            &mut admission,
+            &mut entropy,
+        )
+        .unwrap();
+    }
+    assert_eq!(responder.pending_count(), 4);
+    let mut out = [0u8; 256];
+    let (mut dial, len) = Dial::start(
+        &relay,
+        &responder_address(),
+        BOUND,
+        None,
+        t(1),
+        &mut entropy,
+        &mut out,
+    )
+    .unwrap();
+    let response = answer(
+        &mut responder,
+        &out[..len],
+        t(1),
+        &mut admission,
+        &mut entropy,
+    )
+    .unwrap();
+    established(dial.handle(&relay, &response, t(2)));
+    assert_eq!(responder.pending_count(), 4, "one peer's place was taken");
+    assert_eq!(responder.pending_for(&relay.peer_id()), 1);
+    assert_eq!(
+        responder.pending_for(&identity(1).peer_id())
+            + responder.pending_for(&identity(2).peer_id()),
+        3
+    );
+}

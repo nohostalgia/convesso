@@ -150,6 +150,7 @@ async fn node_with(
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
+            ..Default::default()
         },
         datagrams,
         net.stream(ips[0]),
@@ -323,6 +324,7 @@ async fn generator_failure() {
                 primary: relay.udp[0],
                 other: None,
             }),
+            ..Default::default()
         },
         datagrams,
         net.stream(ip("10.0.0.1")),
@@ -348,7 +350,10 @@ fn start_on<M: embassy_sync::blocking_mutex::raw::RawMutex>(
     let ips = [ip("10.0.0.1")];
     let started = convesso_embassy::start(
         support::identity(key),
-        Config { relay: None },
+        Config {
+            relay: None,
+            ..Default::default()
+        },
         leak(net.bind(&ips, port)),
         net.stream(ips[0]),
         MemInterfaces::new(&ips),
@@ -826,4 +831,76 @@ async fn early_data_between_two_nodes() {
         assert_eq!(seen.last().unwrap(), &("datagram", b"then".to_vec()));
     })
     .await;
+}
+
+// --- sizes given at start -----------------------------------------------------------------
+
+/// Starts node `key` on `slot`, of profile `T`, with no relay and `sizes`;
+/// opens `contexts` and says which opened.
+async fn contexts_opened<T: convesso_core::storage::Config + 'static>(
+    key: usize,
+    port: u16,
+    sizes: convesso_core::storage::Sizes,
+    contexts: &[&[u8]],
+) -> Vec<bool> {
+    let net = Net::new();
+    let ips = [ip("10.0.0.1")];
+    let slot: &'static Slot<'static, NoopRawMutex, T> = leak(Slot::new());
+    let (node, _runner, _events) = convesso_embassy::start(
+        support::identity(key),
+        Config {
+            relay: None,
+            sizes: Some(sizes),
+            ..Default::default()
+        },
+        leak(net.bind(&ips, port)),
+        net.stream(ips[0]),
+        MemInterfaces::new(&ips),
+        leak(TestRng(key as u64)),
+        leak(vec![0u8; 64]).as_mut_slice(),
+        slot,
+    )
+    .unwrap_or_else(|_| panic!("node {key} starts"));
+    let mut opened = Vec::new();
+    for name in contexts {
+        let result = node
+            .context(
+                name,
+                ContextOptions {
+                    access: convesso_embassy::Access::Everyone,
+                    events: leak(vec![0u8; 512]).as_mut_slice(),
+                    slot: leak(ContextSlot::new()),
+                    #[cfg(feature = "stream")]
+                    credit: false,
+                    #[cfg(feature = "stream")]
+                    max_message: None,
+                    passive_keepalive: false,
+                    early_data: false,
+                },
+            )
+            .await;
+        opened.push(result.is_ok());
+    }
+    opened
+}
+
+/// Scenarios: a precompiled library chooses its slots; sizes are ignored on
+/// a fixed profile. A node of the `Boot` profile started with room for one
+/// context opens one and refuses a second by name; a node of the
+/// microcontroller profile given the same sizes opens both.
+#[tokio::test(flavor = "current_thread")]
+async fn a_boot_node_holds_what_it_was_given_and_a_fixed_one_ignores_it() {
+    use convesso_core::storage::{Boot, Sizes};
+    let one = Sizes {
+        contexts: 1,
+        ..Boot::SIZES
+    };
+    assert_eq!(
+        contexts_opened::<Boot>(1, 7600, one, &[b"first", b"second"]).await,
+        [true, false]
+    );
+    assert_eq!(
+        contexts_opened::<Mcu>(2, 7601, one, &[b"first", b"second"]).await,
+        [true, true]
+    );
 }

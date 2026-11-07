@@ -39,13 +39,12 @@ use core::time::Duration;
 
 use super::{
     Address, Admission, Context, DialError, Endpoint, Entropy, Event, FrameKind, Hop, Instant, Key,
-    Output, Owner, PeerId, Poll, SendError, Source, To,
+    Output, PeerId, Poll, SendError, Source, To,
 };
 use crate::dos::SourceKey;
 use crate::handshake::messages::is_first_contact_type;
 use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
-use crate::session::DatagramQueue;
 use crate::storage::{Config, Maybe, Table};
 use crate::transport::{self, DATA_AT, OVERHEAD, TAG_LEN, inner};
 
@@ -294,7 +293,7 @@ impl RelayClient {
         key.0 == self.address.peer_id() && key.1 == self.context
     }
 
-    fn key(&self) -> Key {
+    pub(super) fn key(&self) -> Key {
         (self.address.peer_id(), self.context)
     }
 
@@ -624,9 +623,9 @@ fn offset(base: usize, data: &[u8]) -> usize {
 }
 
 /// The dial whose attempt the relay frame `frame` forwards: a forward to a
-/// peer, carrying a version 1 first contact whose index `indices` gives to
+/// peer, carrying a version 1 first contact whose index `dial_of` gives to
 /// that peer's dial. The frames are the endpoint's own.
-fn attempt_of(indices: &impl Table<u32, Owner>, frame: &[u8]) -> Option<Key> {
+fn attempt_of(dial_of: impl Fn(u32) -> Option<Key>, frame: &[u8]) -> Option<Key> {
     let [frame_type::FORWARD, relay::KIND_PEER_ID, rest @ ..] = frame else {
         return None;
     };
@@ -638,12 +637,8 @@ fn attempt_of(indices: &impl Table<u32, Owner>, frame: &[u8]) -> Option<Key> {
     if !is_first_contact_type(kind) {
         return None;
     }
-    match indices.get(&u32::from_le_bytes([a, b, c, d]))? {
-        Owner::Dial(owner, context) if owner.as_bytes().as_slice() == peer => {
-            Some((*owner, *context))
-        }
-        _ => None,
-    }
+    dial_of(u32::from_le_bytes([a, b, c, d]))
+        .filter(|(owner, _)| owner.as_bytes().as_slice() == peer)
 }
 
 impl<C: Config> Endpoint<C> {
@@ -1652,9 +1647,11 @@ impl<C: Config> Endpoint<C> {
             return Err(SendError::NoRelay);
         };
         let dialling = self.dials.get(&key).is_some();
-        let ready = self.sessions.get(&key).is_some_and(|session| {
-            session.queue.is_empty() && session.current.as_ref().is_some_and(|pair| pair.live(now))
-        });
+        let ready = self.queues.is_empty(&key)
+            && self
+                .sessions
+                .get(&key)
+                .is_some_and(|session| session.current.as_ref().is_some_and(|pair| pair.live(now)));
         if !ready {
             return Ok(None);
         }
@@ -1753,21 +1750,23 @@ impl<C: Config> Endpoint<C> {
         let frame = out
             .get(DATA_AT..DATA_AT + frame_len)
             .ok_or(SendError::Capacity)?;
-        let session = self.session_for(key).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
         session.address = Some(address);
-        let indices = &self.indices;
-        let session = self.sessions.get_mut(&key).ok_or(SendError::Capacity)?;
-        match attempt_of(indices, frame) {
+        let carried = usize::from(session.carried);
+        let (indices, dials) = (&self.indices, &self.dials);
+        let dial_of = |index| super::dial_owning::<C>(indices, dials, index);
+        match attempt_of(dial_of, frame) {
             // A dial's newer attempt takes the place of its earlier ones, so
             // that the peer is not sent more attempts than it keeps; the one
             // the relay session's first contacts carry stays, so that each of
             // them carries the same bytes (`PROTOCOL.md §6`).
-            Some(dial) => session.queue.replace(
-                usize::from(session.carried),
-                |queued| attempt_of(indices, queued) == Some(dial),
+            Some(dial) => self.queues.replace(
+                key,
+                carried,
+                |queued| attempt_of(dial_of, queued) == Some(dial),
                 frame,
             ),
-            None => session.queue.push(frame),
+            None => self.queues.push(key, frame),
         }
         .map_err(SendError::QueueFull)?;
         let pending = self.responder.pending_for(&key.0) > 0;
@@ -2021,12 +2020,7 @@ impl<C: Config> Endpoint<C> {
         }
         // Frames queued while a pending handshake from the relay was not
         // confirmed, and nothing else opening the session: open it.
-        let stuck = !live
-            && !opening
-            && self
-                .sessions
-                .get(&key)
-                .is_some_and(|session| !session.queue.is_empty());
+        let stuck = !live && !opening && !self.queues.is_empty(&key);
         if stuck {
             let (to, len) = self.wake(None, now, policy, entropy, out).ok()?;
             self.note_sent(to, now);

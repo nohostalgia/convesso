@@ -87,6 +87,17 @@ pub struct RelayLocation {
 pub struct Config {
     /// The relay to pin, if any.
     pub relay: Option<RelayLocation>,
+    /// The core's table sizes, for an endpoint of a profile sized when it
+    /// starts (`convesso_core::storage::Boot`): its tables, and the driver's
+    /// table of contexts, are allocated once, as the node starts; unset, the
+    /// microcontroller profile's. A profile sized when it is built ignores
+    /// them.
+    pub sizes: Option<convesso_core::storage::Sizes>,
+    /// With the `stream-boot` feature, the number of message channels,
+    /// allocated once as the node starts; unset, the `Mcu` configuration's
+    /// (feature `stream`; ignored without `stream-boot`).
+    #[cfg(feature = "stream")]
+    pub channels: Option<usize>,
 }
 
 /// Who may reach this node in a context.
@@ -261,9 +272,13 @@ impl Stats {
     }
 }
 
-/// The message channels' configuration (feature `stream`).
-#[cfg(feature = "stream")]
+/// The message channels' configuration (feature `stream`): `Mcu`'s, or with
+/// `stream-boot` the same buffers in as many channels as the node is given
+/// when it starts.
+#[cfg(all(feature = "stream", not(feature = "stream-boot")))]
 type StreamConfig = convesso_stream::config::Mcu;
+#[cfg(feature = "stream-boot")]
+type StreamConfig = convesso_stream::config::Boot;
 
 /// The largest message of the `Mcu` stream configuration.
 #[cfg(feature = "stream")]
@@ -663,7 +678,16 @@ where
     }
     let address = *identity.address();
     // Filled in place, field by field: the endpoint's configuration first,
-    // and its identity last, once nothing can fail.
+    // and its identity last, once nothing can fail. Tables sized as it starts
+    // are made first of all, once.
+    let sizes = config.sizes.unwrap_or(convesso_core::storage::Mcu::SIZES);
+    inner.endpoint.reserve(&sizes);
+    inner.contexts.reserve(sizes.contexts);
+    #[cfg(feature = "stream")]
+    inner.channels.reserve(&convesso_stream::config::Sizes {
+        channels: config.channels.unwrap_or(StreamConfig::SIZES.channels),
+        ..StreamConfig::SIZES
+    });
     if let Some(relay) = config.relay {
         inner
             .endpoint

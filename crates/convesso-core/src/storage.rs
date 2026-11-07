@@ -126,6 +126,11 @@ pub trait Table<K: Ord, V> {
     /// The entry with the smallest key: what an index ordered by time holds
     /// next.
     fn first(&self) -> Option<(&K, &V)>;
+
+    /// Makes room for `capacity` entries, once, for a table sized when the
+    /// endpoint starts ([`BootTable`]); a table sized when it is built, or
+    /// that grows, ignores it.
+    fn reserve(&mut self, _capacity: usize) {}
 }
 
 /// A new key was refused because the table is full.
@@ -344,26 +349,95 @@ impl<T> Maybe<T> {
     }
 }
 
-/// A table of at most `N` entries, held in an array.
+/// Where a [`Slotted`] table keeps its keys or its values: one slot per
+/// entry it can hold, each made from [`Empty`] while free.
+pub trait SlotStorage: Empty {
+    /// What each slot holds.
+    type Item;
+    /// The slots.
+    fn slots(&self) -> &[Self::Item];
+    /// The slots, mutably.
+    fn slots_mut(&mut self) -> &mut [Self::Item];
+    /// Makes `capacity` slots, once: a storage sized when it is built
+    /// ignores it, and so does one already sized.
+    fn reserve(&mut self, capacity: usize);
+}
+
+impl<T: Empty, const N: usize> SlotStorage for [T; N] {
+    type Item = T;
+
+    fn slots(&self) -> &[T] {
+        self
+    }
+
+    fn slots_mut(&mut self) -> &mut [T] {
+        self
+    }
+
+    fn reserve(&mut self, _capacity: usize) {}
+}
+
+#[cfg(feature = "alloc")]
+impl<T> Empty for alloc::vec::Vec<T> {
+    const EMPTY: Self = Self::new();
+}
+
+#[cfg(feature = "alloc")]
+impl<T: Empty> SlotStorage for alloc::vec::Vec<T> {
+    type Item = T;
+
+    fn slots(&self) -> &[T] {
+        self
+    }
+
+    fn slots_mut(&mut self) -> &mut [T] {
+        self
+    }
+
+    fn reserve(&mut self, capacity: usize) {
+        if !self.is_empty() {
+            return;
+        }
+        self.reserve_exact(capacity);
+        for _ in 0..capacity {
+            self.push(T::EMPTY);
+        }
+    }
+}
+
+/// A table of as many entries as it has slots, in a storage of slots for
+/// its keys and one for its values: arrays ([`FixedTable`]), or vectors made
+/// once when the endpoint starts ([`BootTable`]).
 ///
-/// Lookups scan the array: for the handful of entries a microcontroller holds,
+/// Lookups scan the slots: for the handful of entries a microcontroller holds,
 /// that is smaller and as fast as anything that indexes. A key's position
 /// holds its value; a free position holds the value's [`Empty`] state, so
-/// that an empty table is all zero bytes, and an entry is made by copying
-/// that constant straight into its slot, a `memset` (`DESIGN.md §2`). A key
-/// and a value made together, or a value wrapped in an `Option`, would be
-/// assembled on the stack first.
-pub struct FixedTable<K, V, const N: usize> {
-    keys: [Maybe<K>; N],
-    values: [V; N],
+/// that an empty table of arrays is all zero bytes, and an entry is made by
+/// copying that constant straight into its slot, a `memset` (`DESIGN.md §2`).
+/// A key and a value made together, or a value wrapped in an `Option`, would
+/// be assembled on the stack first.
+pub struct Slotted<KS, VS> {
+    keys: KS,
+    values: VS,
     len: usize,
 }
 
-impl<K, V: Empty, const N: usize> FixedTable<K, V, N> {
-    /// An empty table, built at compile time: all zero bytes.
+/// A table of at most `N` entries, held in arrays.
+pub type FixedTable<K, V, const N: usize> = Slotted<[Maybe<K>; N], [V; N]>;
+
+/// A table whose number of entries is given when the endpoint starts
+/// ([`Table::reserve`]), held in vectors allocated then, once, and never
+/// grown or freed: for a library shipped built, whose integrator chooses its
+/// sizes. Until reserved it holds nothing, and refuses every new key. Only
+/// with `alloc`.
+#[cfg(feature = "alloc")]
+pub type BootTable<K, V> = Slotted<alloc::vec::Vec<Maybe<K>>, alloc::vec::Vec<V>>;
+
+impl<KS: Empty, VS: Empty> Slotted<KS, VS> {
+    /// An empty table, built at compile time: all zero bytes for arrays.
     pub const EMPTY: Self = Self {
-        keys: [const { Maybe::None }; N],
-        values: [const { V::EMPTY }; N],
+        keys: KS::EMPTY,
+        values: VS::EMPTY,
         len: 0,
     };
 
@@ -374,33 +448,48 @@ impl<K, V: Empty, const N: usize> FixedTable<K, V, N> {
     }
 }
 
-impl<K, V: Empty, const N: usize> Default for FixedTable<K, V, N> {
+impl<KS: Empty, VS: Empty> Default for Slotted<KS, VS> {
     fn default() -> Self {
         Self::EMPTY
     }
 }
 
-impl<K: Ord, V, const N: usize> FixedTable<K, V, N> {
+impl<K: Ord, V, KS: SlotStorage<Item = Maybe<K>>, VS: SlotStorage<Item = V>> Slotted<KS, VS> {
     /// Where `key` is held.
     fn position(&self, key: &K) -> Option<usize> {
-        self.keys.iter().position(|k| k.as_ref() == Some(key))
+        self.keys
+            .slots()
+            .iter()
+            .position(|k| k.as_ref() == Some(key))
     }
 
     /// A free slot.
     fn free(&self) -> Option<usize> {
-        self.keys.iter().position(Maybe::is_none)
+        self.keys.slots().iter().position(Maybe::is_none)
+    }
+
+    fn full(&self) -> TableFull {
+        TableFull {
+            capacity: self.keys.slots().len(),
+        }
     }
 }
 
-impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
+impl<K: Ord, V: Empty, KS, VS> Table<K, V> for Slotted<KS, VS>
+where
+    KS: SlotStorage<Item = Maybe<K>>,
+    VS: SlotStorage<Item = V>,
+{
     const EMPTY: Self = Self::EMPTY;
 
     fn insert(&mut self, key: K, value: V) -> Result<Option<V>, CapacityExhausted<K, V>> {
         if let Some(existing) = self.get_mut(&key) {
             return Ok(Some(core::mem::replace(existing, value)));
         }
+        let capacity = self.keys.slots().len();
         let free = self.free();
-        match free.and_then(|at| Some((self.keys.get_mut(at)?, self.values.get_mut(at)?))) {
+        let (keys, values) = (self.keys.slots_mut(), self.values.slots_mut());
+        match free.and_then(|at| Some((keys.get_mut(at)?, values.get_mut(at)?))) {
             Some((slot, held)) => {
                 *slot = Maybe::Some(key);
                 *held = value;
@@ -410,34 +499,40 @@ impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
             None => Err(CapacityExhausted {
                 key,
                 value,
-                capacity: N,
+                capacity,
             }),
         }
     }
 
     fn get(&self, key: &K) -> Option<&V> {
-        self.values.get(self.position(key)?)
+        self.values.slots().get(self.position(key)?)
     }
 
     fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let at = self.position(key)?;
-        self.values.get_mut(at)
+        self.values.slots_mut().get_mut(at)
     }
 
     fn remove(&mut self, key: &K) -> Option<V> {
         let at = self.position(key)?;
-        *self.keys.get_mut(at)? = Maybe::None;
+        *self.keys.slots_mut().get_mut(at)? = Maybe::None;
         self.len -= 1;
-        Some(core::mem::replace(self.values.get_mut(at)?, V::EMPTY))
+        Some(core::mem::replace(
+            self.values.slots_mut().get_mut(at)?,
+            V::EMPTY,
+        ))
     }
 
     fn insert_empty(&mut self, key: K) -> Result<&mut V, TableFull> {
-        let full = TableFull { capacity: N };
+        let full = self.full();
         if let Some(at) = self.position(&key) {
-            return self.values.get_mut(at).ok_or(full);
+            return self.values.slots_mut().get_mut(at).ok_or(full);
         }
         let at = self.free().ok_or(full)?;
-        let (Some(slot), Some(held)) = (self.keys.get_mut(at), self.values.get_mut(at)) else {
+        let (Some(slot), Some(held)) = (
+            self.keys.slots_mut().get_mut(at),
+            self.values.slots_mut().get_mut(at),
+        ) else {
             return Err(full);
         };
         *slot = Maybe::Some(key);
@@ -452,7 +547,10 @@ impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
         let Some(at) = self.position(key) else {
             return false;
         };
-        if let (Some(slot), Some(held)) = (self.keys.get_mut(at), self.values.get_mut(at)) {
+        if let (Some(slot), Some(held)) = (
+            self.keys.slots_mut().get_mut(at),
+            self.values.slots_mut().get_mut(at),
+        ) {
             *slot = Maybe::None;
             // Dropped where it is held, and left empty.
             *held = V::EMPTY;
@@ -466,11 +564,11 @@ impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
     }
 
     fn capacity(&self) -> Option<usize> {
-        Some(N)
+        Some(self.keys.slots().len())
     }
 
     fn for_each(&self, mut f: impl FnMut(&K, &V)) {
-        for (k, v) in self.keys.iter().zip(&self.values) {
+        for (k, v) in self.keys.slots().iter().zip(self.values.slots()) {
             if let Some(k) = k.as_ref() {
                 f(k, v);
             }
@@ -478,7 +576,8 @@ impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
-        for (slot, held) in self.keys.iter_mut().zip(&mut self.values) {
+        let (keys, values) = (self.keys.slots_mut(), self.values.slots_mut());
+        for (slot, held) in keys.iter_mut().zip(values) {
             let drop = match slot.as_ref() {
                 Some(k) => !keep(k, held),
                 None => false,
@@ -493,10 +592,18 @@ impl<K: Ord, V: Empty, const N: usize> Table<K, V> for FixedTable<K, V, N> {
 
     fn first(&self) -> Option<(&K, &V)> {
         self.keys
+            .slots()
             .iter()
-            .zip(&self.values)
+            .zip(self.values.slots())
             .filter_map(|(k, v)| Some((k.as_ref()?, v)))
             .min_by(|(a, _), (b, _)| a.cmp(b))
+    }
+
+    fn reserve(&mut self, capacity: usize) {
+        if self.len == 0 {
+            self.keys.reserve(capacity);
+            self.values.reserve(capacity);
+        }
     }
 }
 
@@ -624,12 +731,21 @@ pub trait Config {
     /// A receiver's anti-replay window, per key pair.
     type ReplayWindow: crate::transport::ReplayWindow;
     /// Datagrams a session holds while it has no keys, bounded in bytes.
-    type Queue: crate::session::DatagramQueue;
+    type Queue: crate::session::DatagramQueue + Empty;
+    /// Where the sessions reopening with datagrams waiting keep their queue:
+    /// lent while they wait, given back when it empties.
+    type Queues<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where an endpoint keeps the dials it is making.
     type Dials<K: Ord, V: Empty>: Table<K, V> + Default;
     /// Where an endpoint maps the indices peers put in packets to their session
-    /// or dial.
+    /// or dial, when [`Self::INDEXED`]; otherwise a table of no entries, never
+    /// used.
     type Indices<K: Ord, V: Empty>: Table<K, V> + Default;
+    /// Whether the endpoint keeps a table of indices. A bounded profile does
+    /// not: it finds an index's owner among its sessions and dials, which hold
+    /// their indices, so that no index outlives its owner and no size is kept
+    /// in step with theirs. A growable one does, for its thousands of sessions.
+    const INDEXED: bool;
     /// Where an endpoint keeps the direct address hints applications give for
     /// peers. Bounded: a full table forgets the hint used least recently.
     type Hints<K: Ord, V: Empty>: Table<K, V> + Default;
@@ -669,8 +785,10 @@ pub struct Sizes {
     pub queue_bytes: usize,
     /// Dials in progress.
     pub dials: usize,
-    /// Indices of sessions and dials.
-    pub indices: usize,
+    /// Sessions that may hold queued datagrams at once, each up to
+    /// `queue_bytes`: a session holds one only while it reopens with
+    /// datagrams waiting.
+    pub queues: usize,
     /// Direct address hints.
     pub hints: usize,
     /// Excluded IP prefixes.
@@ -747,10 +865,12 @@ macro_rules! __fixed_config {
                 $crate::storage::FixedTable<K, V, { $name::SIZES.source_rates }>;
             type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
             type Queue = $crate::session::FixedQueue<{ $name::SIZES.queue_bytes }>;
+            type Queues<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.queues }>;
             type Dials<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::FixedTable<K, V, { $name::SIZES.dials }>;
-            type Indices<K: Ord, V: $crate::storage::Empty> =
-                $crate::storage::FixedTable<K, V, { $name::SIZES.indices }>;
+            type Indices<K: Ord, V: $crate::storage::Empty> = $crate::storage::FixedTable<K, V, 0>;
+            const INDEXED: bool = false;
             type Hints<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::FixedTable<K, V, { $name::SIZES.hints }>;
             type Excluded<K: Ord, V: $crate::storage::Empty> =
@@ -781,10 +901,12 @@ macro_rules! __growable_config {
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.source_rates }>;
             type ReplayWindow = $crate::transport::Window<{ $name::SIZES.replay_words }>;
             type Queue = $crate::session::GrowableQueue<{ $name::SIZES.queue_bytes }>;
+            type Queues<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.queues }>;
             type Dials<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.dials }>;
-            type Indices<K: Ord, V: $crate::storage::Empty> =
-                $crate::storage::GrowableTable<K, V, { $name::SIZES.indices }>;
+            type Indices<K: Ord, V: $crate::storage::Empty> = $crate::storage::GrowableTable<K, V>;
+            const INDEXED: bool = true;
             type Hints<K: Ord, V: $crate::storage::Empty> =
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.hints }>;
             type Excluded<K: Ord, V: $crate::storage::Empty> =
@@ -818,7 +940,8 @@ impl Mcu {
         // 1 KB: a waking sensor's reading leaves with its first handshake.
         queue_bytes: 1024,
         dials: 2,
-        indices: 12,
+        // 2: the sessions reopening at once with datagrams waiting.
+        queues: 2,
         // 4: a device that talks to a handful of peers.
         hints: 4,
         // 4: an overlay's prefix and a few more.
@@ -829,6 +952,43 @@ impl Mcu {
 }
 
 crate::__fixed_config!(Mcu);
+
+/// A device whose sizes are given when its endpoint starts
+/// (`Endpoint::reserve`), not when it is built: every table a
+/// [`BootTable`], allocated once then and never grown or freed, so that a
+/// library shipped built lets its integrator choose them. The queue's bound,
+/// the replay window and the load rate are [`Mcu`]'s, fixed when it is built.
+/// Only with `alloc`.
+#[cfg(feature = "alloc")]
+pub struct Boot;
+
+#[cfg(feature = "alloc")]
+impl Boot {
+    /// The sizes a `Boot` endpoint is usually given: [`Mcu`]'s. Of these,
+    /// `queue_bytes`, `replay_words` and the load rate are fixed when it is
+    /// built; every other one is read when it starts.
+    pub const SIZES: Sizes = Mcu::SIZES;
+}
+
+#[cfg(feature = "alloc")]
+impl Config for Boot {
+    type Contexts<K: Ord, V: Empty> = BootTable<K, V>;
+    type Sessions<K: Ord, V: Empty> = BootTable<K, V>;
+    type Peers<K: Ord, V: Empty> = BootTable<K, V>;
+    type Pending<K: Ord, V: Empty> = BootTable<K, V>;
+    type RecentEphemerals<K: Ord, V: Empty> = BootTable<K, V>;
+    type SourceRates<K: Ord, V: Empty> = BootTable<K, V>;
+    type ReplayWindow = crate::transport::Window<{ Mcu::SIZES.replay_words }>;
+    type Queue = crate::session::FixedQueue<{ Mcu::SIZES.queue_bytes }>;
+    type Queues<K: Ord, V: Empty> = BootTable<K, V>;
+    type Dials<K: Ord, V: Empty> = BootTable<K, V>;
+    type Indices<K: Ord, V: Empty> = FixedTable<K, V, 0>;
+    const INDEXED: bool = false;
+    type Hints<K: Ord, V: Empty> = BootTable<K, V>;
+    type Excluded<K: Ord, V: Empty> = BootTable<K, V>;
+    const LOAD_RATE_PER_SECOND: u32 = Mcu::SIZES.load_rate_per_second;
+    const LOAD_BURST: u32 = Mcu::SIZES.load_burst;
+}
 
 /// A server: tables that grow with what they hold, contexts and sessions as
 /// memory allows; at most 4,096 pending handshakes, recent ephemerals and
@@ -852,7 +1012,7 @@ impl Server {
         // 64 KB, allocated only while a session reopens.
         queue_bytes: 65536,
         dials: 4096,
-        indices: 16384,
+        queues: usize::MAX,
         hints: 4096,
         excluded: 16,
         load_rate_per_second: 1000,

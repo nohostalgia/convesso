@@ -39,6 +39,14 @@ impl<C: StreamConfig> Indexed<C> {
         due: <C::Deadlines<()> as Table<(Instant, Key), ()>>::EMPTY,
     };
 
+    /// Makes room for `channels` channels, in each of its tables, once.
+    pub(crate) fn reserve(&mut self, channels: usize) {
+        self.table.reserve(channels);
+        self.touched.reserve(channels);
+        self.ready.reserve(channels);
+        self.due.reserve(channels);
+    }
+
     pub(crate) fn get(&self, key: &Key) -> Option<&Channel<C>> {
         self.table.get(key)
     }

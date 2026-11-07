@@ -407,6 +407,61 @@ fn a_fifth_channel_on_mcu_is_refused() {
     assert_eq!(channels.memory(fifth, ctx()), None);
 }
 
+/// Scenario: channels sized at start. `Boot` channels given 6 carry
+/// messages on 6 sessions, and refuse a seventh by name.
+#[cfg(feature = "alloc")]
+#[test]
+fn boot_channels_are_sized_at_start() {
+    use crate::config::Boot;
+    let mut channels: Channels<Boot> = Channels::new();
+    channels.reserve(&crate::config::Sizes {
+        channels: 6,
+        ..Boot::SIZES
+    });
+    let mut entropy = Counter(1);
+    let now = Instant::from_millis(0);
+    // Seven sessions: four peers, in two contexts.
+    let sessions: Vec<(PeerId, &[u8])> = (0..4)
+        .flat_map(|i| {
+            [
+                (address(i).peer_id(), &b"ctx"[..]),
+                (address(i).peer_id(), &b"other"[..]),
+            ]
+        })
+        .take(7)
+        .collect();
+    for (peer, context) in &sessions[..6] {
+        channels
+            .send_message(*peer, None, context, b"hello", now, &mut entropy)
+            .unwrap();
+    }
+    let (peer, context) = sessions[6];
+    assert_eq!(
+        channels.send_message(peer, None, context, b"hello", now, &mut entropy),
+        Err(SendError::TableFull)
+    );
+}
+
+/// Scenario: channels not sized hold nothing.
+#[cfg(feature = "alloc")]
+#[test]
+fn boot_channels_not_sized_hold_nothing() {
+    let mut channels: Channels<crate::config::Boot> = Channels::new();
+    let mut entropy = Counter(1);
+    let peer = address(0).peer_id();
+    assert_eq!(
+        channels.send_message(
+            peer,
+            None,
+            b"ctx",
+            b"hello",
+            Instant::from_millis(0),
+            &mut entropy
+        ),
+        Err(SendError::TableFull)
+    );
+}
+
 crate::config! {
     /// `Mcu` with messages up to 1,024 bytes and 2 channels.
     Small: Mcu { max_message: 1024, channels: 2 }
