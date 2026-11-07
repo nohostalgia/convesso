@@ -49,6 +49,14 @@ impl<C: Config> Sessions<C> {
         due: <C::Sessions<(Instant, Key), ()> as Table<(Instant, Key), ()>>::EMPTY,
     };
 
+    /// Makes room for `sessions` sessions, in each of its tables, once.
+    pub(super) fn reserve(&mut self, sessions: usize) {
+        self.table.reserve(sessions);
+        self.touched.reserve(sessions);
+        self.ready.reserve(sessions);
+        self.due.reserve(sessions);
+    }
+
     pub(super) fn get(&self, key: &Key) -> Option<&SessionOf<C>> {
         self.table.get(key)
     }
@@ -88,7 +96,7 @@ impl<C: Config> Sessions<C> {
         self.table.len()
     }
 
-    #[cfg(test)]
+    /// The most sessions it holds, or `None` when it grows without limit.
     pub(super) fn capacity(&self) -> Option<usize> {
         self.table.capacity()
     }

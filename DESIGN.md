@@ -34,8 +34,21 @@ bytes and the next deadline come out.
   handshakes) are supplied by the integrator through a storage configuration: fixed capacity on a
   microcontroller (`Mcu`), growable on a server (`Server`, behind the `alloc` feature). An
   integrator who needs other sizes derives a configuration from either, naming only what changes
-  (`convesso_core::profile!`, and `convesso_stream::config!` for the stream layer's buffers). When
-  a table is full, the core returns a named error instead of growing.
+  (`convesso_core::profile!`, and `convesso_stream::config!` for the stream layer's buffers). A
+  library shipped built cannot be derived from: the `Boot` profile (behind `alloc`) takes its
+  sizes when the endpoint starts, allocates each table once then, and never grows or frees one,
+  so a device with a heap chooses its slots without a rebuild and its heap does not fragment.
+  When a table is full, the core returns a named error instead of growing.
+- **A bounded endpoint serves more peers than it has slots.** A session holds its slot while it
+  is in use; one silent both ways for 30 seconds may be closed to make room for a new peer, with
+  an authenticated close that tells the peer why (§5), so that four slots serve any number of
+  peers that are not all active at once. When no session can make room, a first contact is
+  refused by name rather than accepted and dropped. The pinned relay keeps a session slot, a dial
+  and a pending handshake that peers cannot take: whatever the peers do, the relay can reach the
+  device. A bounded profile keeps no table of the indices peers put in packets: an index is found
+  among the sessions and dials that hold it, so none can outlive its owner. The queue a session
+  fills while it reopens is lent to it, and given back when it empties: the few sessions that
+  reopen at once share a handful of queues.
 - **State lives where the integrator puts it, never on the stack.** A microcontroller's task gets
   a few kilobytes of stack, and an endpoint of the `Mcu` profile is about 19 KB. So every table,
   the endpoint, the stream layer's channels and the embedded driver's slot can be built at compile

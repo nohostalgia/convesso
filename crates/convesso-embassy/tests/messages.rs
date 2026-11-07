@@ -121,6 +121,7 @@ async fn node_with(
                 primary: relay.udp[0],
                 other: relay.udp.get(1).copied(),
             }),
+            ..Default::default()
         },
         datagrams,
         net.stream(ips[0]),

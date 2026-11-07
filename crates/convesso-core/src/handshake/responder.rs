@@ -299,6 +299,16 @@ impl<C: Config> Responder<C> {
         self.identity = Some(identity);
     }
 
+    /// Makes room in its tables for the sizes given, once, before it serves
+    /// anything: for tables sized when the endpoint starts
+    /// ([`crate::storage::BootTable`]); others ignore it.
+    pub fn reserve(&mut self, sizes: &crate::storage::Sizes) {
+        self.contexts.reserve(sizes.contexts);
+        self.pending.reserve(sizes.pending);
+        self.recent.reserve(sizes.recent_ephemerals);
+        self.rates.reserve(sizes.source_rates);
+    }
+
     /// Serves `context`, reached under `access`. A first contact in a context
     /// not served meets silence.
     ///
@@ -563,7 +573,8 @@ impl<C: Config> Responder<C> {
 
         let mut responder_index = draw_index(entropy);
         if decision == WireDecision::Accept {
-            match self.make_room(&peer, entropy) {
+            let bound = matches!(access, Access::Bound(_));
+            match self.make_room(&peer, &context, bound, entropy) {
                 Some(index) => responder_index = index,
                 None => decision = WireDecision::Refuse(RefusalCode::CAPACITY_EXHAUSTED),
             }
@@ -713,9 +724,35 @@ impl<C: Config> Responder<C> {
         found
     }
 
-    /// Makes room for one more pending handshake from `peer` and returns a free
-    /// responder index, or `None` when the responder is full.
-    fn make_room(&mut self, peer: &PeerId, entropy: &mut impl Entropy) -> Option<u32> {
+    /// Makes room for one more pending handshake from `peer` in `context` and
+    /// returns a free responder index, or `None` when the responder is full.
+    /// A context `bound` to one peer, the pinned relay's on a client, is never
+    /// refused for room: it takes the place of the oldest pending handshake of
+    /// another context (`PROTOCOL.md §6`).
+    fn make_room(
+        &mut self,
+        peer: &PeerId,
+        context: &Context,
+        bound: bool,
+        entropy: &mut impl Entropy,
+    ) -> Option<u32> {
+        let full = self
+            .pending
+            .capacity()
+            .is_some_and(|capacity| self.pending.len() >= capacity);
+        if bound && full {
+            let mut oldest: Option<(u64, u32)> = None;
+            self.pending.for_each(|index, pending| {
+                if pending.context != *context
+                    && oldest.is_none_or(|(accepted, _)| pending.accepted < accepted)
+                {
+                    oldest = Some((pending.accepted, *index));
+                }
+            });
+            if let Some((_, index)) = oldest {
+                self.pending.remove(&index);
+            }
+        }
         let mut from_peer = 0;
         let mut oldest: Option<(u64, u32)> = None;
         self.pending.for_each(|index, pending| {

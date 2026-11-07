@@ -29,7 +29,7 @@ use crate::handshake::{
 use crate::identity::{Address, Identity, PeerId};
 use crate::paths::PathKind;
 use crate::relay::{self, Link};
-use crate::session::{DatagramQueue, KeyPair, QueueFull, Session};
+use crate::session::{KeyPair, QueueFull, Session};
 use crate::storage::{Config, Maybe, Table};
 use crate::time::Instant;
 use crate::transport::{self, OVERHEAD, ReplayWindow, TYPE_TRANSPORT, inner};
@@ -37,10 +37,12 @@ use crate::wire::{self, Classified, Version, VersionNotSupported};
 
 mod direct;
 mod index;
+mod queues;
 mod relayed;
 
 pub use direct::ExcludeError;
 use index::{Look, Sessions};
+use queues::Queues;
 pub use relayed::{
     ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintError, HintTooLong, KeepAliveTooShort,
     LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RELAY_AFTER_HINTS, RelayError,
@@ -49,7 +51,7 @@ pub use relayed::{
 use relayed::{Answer, RelayClient};
 
 type Key = (PeerId, Context);
-type SessionOf<C> = Session<<C as Config>::ReplayWindow, <C as Config>::Queue>;
+type SessionOf<C> = Session<<C as Config>::ReplayWindow>;
 
 /// What an index names: a dial's attempt, or a session's key pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,116 @@ pub enum Owner {
 impl crate::storage::Empty for Owner {
     /// What a free slot of the indices holds, never read.
     const EMPTY: Self = Self::Dial(crate::identity::Address::UNSET.peer_id(), Context::EMPTY);
+}
+
+/// The library's close code for a session closed to make room for another
+/// (`PROTOCOL.md §5`), sent as `02 00`.
+pub const CLOSE_TO_MAKE_ROOM: u16 = 0x0002;
+
+/// How long a session of a bounded profile must have done nothing, sent or
+/// heard, before it may be closed to make room for a new one
+/// (`PROTOCOL.md §5`): above the passive keepalive (10 s) and the time UDP
+/// stays proven to the relay (15 s), below the 180 s a silent session keeps
+/// its keys. A peer that exchanges anything twice a minute keeps its place.
+pub const IDLE_BEFORE_EVICTION: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// A close with its inner type and code: what an eviction sends.
+const FAREWELL_LEN: usize = OVERHEAD + 2;
+
+/// A session closed to make room: its close, sealed when it was evicted, and
+/// the event the application is owed once the close left.
+struct Farewell {
+    peer: PeerId,
+    context: Context,
+    close: [u8; FAREWELL_LEN],
+    /// The close's length; 0 when the session had no keys to seal it with.
+    len: usize,
+    to: Hop,
+    sent: bool,
+}
+
+/// Where a new session would go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Room {
+    /// The session exists.
+    Held,
+    /// A slot is free for it.
+    Free,
+    /// This idle session is to be closed to make room.
+    Evict(Key),
+    /// No room: every other session is busy, or the last slot is the relay's.
+    Full,
+}
+
+/// The room for `key`'s session, on a table that the pinned relay's session
+/// `relay` may still need (`PROTOCOL.md §6`). A bounded table keeps its last
+/// slot for the relay session while that is not held, and makes room by
+/// closing the session least recently active among those idle for
+/// [`IDLE_BEFORE_EVICTION`]: never the relay's, nor one dialling, queueing or
+/// closing. `farewell_free`: an eviction's close can be held.
+fn room<C: Config>(
+    sessions: &Sessions<C>,
+    dials: &C::Dials<Key, Dial>,
+    queues: &Queues<C>,
+    relay: Option<Key>,
+    farewell_free: bool,
+    key: &Key,
+    now: Instant,
+) -> Room {
+    if sessions.get(key).is_some() {
+        return Room::Held;
+    }
+    let Some(capacity) = sessions.capacity() else {
+        return Room::Free;
+    };
+    let reserved = relay.is_some_and(|relay| relay != *key && sessions.get(&relay).is_none());
+    let usable = capacity.saturating_sub(usize::from(reserved));
+    let held = sessions.len();
+    if held < usable {
+        return Room::Free;
+    }
+    // One eviction must be enough, and its close must have room.
+    if held.saturating_sub(1) >= usable || !farewell_free {
+        return Room::Full;
+    }
+    let mut victim: Option<(Instant, Key)> = None;
+    sessions.for_each(|held, session| {
+        let spared = Some(*held) == relay
+            || dials.get(held).is_some()
+            || !queues.is_empty(held)
+            || session.closing.is_some();
+        let active = session.last_active().unwrap_or(Instant::from_millis(0));
+        let idle = now >= active.saturating_add(IDLE_BEFORE_EVICTION);
+        if !spared && idle && victim.is_none_or(|(at, _)| active < at) {
+            victim = Some((active, *held));
+        }
+    });
+    victim.map_or(Room::Full, |(_, held)| Room::Evict(held))
+}
+
+/// The application's policy, refusing a first contact whose session could
+/// not be kept: refused by name rather than accepted and dropped at its
+/// confirmation (`PROTOCOL.md §3`).
+struct Roomy<'p, P, H> {
+    inner: &'p mut P,
+    holds: H,
+}
+
+impl<P: Admission, H: FnMut(&PeerId, &[u8]) -> bool> Admission for Roomy<'_, P, H> {
+    fn admit(&mut self, peer: &PeerId, context: &[u8]) -> Decision {
+        if (self.holds)(peer, context) {
+            self.inner.admit(peer, context)
+        } else {
+            Decision::Refuse {
+                code: crate::handshake::RefusalCode::CAPACITY_EXHAUSTED,
+                psk: None,
+            }
+        }
+    }
+
+    fn psk(&mut self, peer: &PeerId, context: &[u8]) -> Option<crate::handshake::Psk> {
+        self.inner.psk(peer, context)
+    }
 }
 
 /// Which stream frame a packet carries (`PROTOCOL.md §8`). The core
@@ -414,9 +526,15 @@ pub struct Endpoint<C: Config> {
     dials: C::Dials<Key, Dial>,
     /// The sessions, with the index of what is due among them.
     sessions: Sessions<C>,
+    /// The queues lent to the sessions reopening with datagrams waiting.
+    queues: Queues<C>,
+    /// The owners of indices, when the profile keeps them (`Config::INDEXED`).
     indices: C::Indices<u32, Owner>,
     /// A response owed to the source of the last packet, sent by the next poll.
     owed: Maybe<([u8; RESPONSE_LEN], Hop)>,
+    /// A session closed to make room, whose close and event the next poll
+    /// owes.
+    farewell: Maybe<Farewell>,
     /// First contacts owed to the hints after the first, one per dial attempt,
     /// by the order they were made in.
     fans: C::Dials<u32, relayed::Fan>,
@@ -465,8 +583,10 @@ impl<C: Config> Endpoint<C> {
         responder: Responder::EMPTY,
         dials: <C::Dials<Key, Dial> as Table<Key, Dial>>::EMPTY,
         sessions: Sessions::EMPTY,
+        queues: Queues::EMPTY,
         indices: <C::Indices<u32, Owner> as Table<u32, Owner>>::EMPTY,
         owed: Maybe::None,
+        farewell: Maybe::None,
         fans: <C::Dials<u32, relayed::Fan> as Table<u32, relayed::Fan>>::EMPTY,
         fan_seq: 0,
         hints: <C::Hints<(PeerId, u8), relayed::Hint> as Table<(PeerId, u8), relayed::Hint>>::EMPTY,
@@ -479,6 +599,25 @@ impl<C: Config> Endpoint<C> {
         #[cfg(any(test, feature = "testing"))]
         check_index: true,
     };
+
+    /// Sizes the tables of an endpoint built empty ([`Self::EMPTY`]) and not
+    /// yet started, for a profile whose sizes are given when it starts
+    /// ([`crate::storage::Boot`]): each table is allocated once, here, and
+    /// never grown or freed. A profile sized when it is built ignores it. Called
+    /// again, or after [`Self::start`], it changes nothing.
+    pub fn reserve(&mut self, sizes: &crate::storage::Sizes) {
+        if self.responder.identity().is_some() {
+            return;
+        }
+        self.responder.reserve(sizes);
+        self.dials.reserve(sizes.dials);
+        self.fans.reserve(sizes.dials);
+        self.sessions.reserve(sizes.sessions);
+        self.queues.reserve(sizes.queues);
+        self.hints.reserve(sizes.hints);
+        self.excluded.reserve(sizes.excluded);
+        self.settings.reserve(sizes.contexts);
+    }
 
     /// Starts an endpoint built empty ([`Self::EMPTY`]), in place: gives it
     /// `identity`, and serves `contexts` under [`Access::Policy`]. Refused,
@@ -622,6 +761,7 @@ impl<C: Config> Endpoint<C> {
                 self.responder.stop_serving(&served);
             }
         }
+        let queues = &mut self.queues;
         self.sessions.retain(|(peer, in_context), session| {
             if *in_context == served
                 && session.accepted
@@ -629,7 +769,7 @@ impl<C: Config> Endpoint<C> {
                 && let Some(code) = refused(access, code, peer, context, policy)
             {
                 session.closing = Some(code.max(1));
-                session.queue.clear();
+                queues.clear(&(*peer, *in_context));
             }
             true
         });
@@ -653,10 +793,11 @@ impl<C: Config> Endpoint<C> {
             return Err(ResponderError::RelayContext);
         }
         let closed = Context::new(context).map_err(ResponderError::ContextTooLong)?;
-        self.sessions.retain(|(_, in_context), session| {
+        let queues = &mut self.queues;
+        self.sessions.retain(|(peer, in_context), session| {
             if *in_context == closed {
                 session.closing.get_or_insert(code.max(1));
-                session.queue.clear();
+                queues.clear(&(*peer, *in_context));
             }
             true
         });
@@ -784,9 +925,29 @@ impl<C: Config> Endpoint<C> {
                 Standing::NoKeys
             }
         };
-        let answered = self
-            .responder
-            .handle_with(packet, source, now, policy, standing, entropy, out);
+        // A session that could not be kept is refused by name, before the
+        // application's policy is asked.
+        let (queues, relay) = (&self.queues, self.relay.as_ref().map(RelayClient::key));
+        let farewell_free = self.farewell.is_none();
+        let mut policy = Roomy {
+            inner: policy,
+            holds: |peer: &PeerId, context: &[u8]| {
+                Context::new(context).is_ok_and(|context| {
+                    room::<C>(
+                        sessions,
+                        dials,
+                        queues,
+                        relay,
+                        farewell_free,
+                        &(*peer, context),
+                        now,
+                    ) != Room::Full
+                })
+            },
+        };
+        let answered =
+            self.responder
+                .handle_with(packet, source, now, &mut policy, standing, entropy, out);
         // This side's opening lost the crossing: its dial ends, and what it
         // carried goes once the peer's handshake gives keys.
         if let Some(key) = yields
@@ -848,7 +1009,7 @@ impl<C: Config> Endpoint<C> {
         else {
             return Output::Nothing;
         };
-        let Some(Owner::Dial(peer, context)) = self.indices.get(&index).copied() else {
+        let Some(Owner::Dial(peer, context)) = self.owner(index) else {
             return Output::Nothing;
         };
         self.dial_event((peer, context), packet, source, now)
@@ -922,7 +1083,8 @@ impl<C: Config> Endpoint<C> {
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
             relay.register_due |= relay.link_open();
         }
-        let Some(session) = self.session_for(key) else {
+        // Held since the dial started, and spared by evictions while it ran.
+        let Some(session) = self.session_for(key, now) else {
             return Output::Nothing;
         };
         if address.is_some() {
@@ -940,18 +1102,24 @@ impl<C: Config> Endpoint<C> {
         let freed = session.promote(pair, established.channel_binding(), first);
         session.connected |= first;
         // The dial carried the head of the queue in its first contact.
-        if session.carried {
-            session.queue.pop();
-            session.carried = false;
+        let carried = core::mem::take(&mut session.carried);
+        if carried {
+            self.queues.pop(&key);
         }
         // The first datagram in the queue confirms as well as a keepalive would.
-        session.confirm = session.queue.is_empty();
-        if let Some(index) = freed {
-            self.indices.remove(&index);
+        let queued = !self.queues.is_empty(&key);
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.confirm = !queued;
         }
-        let _ = self
-            .indices
-            .insert(local_index, Owner::Session(key.0, key.1));
+        if C::INDEXED {
+            if let Some(index) = freed {
+                self.indices.remove(&index);
+            }
+            // Unbounded: an index always finds room.
+            let _ = self
+                .indices
+                .insert(local_index, Owner::Session(key.0, key.1));
+        }
         if first {
             Output::Event(Event::Connected {
                 peer: key.0,
@@ -971,9 +1139,7 @@ impl<C: Config> Endpoint<C> {
         {
             relay.session_failed();
         }
-        if let Some(session) = self.sessions.get_mut(&key) {
-            session.queue.clear();
-        }
+        self.queues.clear(&key);
         Event::ReopenFailed {
             peer: key.0,
             context: key.1,
@@ -991,7 +1157,7 @@ impl<C: Config> Endpoint<C> {
         let Ok(header) = transport::parse_header(packet) else {
             return Output::Nothing;
         };
-        match self.indices.get(&header.receiver_index).copied() {
+        match self.owner(header.receiver_index) {
             Some(Owner::Session(peer, context)) => {
                 self.session_packet((peer, context), packet, header, source, now, out)
             }
@@ -1037,6 +1203,7 @@ impl<C: Config> Endpoint<C> {
         };
         pair.window.accept(header.counter);
         pair.received += 1;
+        session.last_heard = Some(now);
         heard(
             session,
             opened.inner_type,
@@ -1093,8 +1260,17 @@ impl<C: Config> Endpoint<C> {
 
         let key = (peer, context);
         let path = self.may_be_path(source.key());
-        let Some(session) = self.session_for(key) else {
-            return Output::Nothing;
+        let Some(session) = self.session_for(key, now) else {
+            // The room went while the handshake was pending: the initiator,
+            // which holds these keys, is told rather than left sending into
+            // nothing.
+            return match close_unheld(&mut pair, out) {
+                Some(len) => Output::Transmit {
+                    to: relayed::answer_hop(source),
+                    len,
+                },
+                None => Output::Nothing,
+            };
         };
         session.accepted = true;
         // The first packet of a pending pair: the newest it has, and the
@@ -1104,12 +1280,15 @@ impl<C: Config> Endpoint<C> {
         let first = opens;
         let freed = session.promote(pair, &binding, opens);
         session.connected |= first;
-        if let Some(index) = freed {
-            self.indices.remove(&index);
+        if C::INDEXED {
+            if let Some(index) = freed {
+                self.indices.remove(&index);
+            }
+            // Unbounded: an index always finds room.
+            let _ = self
+                .indices
+                .insert(local_index, Owner::Session(peer, context));
         }
-        let _ = self
-            .indices
-            .insert(local_index, Owner::Session(peer, context));
         self.last_opened = Maybe::Some((key, true));
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
             relay.register_due |= relay.link_open();
@@ -1303,7 +1482,7 @@ impl<C: Config> Endpoint<C> {
                 session.address = address;
             }
             let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
-            if live && session.queue.is_empty() {
+            if live && self.queues.is_empty(&key) {
                 return self.seal_live(key, inner::DATAGRAM, data, now, out);
             }
         }
@@ -1324,18 +1503,19 @@ impl<C: Config> Endpoint<C> {
             if !pending && !live {
                 return Err(SendError::AddressUnknown);
             }
-            let session = self.session_for(key).ok_or(SendError::Capacity)?;
-            session.queue.push(data).map_err(SendError::QueueFull)?;
+            self.session_for(key, now).ok_or(SendError::Capacity)?;
+            self.queues.push(key, data).map_err(SendError::QueueFull)?;
             return Ok(Output::Nothing);
         };
-        let session = self.session_for(key).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
         session.address = Some(address);
         if at.is_some() && !live {
             // Reopened where the caller knows the peer is.
             session.last_source = at;
         }
-        session.queue.push(data).map_err(SendError::QueueFull)?;
-        if dialling || pending || session.current.as_ref().is_some_and(|pair| pair.live(now)) {
+        let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
+        self.queues.push(key, data).map_err(SendError::QueueFull)?;
+        if dialling || pending || live {
             return Ok(Output::Nothing);
         }
         self.start_dial(
@@ -1506,7 +1686,7 @@ impl<C: Config> Endpoint<C> {
         if self.dials.get(&key).is_some() || self.is_live(&key.0, context.as_bytes(), now) {
             return Ok(Output::Nothing);
         }
-        let session = self.session_for(key).ok_or(SendError::Capacity)?;
+        let session = self.session_for(key, now).ok_or(SendError::Capacity)?;
         session.address = Some(*address);
         let len = self.start_dial(key, address, None, false, now, policy, entropy, out)?;
         Ok(Output::Transmit {
@@ -1552,12 +1732,21 @@ impl<C: Config> Endpoint<C> {
         let payload = if renewal {
             &[][..]
         } else {
-            wake_payload(&self.sessions, early_data, &key, out.len(), path_max)
+            wake_payload(&self.queues, early_data, &key, out.len(), path_max)
         };
         if !Dial::fits(payload.len(), out.len()) {
             return Err(SendError::Capacity);
         }
         let identity = self.responder.identity().ok_or(SendError::NotStarted)?;
+        // The last free dial is the pinned relay's while its session is not
+        // being dialled (`PROTOCOL.md §6`).
+        let relay = self.relay.as_ref().map(RelayClient::key);
+        if let Some(capacity) = self.dials.capacity()
+            && relay.is_some_and(|relay| relay != key && self.dials.get(&relay).is_none())
+            && self.dials.len() + 1 >= capacity
+        {
+            return Err(SendError::Capacity);
+        }
         // Made where it is kept: a dial never crosses the stack.
         let dial = self
             .dials
@@ -1565,8 +1754,11 @@ impl<C: Config> Endpoint<C> {
             .map_err(|_| SendError::Capacity)?;
         dial.open(address, key.1, psk, renewal, now);
         let len = dial.first_attempt(identity, payload, now, entropy, out);
-        for index in dial.attempt_indices() {
-            let _ = self.indices.insert(index, Owner::Dial(key.0, key.1));
+        if C::INDEXED {
+            for index in dial.attempt_indices() {
+                // Unbounded: an index always finds room.
+                let _ = self.indices.insert(index, Owner::Dial(key.0, key.1));
+            }
         }
         let carried = !payload.is_empty();
         if let Some(session) = self.sessions.get_mut(&key) {
@@ -1654,10 +1846,11 @@ impl<C: Config> Endpoint<C> {
     /// closes leave through [`Self::poll`]), and discards its dials, pending
     /// handshakes and queued datagrams.
     pub fn close_peer(&mut self, peer: PeerId, code: u16) {
-        self.sessions.retain(|(p, _), session| {
+        let queues = &mut self.queues;
+        self.sessions.retain(|(p, in_context), session| {
             if *p == peer {
                 session.closing = Some(code.max(1));
-                session.queue.clear();
+                queues.clear(&(*p, *in_context));
             }
             true
         });
@@ -1771,6 +1964,32 @@ impl<C: Config> Endpoint<C> {
             };
         }
 
+        // A session closed to make room: its close, then its event.
+        if let Some(farewell) = self.farewell.as_mut() {
+            if !farewell.sent {
+                farewell.sent = true;
+                if let (Some(field), Some(close)) = (
+                    out.get_mut(..farewell.len),
+                    farewell.close.get(..farewell.len),
+                ) && farewell.len > 0
+                {
+                    field.copy_from_slice(close);
+                    return Poll::Transmit {
+                        to: farewell.to,
+                        len: farewell.len,
+                    };
+                }
+            }
+            let (peer, context) = (farewell.peer, farewell.context);
+            self.farewell = Maybe::None;
+            return Poll::Event(Event::Closed {
+                peer,
+                context,
+                code: CLOSE_TO_MAKE_ROOM,
+                by_peer: false,
+            });
+        }
+
         // Dials whose next step is due.
         let mut due_dial = None;
         self.dials.for_each(|key, dial| {
@@ -1781,11 +2000,14 @@ impl<C: Config> Endpoint<C> {
         if let Some(key) = due_dial
             && let Some(identity) = self.responder.identity()
         {
-            let payload: &[u8] = self
+            let carried = self
                 .sessions
                 .get(&key)
-                .filter(|session| session.carried)
-                .and_then(|session| session.queue.front())
+                .is_some_and(|session| session.carried);
+            let payload: &[u8] = self
+                .queues
+                .front(&key)
+                .filter(|_| carried)
                 .unwrap_or_default();
             if let Some(dial) = self.dials.get_mut(&key) {
                 match dial.poll_with_payload(identity, payload, now, entropy, out) {
@@ -1796,8 +2018,11 @@ impl<C: Config> Endpoint<C> {
                             *slot = index;
                             count += 1;
                         }
-                        for index in indices.iter().take(count) {
-                            let _ = self.indices.insert(*index, Owner::Dial(key.0, key.1));
+                        if C::INDEXED {
+                            for index in indices.iter().take(count) {
+                                // Unbounded: an index always finds room.
+                                let _ = self.indices.insert(*index, Owner::Dial(key.0, key.1));
+                            }
                         }
                         let last_source = self.sessions.get(&key).and_then(|s| {
                             direct::route_source(key.0, s, now, self.relay.is_some())
@@ -1819,12 +2044,12 @@ impl<C: Config> Endpoint<C> {
 
         // Sessions with something to send now.
         let mut due_session = None;
-        let dials = &self.dials;
+        let (dials, queues) = (&self.dials, &self.queues);
         let generation = self.own.owed_generation();
         // The ready sessions with nothing to do leave the set; one whose
         // renewal holds back its idle stays until the renewal ends.
         self.sessions.retain_ready(|key, session| {
-            let wants = wants(key, session, now, generation, dials);
+            let wants = wants(key, session, now, generation, dials, !queues.is_empty(key));
             if wants && due_session.is_none() {
                 due_session = Some(*key);
             }
@@ -1833,8 +2058,9 @@ impl<C: Config> Endpoint<C> {
         #[cfg(any(test, feature = "testing"))]
         if self.check_index {
             let mut walk = false;
-            self.sessions
-                .for_each(|key, session| walk |= wants(key, session, now, generation, dials));
+            self.sessions.for_each(|key, session| {
+                walk |= wants(key, session, now, generation, dials, !queues.is_empty(key));
+            });
             assert_eq!(
                 due_session.is_some(),
                 walk,
@@ -1950,16 +2176,17 @@ impl<C: Config> Endpoint<C> {
             return Some(poll);
         }
 
+        let queued = !self.queues.is_empty(&key);
         let session = self.sessions.get_mut(&key)?;
         let owed = session.confirm
-            || !session.queue.is_empty()
+            || queued
             || session
                 .passive_keepalive_due()
                 .is_some_and(|due| due <= now);
         if !owed {
             return None;
         }
-        if !session.queue.is_empty() {
+        if queued {
             direct::note_use(&mut session.paths, now);
         }
         let to = Hop::Peer {
@@ -1968,7 +2195,7 @@ impl<C: Config> Endpoint<C> {
             attempt: None,
         };
         let pair = session.current.as_mut().filter(|pair| pair.live(now))?;
-        let (inner_type, data): (u8, &[u8]) = match session.queue.front() {
+        let (inner_type, data): (u8, &[u8]) = match self.queues.front(&key) {
             Some(datagram) => (inner::DATAGRAM, datagram),
             None => (inner::KEEPALIVE, &[]),
         };
@@ -1982,16 +2209,19 @@ impl<C: Config> Endpoint<C> {
         )
         .ok()?;
         pair.next_counter += 1;
-        if inner_type == inner::DATAGRAM {
-            session.queue.pop();
-        }
         session.confirm = false;
         session.last_sent = Some(now);
+        if inner_type == inner::DATAGRAM {
+            self.queues.pop(&key);
+        }
         Some(Poll::Transmit { to, len })
     }
 
     /// The next instant anything is due, or `None` when nothing ever is.
     fn next_deadline(&self) -> Option<Instant> {
+        if self.farewell.is_some() {
+            return Some(Instant::from_millis(0));
+        }
         let mut next: Option<Instant> = self.responder.next_deadline();
         let mut consider = |at: Instant| {
             next = Some(next.map_or(at, |n| n.min(at)));
@@ -2035,33 +2265,91 @@ impl<C: Config> Endpoint<C> {
     /// endpoint thus holds the sessions in use, whatever the peers it met.
     fn expire(&mut self, now: Instant) {
         let indices = &mut self.indices;
-        let dials = &self.dials;
+        let (dials, queues) = (&self.dials, &self.queues);
         let generation = self.own.owed_generation();
         self.sessions.refresh(now, |key, session| {
             for index in session.expire(now).into_iter().flatten() {
-                indices.remove(&index);
+                if C::INDEXED {
+                    indices.remove(&index);
+                }
             }
-            look(key, session, now, generation, dials)
+            look(key, session, now, generation, dials, !queues.is_empty(key))
         });
         #[cfg(any(test, feature = "testing"))]
         if self.check_index {
             self.sessions.check(now, |key, session| {
-                look(key, session, now, generation, dials)
+                look(key, session, now, generation, dials, !queues.is_empty(key))
             });
         }
     }
 
-    /// The session for `key`, created if needed; `None` when the table is
-    /// full. Nothing is evicted to make room: the sessions held are in use.
-    fn session_for(&mut self, key: Key) -> Option<&mut SessionOf<C>> {
-        if self.sessions.get(&key).is_none() {
-            let passive_keepalive = self.settings_of(&key.1).passive_keepalive;
-            // Made where it is kept: a session never crosses the stack.
-            let session = self.sessions.insert_empty(key)?;
-            session.passive_keepalive = passive_keepalive;
-            return Some(session);
+    /// The room for `key`'s session at `now`, as [`room`] says.
+    fn room(&self, key: &Key, now: Instant) -> Room {
+        room::<C>(
+            &self.sessions,
+            &self.dials,
+            &self.queues,
+            self.relay.as_ref().map(RelayClient::key),
+            self.farewell.is_none(),
+            key,
+            now,
+        )
+    }
+
+    /// Closes `victim` to make room: its close is sealed now, under its live
+    /// keys if it has any, and leaves with the next poll, which then tells
+    /// the application (`PROTOCOL.md §5`).
+    fn evict(&mut self, victim: Key, now: Instant) {
+        let mut close = [0u8; FAREWELL_LEN];
+        let mut len = 0;
+        let mut to = Hop::Source;
+        let relayed = self.relay.is_some();
+        if let Some(session) = self.sessions.get_mut(&victim) {
+            to = Hop::Peer {
+                peer: victim.0,
+                last_source: direct::route_source(victim.0, session, now, relayed),
+                attempt: None,
+            };
+            if let Some(pair) = session.current.as_mut().filter(|pair| pair.live(now))
+                && let Ok(sealed) = transport::seal(
+                    &pair.send,
+                    pair.remote_index,
+                    pair.next_counter,
+                    inner::CLOSE,
+                    &CLOSE_TO_MAKE_ROOM.to_le_bytes(),
+                    &mut close,
+                )
+            {
+                pair.next_counter += 1;
+                len = sealed;
+            }
         }
-        self.sessions.get_mut(&key)
+        self.remove_session(victim);
+        self.farewell = Maybe::Some(Farewell {
+            peer: victim.0,
+            context: victim.1,
+            close,
+            len,
+            to,
+            sent: false,
+        });
+    }
+
+    /// The session for `key`, created if needed, closing an idle session to
+    /// make room when the table is full ([`room`]); `None` when there is no
+    /// room.
+    fn session_for(&mut self, key: Key, now: Instant) -> Option<&mut SessionOf<C>> {
+        match self.room(&key, now) {
+            Room::Held => return self.sessions.get_mut(&key),
+            Room::Free => {}
+            Room::Evict(victim) => self.evict(victim, now),
+            Room::Full => return None,
+        }
+        let passive_keepalive = self.settings_of(&key.1).passive_keepalive;
+        // Made where it is kept: a session never crosses the stack.
+        let session = self.sessions.insert_empty(key)?;
+        session.passive_keepalive = passive_keepalive;
+        Some(session)
     }
 
     fn remove_session(&mut self, key: Key) {
@@ -2075,6 +2363,7 @@ impl<C: Config> Endpoint<C> {
         }
         // Dropped where it is kept.
         self.sessions.discard(&key);
+        self.queues.clear(&key);
         self.remove_dial(key);
     }
 
@@ -2109,13 +2398,35 @@ impl<C: Config> Endpoint<C> {
         }
     }
 
+    /// The owner of `index`: from the table of indices when the profile keeps
+    /// one, otherwise found among the sessions and dials that hold it.
+    fn owner(&self, index: u32) -> Option<Owner> {
+        if C::INDEXED {
+            return self.indices.get(&index).copied();
+        }
+        let mut found = None;
+        self.sessions.for_each(|key, session| {
+            let holds = [session.current.as_ref(), session.previous.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|pair| pair.local_index == index);
+            if holds && found.is_none() {
+                found = Some(Owner::Session(key.0, key.1));
+            }
+        });
+        found.or_else(|| {
+            dial_owning::<C>(&self.indices, &self.dials, index)
+                .map(|(peer, context)| Owner::Dial(peer, context))
+        })
+    }
+
     /// The peer whose session a transport packet names by its receiver index,
     /// without opening it: what a relay checks before handling a packet on a
     /// link bound to another key.
     #[must_use]
     pub fn owner_of(&self, packet: &[u8]) -> Option<PeerId> {
         let header = transport::parse_header(packet).ok()?;
-        match self.indices.get(&header.receiver_index).copied()? {
+        match self.owner(header.receiver_index)? {
             Owner::Session(peer, _) | Owner::Dial(peer, _) => Some(peer),
         }
     }
@@ -2169,8 +2480,8 @@ struct Arrival<'s> {
 /// of the previous pair does not: it is older than every packet of the current
 /// one. Nor does a path the peer has not sent on yet: it may not have taken it
 /// yet, and will once this side's packets arrive there.
-fn heard<W, Q>(
-    session: &mut Session<W, Q>,
+fn heard<W>(
+    session: &mut Session<W>,
     inner_type: u8,
     source: Source<'_>,
     path: bool,
@@ -2206,21 +2517,60 @@ fn heard<W, Q>(
     }
 }
 
+/// Seals, under `pair`, the close a side sends for keys it cannot keep for
+/// want of room ([`CLOSE_TO_MAKE_ROOM`]); its length.
+fn close_unheld<W: ReplayWindow>(pair: &mut KeyPair<W>, out: &mut [u8]) -> Option<usize> {
+    let len = transport::seal(
+        &pair.send,
+        pair.remote_index,
+        pair.next_counter,
+        inner::CLOSE,
+        &CLOSE_TO_MAKE_ROOM.to_le_bytes(),
+        out,
+    )
+    .ok()?;
+    pair.next_counter += 1;
+    Some(len)
+}
+
+/// The dial whose attempt registered `index`: from the table of indices when
+/// the profile keeps one, otherwise found among the dials.
+fn dial_owning<C: Config>(
+    indices: &C::Indices<u32, Owner>,
+    dials: &C::Dials<Key, Dial>,
+    index: u32,
+) -> Option<Key> {
+    if C::INDEXED {
+        return match indices.get(&index)? {
+            Owner::Dial(peer, context) => Some((*peer, *context)),
+            Owner::Session(..) => None,
+        };
+    }
+    let mut found = None;
+    dials.for_each(|key, dial| {
+        if found.is_none() && dial.attempt_indices().any(|attempt| attempt == index) {
+            found = Some(*key);
+        }
+    });
+    found
+}
+
 /// Whether `key`'s session owes the peer this endpoint's list of
 /// `generation`: never in the relay context, which is the relay's own session.
 /// What the index makes of a session: forgotten when it has no keys and
 /// nothing in progress after it was told idle; otherwise its next deadline,
 /// and whether it may have something to do now.
-fn look<W: ReplayWindow, Q: DatagramQueue>(
+fn look<W: ReplayWindow>(
     key: &Key,
-    session: &Session<W, Q>,
+    session: &Session<W>,
     now: Instant,
     generation: Option<u16>,
     dials: &impl Table<Key, Dial>,
+    queued: bool,
 ) -> Look {
     if session.dormant()
         && !session.connected
-        && session.queue.is_empty()
+        && !queued
         && session.closing.is_none()
         && dials.get(key).is_none()
     {
@@ -2229,22 +2579,23 @@ fn look<W: ReplayWindow, Q: DatagramQueue>(
     Look::Keep {
         deadline: session_deadline(session),
         ready: (session.connected && session.dormant())
-            || wants(key, session, now, generation, dials),
+            || wants(key, session, now, generation, dials, queued),
     }
 }
 
 /// Whether a session has something to send at `now`.
-fn wants<W: ReplayWindow, Q: DatagramQueue>(
+fn wants<W: ReplayWindow>(
     key: &Key,
-    session: &Session<W, Q>,
+    session: &Session<W>,
     now: Instant,
     generation: Option<u16>,
     dials: &impl Table<Key, Dial>,
+    queued: bool,
 ) -> bool {
     let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
     session.closing.is_some()
         || (live && session.confirm)
-        || (live && !session.queue.is_empty())
+        || (live && queued)
         || (live && candidates_owed(key, session, generation))
         || (session.rekey && session.address.is_some() && dials.get(key).is_none())
         || session
@@ -2255,7 +2606,7 @@ fn wants<W: ReplayWindow, Q: DatagramQueue>(
 
 /// The next instant a session has anything due: its keys' expiry, its
 /// passive keepalive, its path work.
-fn session_deadline<W: ReplayWindow, Q: DatagramQueue>(session: &Session<W, Q>) -> Option<Instant> {
+fn session_deadline<W: ReplayWindow>(session: &Session<W>) -> Option<Instant> {
     [
         session.current.as_ref().map(KeyPair::expires_at),
         session.previous.as_ref().map(KeyPair::expires_at),
@@ -2271,10 +2622,10 @@ fn session_deadline<W: ReplayWindow, Q: DatagramQueue>(session: &Session<W, Q>) 
 /// a first contact and an output of `room` bytes: in the relay context; and
 /// in a context that carries early data (`early_data`), when the dial starts
 /// from a send whose path takes `path_max` bytes, the first contact fitting
-/// that path too. A function of the sessions alone, so that the dial it is
-/// for can be made in its own table meanwhile.
+/// that path too. A function of the queues alone, so that the dial it is for
+/// can be made in its own table meanwhile.
 fn wake_payload<'s, C: Config>(
-    sessions: &'s Sessions<C>,
+    queues: &'s Queues<C>,
     early_data: bool,
     key: &Key,
     room: usize,
@@ -2288,9 +2639,8 @@ fn wake_payload<'s, C: Config>(
             _ => return &[],
         }
     };
-    sessions
-        .get(key)
-        .and_then(|session| session.queue.front())
+    queues
+        .front(key)
         .filter(|head| {
             head.len() <= crate::handshake::MAX_PAYLOAD
                 && room >= crate::handshake::FIRST_CONTACT_LEN + head.len()
@@ -2298,7 +2648,7 @@ fn wake_payload<'s, C: Config>(
         .unwrap_or_default()
 }
 
-fn candidates_owed<W, Q>(key: &Key, session: &Session<W, Q>, generation: Option<u16>) -> bool {
+fn candidates_owed<W>(key: &Key, session: &Session<W>, generation: Option<u16>) -> bool {
     let relayed = session
         .last_source
         .is_some_and(|source| source.relayed_from().is_some());

@@ -199,6 +199,36 @@ impl Mcu {
 
 crate::__fixed_stream_config!(Mcu);
 
+/// A device whose number of channels is given when they start
+/// ([`Channels::reserve`](crate::Channels::reserve)), not when it is built:
+/// each channel's buffers are [`Mcu`]'s, fixed arrays; the tables of channels
+/// are allocated once then, and never grown or freed, so that a library
+/// shipped built lets its integrator choose how many. Only with `alloc`.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boot;
+
+#[cfg(feature = "alloc")]
+impl Boot {
+    /// The sizes `Boot` channels are usually given: [`Mcu`]'s. Of these, only
+    /// `channels` and `contexts` are read when they start; the buffers are
+    /// fixed when it is built.
+    pub const SIZES: Sizes = Mcu::SIZES;
+}
+
+#[cfg(feature = "alloc")]
+impl StreamConfig for Boot {
+    const MAX_MESSAGE: usize = Mcu::SIZES.max_message;
+    type SendQueue = FixedQueue<{ Mcu::SIZES.send_bytes }>;
+    type Lengths = FixedSlots<u32, { Mcu::SIZES.send_messages }>;
+    type InFlight = FixedSlots<Sent, { Mcu::SIZES.in_flight }>;
+    type ReceiveArena = FixedArena<{ Mcu::SIZES.receive_bytes }>;
+    type Stored = FixedSlots<Stored, { Mcu::SIZES.stored }>;
+    type Channels<V: Empty> = convesso_core::storage::BootTable<Key, V>;
+    type Deadlines<V: Empty> = convesso_core::storage::BootTable<(Instant, Key), V>;
+    type Contexts<V: Empty> = convesso_core::storage::BootTable<Context, V>;
+}
+
 /// The server configuration: messages up to 262,144 bytes (256 KiB), buffers
 /// that grow to twice that per channel and are released when they empty. Only
 /// with the `alloc` feature.

@@ -259,7 +259,15 @@ Other values are reserved: such a packet is counted against replay, and its cont
 - **Close** is one authenticated packet with a code. It is not retransmitted. Codes `0x0001` to
   `0x00FF` are the library's, `0x0100` to `0xFFFF` the application's, as for refusals; `0x0000` is
   not sent. `0x0001` is a close without a code: one asked with `0x0000`, or a context closed by
-  dropping its handle (`DESIGN.md §10`).
+  dropping its handle (`DESIGN.md §10`). `0x0002` (`02 00`) closes a session to make room for
+  another.
+- **Room.** An endpoint with a bounded session table that needs a slot for a new session closes
+  the session least recently active among those silent both ways for 30 seconds, never the
+  pinned relay's, nor one dialling, with queued datagrams or closing, with code `0x0002`. When none
+  can be closed, it refuses the first contact with `0x0001`, rather than accept a handshake whose
+  session it could not keep; and a confirmation that finds no room after all is answered with a
+  close `0x0002`, under the keys it confirms. The pinned relay's session, a dial and a pending
+  handshake in the relay context are kept from the peers (§6).
 - **A datagram too large for the path is refused,** never truncated.
 - **The channel binding** of a session is that of the handshake that opened it, kept across
   renewals. It is forgotten, with what the session knew of its paths, when the session is told

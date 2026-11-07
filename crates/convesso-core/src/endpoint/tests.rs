@@ -1747,14 +1747,7 @@ fn a_frame_on_a_dormant_session_is_refused_not_queued() {
     assert_eq!(net.a.first_contacts_sent(), contacts_after);
     assert_eq!(net.a.sent.len(), sent, "nothing sent");
     let key = (net.b.peer_id(), ctx());
-    assert!(
-        net.a
-            .endpoint
-            .sessions
-            .get(&key)
-            .is_none_or(|session| session.queue.is_empty()),
-        "nothing queued"
-    );
+    assert!(net.a.endpoint.queues.is_empty(&key), "nothing queued");
     assert!(contacts_after > contacts);
     assert!(net.b_frames().is_empty());
 }
@@ -3509,23 +3502,33 @@ impl<C: Config> Waiting<C> {
     }
 
     fn relay_session(&mut self) -> &mut SessionOf<C> {
-        let key = (
+        self.endpoint.sessions.get_mut(&Self::relay_key()).unwrap()
+    }
+
+    fn relay_key() -> Key {
+        (
             identity(4).peer_id(),
             Context::new(crate::relay::CONTEXT).unwrap(),
-        );
-        self.endpoint.sessions.get_mut(&key).unwrap()
+        )
+    }
+
+    /// Queues `frame` in the relay session, as a send does.
+    fn queue_relay_frame(&mut self, frame: &[u8]) {
+        assert!(self.endpoint.sessions.get(&Self::relay_key()).is_some());
+        self.endpoint.queues.push(Self::relay_key(), frame).unwrap();
     }
 
     /// The relay session's queue, in order, left as it was.
     fn queued(&mut self) -> Vec<Vec<u8>> {
-        let queue = &mut self.relay_session().queue;
+        let key = Self::relay_key();
+        let queues = &mut self.endpoint.queues;
         let mut frames = Vec::new();
-        while let Some(frame) = queue.front() {
+        while let Some(frame) = queues.front(&key) {
             frames.push(frame.to_vec());
-            queue.pop();
+            queues.pop(&key);
         }
         for frame in &frames {
-            queue.push(frame).unwrap();
+            queues.push(key, frame).unwrap();
         }
         frames
     }
@@ -3601,7 +3604,7 @@ fn datagrams_and_other_dials_attempts_stay_in_the_queue() {
     datagram.extend_from_slice(&c);
     datagram.extend_from_slice(&[0x01, 0x04, 0, 0, 0, 0]);
     datagram.extend_from_slice(&[0; 40]);
-    a.relay_session().queue.push(&datagram).unwrap();
+    a.queue_relay_frame(&datagram);
     let before = kinds(&a.queued());
     let [
         head @ Queued::Attempt(..),
@@ -4274,7 +4277,7 @@ fn early_data_arrives_at_most_once_per_attempt() {
 crate::profile! {
     /// The server profile with room for many sessions with keys, admitting
     /// handshakes as fast as a measurement makes them.
-    Wide: Server { indices: 100_000, load_rate_per_second: 10_000_000, load_burst: 10_000_000 }
+    Wide: Server { load_rate_per_second: 10_000_000, load_burst: 10_000_000 }
 }
 
 /// The cost of one datagram each way between a server-profile endpoint and
@@ -4499,3 +4502,5 @@ fn a_start_refused_changes_nothing() {
     endpoint.start(identity(0), &[b"a", b"b"]).unwrap();
     assert!(endpoint.serves(b"a") && endpoint.serves(b"b"));
 }
+
+mod room;

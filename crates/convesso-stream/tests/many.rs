@@ -23,7 +23,7 @@ use convesso_stream::{Channels, Event, Poll};
 convesso_core::profile! {
     /// The server profile with room for many sessions, admitting handshakes
     /// as fast as a measurement makes them.
-    Wide: Server { indices: 100_000, load_rate_per_second: 10_000_000, load_burst: 10_000_000 }
+    Wide: Server { load_rate_per_second: 10_000_000, load_burst: 10_000_000 }
 }
 
 struct Open;

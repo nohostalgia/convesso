@@ -164,6 +164,19 @@ impl<C: StreamConfig> Default for Channels<C> {
 }
 
 impl<C: StreamConfig> Channels<C> {
+    /// Sizes the tables of channels with none yet, for a configuration whose
+    /// number of channels is given when they start ([`config::Boot`]): each
+    /// table is allocated once, here, and never grown or freed. Reads
+    /// `sizes.channels` and `sizes.contexts`; a configuration sized when it is
+    /// built ignores it, and so do channels that hold any.
+    pub fn reserve(&mut self, sizes: &config::Sizes) {
+        if self.table.len() > 0 {
+            return;
+        }
+        self.table.reserve(sizes.channels);
+        self.contexts.reserve(sizes.contexts);
+    }
+
     /// No channel yet; every message is handed out as soon as the driver can
     /// deliver it.
     #[must_use]

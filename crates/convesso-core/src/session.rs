@@ -120,6 +120,10 @@ impl<const N: usize> FixedQueue<N> {
     }
 }
 
+impl<const N: usize> crate::storage::Empty for FixedQueue<N> {
+    const EMPTY: Self = <Self as DatagramQueue>::EMPTY;
+}
+
 impl<const N: usize> DatagramQueue for FixedQueue<N> {
     const LIMIT: usize = N;
     const EMPTY: Self = Self {
@@ -215,6 +219,11 @@ impl<const N: usize> DatagramQueue for FixedQueue<N> {
 pub struct GrowableQueue<const LIMIT: usize> {
     datagrams: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
     used: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl<const LIMIT: usize> crate::storage::Empty for GrowableQueue<LIMIT> {
+    const EMPTY: Self = <Self as DatagramQueue>::EMPTY;
 }
 
 #[cfg(feature = "alloc")]
@@ -347,11 +356,10 @@ impl<W: ReplayWindow> KeyPair<W> {
 }
 
 /// A session with one peer in one context.
-pub(crate) struct Session<W, Q> {
+pub(crate) struct Session<W> {
     pub(crate) address: Option<Address>,
     pub(crate) current: Maybe<KeyPair<W>>,
     pub(crate) previous: Maybe<KeyPair<W>>,
-    pub(crate) queue: Q,
     pub(crate) last_source: Option<SourceKey>,
     /// Set when this side completed a handshake as initiator and owes the
     /// responder its confirming packet.
@@ -363,6 +371,8 @@ pub(crate) struct Session<W, Q> {
     pub(crate) passive_keepalive: bool,
     pub(crate) last_received_data: Option<Instant>,
     pub(crate) last_sent: Option<Instant>,
+    /// When a packet of the session was last authenticated, of any kind.
+    pub(crate) last_heard: Option<Instant>,
     /// Whether the application was told of this session's connection and not
     /// yet that it went idle (`PROTOCOL.md §5`): a handshake while it is set
     /// is a silent renewal.
@@ -383,14 +393,13 @@ pub(crate) struct Session<W, Q> {
     pub(crate) deadline: Option<Instant>,
 }
 
-impl<W: ReplayWindow, Q: DatagramQueue> crate::storage::Empty for Session<W, Q> {
+impl<W: ReplayWindow> crate::storage::Empty for Session<W> {
     /// A session with no keys, made in the sessions' table and then given
     /// its settings.
     const EMPTY: Self = Self {
         address: None,
         current: Maybe::None,
         previous: Maybe::None,
-        queue: Q::EMPTY,
         last_source: None,
         confirm: false,
         rekey: false,
@@ -398,6 +407,7 @@ impl<W: ReplayWindow, Q: DatagramQueue> crate::storage::Empty for Session<W, Q> 
         passive_keepalive: false,
         last_received_data: None,
         last_sent: None,
+        last_heard: None,
         connected: false,
         accepted: false,
         carried: false,
@@ -407,7 +417,19 @@ impl<W: ReplayWindow, Q: DatagramQueue> crate::storage::Empty for Session<W, Q> 
     };
 }
 
-impl<W: ReplayWindow, Q: DatagramQueue> Session<W, Q> {
+impl<W: ReplayWindow> Session<W> {
+    /// When the session last did anything: sent, was heard, or got its keys.
+    pub(crate) fn last_active(&self) -> Option<Instant> {
+        [
+            self.last_sent,
+            self.last_heard,
+            self.current.as_ref().map(|pair| pair.created),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
     /// Deletes every key pair past its life. Returns the local indices freed.
     /// What the session knew of its paths and its binding stays until it is
     /// told idle ([`Self::end_life`]): a renewal still in flight keeps them.
