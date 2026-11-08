@@ -432,6 +432,10 @@ impl MemListener {
 
 /// The `i`-th identity of `identity.json`, through a provisioning record.
 pub fn identity(i: usize) -> convesso_core::identity::Identity {
+    // Beyond the vectors' keys, one derived from a seed.
+    if i >= 5 {
+        return convesso_core::identity::Identity::from_ed25519_seed(&[i as u8; 32]).unwrap();
+    }
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("../../../convesso-core/vectors/identity.json")).unwrap();
     let hex = |v: &serde_json::Value| -> Vec<u8> {

@@ -123,7 +123,7 @@ fn a_wake_reaches_the_peer_in_one_round_trip() {
     let b = world.clients[1].peer_id();
     let connected = world.when(0, &Ev::Connected(b)).unwrap();
     assert_eq!(connected - start, 4 * world.delay);
-    assert_eq!(world.clients[0].udp_log[0].len(), 302);
+    assert_eq!(world.clients[0].udp_log[0].len(), 310);
     std::println!(
         "wake through the relay: the peer's response after {} ms, {} hops of {} ms",
         connected - start,

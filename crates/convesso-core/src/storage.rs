@@ -757,6 +757,13 @@ pub trait Config {
     const LOAD_RATE_PER_SECOND: u32;
     /// How many such first contacts may arrive at once.
     const LOAD_BURST: u32;
+    /// Where an endpoint keeps the closes of the sessions it evicted, until
+    /// the next polls send them (`PROTOCOL.md §5`). Bounded.
+    type Farewells<K: Ord, V: Empty>: Table<K, V> + Default;
+    /// Unknown-index signals an endpoint sends a second (`PROTOCOL.md §5`).
+    const SIGNAL_RATE_PER_SECOND: u32;
+    /// How many such signals may leave at once.
+    const SIGNAL_BURST: u32;
 }
 
 /// Every size of a configuration: how many entries each table holds, or for a
@@ -797,6 +804,12 @@ pub struct Sizes {
     pub load_rate_per_second: u32,
     /// First contacts that may arrive at once.
     pub load_burst: u32,
+    /// Sessions that may be evicted between two polls, their closes waiting.
+    pub farewells: usize,
+    /// Unknown-index signals a second.
+    pub signal_rate_per_second: u32,
+    /// Unknown-index signals that may leave at once.
+    pub signal_burst: u32,
 }
 
 /// Derives a configuration from [`Mcu`] or [`Server`], naming only the sizes
@@ -877,6 +890,10 @@ macro_rules! __fixed_config {
                 $crate::storage::FixedTable<K, V, { $name::SIZES.excluded }>;
             const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
             const LOAD_BURST: u32 = $name::SIZES.load_burst;
+            type Farewells<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::FixedTable<K, V, { $name::SIZES.farewells }>;
+            const SIGNAL_RATE_PER_SECOND: u32 = $name::SIZES.signal_rate_per_second;
+            const SIGNAL_BURST: u32 = $name::SIZES.signal_burst;
         }
     };
 }
@@ -913,6 +930,10 @@ macro_rules! __growable_config {
                 $crate::storage::GrowableTable<K, V, { $name::SIZES.excluded }>;
             const LOAD_RATE_PER_SECOND: u32 = $name::SIZES.load_rate_per_second;
             const LOAD_BURST: u32 = $name::SIZES.load_burst;
+            type Farewells<K: Ord, V: $crate::storage::Empty> =
+                $crate::storage::GrowableTable<K, V, { $name::SIZES.farewells }>;
+            const SIGNAL_RATE_PER_SECOND: u32 = $name::SIZES.signal_rate_per_second;
+            const SIGNAL_BURST: u32 = $name::SIZES.signal_burst;
         }
     };
 }
@@ -948,6 +969,12 @@ impl Mcu {
         excluded: 4,
         load_rate_per_second: 5,
         load_burst: 5,
+        // 4: every session but the relay's evicted before a poll, at most.
+        farewells: 4,
+        // 20 a second, 5 at once: a peer that lost its session learns it
+        // within a round trip, and a board reflects little.
+        signal_rate_per_second: 20,
+        signal_burst: 5,
     };
 }
 
@@ -957,7 +984,8 @@ crate::__fixed_config!(Mcu);
 /// (`Endpoint::reserve`), not when it is built: every table a
 /// [`BootTable`], allocated once then and never grown or freed, so that a
 /// library shipped built lets its integrator choose them. The queue's bound,
-/// the replay window and the load rate are [`Mcu`]'s, fixed when it is built.
+/// the replay window, the load rate and the rate of unknown-index signals are
+/// [`Mcu`]'s, fixed when it is built.
 /// Only with `alloc`.
 #[cfg(feature = "alloc")]
 pub struct Boot;
@@ -965,8 +993,8 @@ pub struct Boot;
 #[cfg(feature = "alloc")]
 impl Boot {
     /// The sizes a `Boot` endpoint is usually given: [`Mcu`]'s. Of these,
-    /// `queue_bytes`, `replay_words` and the load rate are fixed when it is
-    /// built; every other one is read when it starts.
+    /// `queue_bytes`, `replay_words`, the load rate and the signal rate are
+    /// fixed when it is built; every other one is read when it starts.
     pub const SIZES: Sizes = Mcu::SIZES;
 }
 
@@ -988,6 +1016,9 @@ impl Config for Boot {
     type Excluded<K: Ord, V: Empty> = BootTable<K, V>;
     const LOAD_RATE_PER_SECOND: u32 = Mcu::SIZES.load_rate_per_second;
     const LOAD_BURST: u32 = Mcu::SIZES.load_burst;
+    type Farewells<K: Ord, V: Empty> = BootTable<K, V>;
+    const SIGNAL_RATE_PER_SECOND: u32 = Mcu::SIZES.signal_rate_per_second;
+    const SIGNAL_BURST: u32 = Mcu::SIZES.signal_burst;
 }
 
 /// A server: tables that grow with what they hold, contexts and sessions as
@@ -1017,6 +1048,11 @@ impl Server {
         excluded: 16,
         load_rate_per_second: 1000,
         load_burst: 1000,
+        // A table without bound never evicts.
+        farewells: 0,
+        // A server restarted under thousands of sessions tells them fast.
+        signal_rate_per_second: 1000,
+        signal_burst: 1000,
     };
 }
 

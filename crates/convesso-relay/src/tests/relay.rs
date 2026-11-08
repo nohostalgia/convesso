@@ -344,7 +344,7 @@ fn a_key_over_its_rate_is_held_to_it() {
     }
     world.run_for(2000);
     let delivered = world.clients[1].datagrams().len() - before;
-    // Each forward is 34 + 31 + 1,000 bytes: the rate and burst allow
+    // Each forward is 34 + 35 + 1,000 bytes: the rate and burst allow
     // (25,000 * 10 + 25,000) / 1,065 of them in these 10 seconds.
     assert!(delivered <= 259, "{delivered} delivered");
     assert!(delivered >= 200, "{delivered} delivered");

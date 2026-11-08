@@ -34,8 +34,8 @@ use super::messages::{
     WireDecision,
 };
 use super::{
-    Admission, ChannelBinding, Context, ContextTooLong, Decision, Entropy, MAX_PAYLOAD, NO_PSK,
-    PENDING_LIFETIME, PENDING_PER_PEER, PROLOGUE_MAX, RESPONSE_LEN, RefusalCode,
+    Admission, ChannelBinding, Context, ContextTooLong, Decision, Entropy, Index, MAX_PAYLOAD,
+    NO_PSK, PENDING_LIFETIME, PENDING_PER_PEER, PROLOGUE_MAX, RESPONSE_LEN, RefusalCode,
 };
 use crate::dos::{self, Bucket, CookieSecret, Source, SourceKey};
 use crate::identity::{Identity, PeerId};
@@ -153,8 +153,8 @@ pub enum ResponderOutput {
 /// An accepted handshake, not yet confirmed.
 pub struct Pending {
     peer: PeerId,
-    initiator_index: u32,
-    responder_index: u32,
+    initiator_index: Index,
+    responder_index: Index,
     context: Context,
     expires_at: Instant,
     accepted: u64,
@@ -185,13 +185,13 @@ impl Pending {
 
     /// The initiator's index.
     #[must_use]
-    pub const fn initiator_index(&self) -> u32 {
+    pub const fn initiator_index(&self) -> Index {
         self.initiator_index
     }
 
     /// This responder's index for the handshake.
     #[must_use]
-    pub const fn responder_index(&self) -> u32 {
+    pub const fn responder_index(&self) -> Index {
         self.responder_index
     }
 
@@ -251,7 +251,7 @@ pub struct Responder<C: Config> {
     identity: Option<Identity>,
     mac1_key: Mac1Key,
     contexts: C::Contexts<Context, Served>,
-    pending: C::Pending<u32, Pending>,
+    pending: C::Pending<Index, Pending>,
     accepted: u64,
     load: Option<Bucket>,
     cookie_secret: CookieSecret,
@@ -283,7 +283,7 @@ impl<C: Config> Responder<C> {
         identity: None,
         mac1_key: Mac1Key::EMPTY,
         contexts: <C::Contexts<Context, Served> as Table<Context, Served>>::EMPTY,
-        pending: <C::Pending<u32, Pending> as Table<u32, Pending>>::EMPTY,
+        pending: <C::Pending<Index, Pending> as Table<Index, Pending>>::EMPTY,
         accepted: 0,
         load: None,
         cookie_secret: CookieSecret::EMPTY,
@@ -571,7 +571,7 @@ impl<C: Config> Responder<C> {
         };
         let psk = psk.unwrap_or(NO_PSK);
 
-        let mut responder_index = draw_index(entropy);
+        let mut responder_index = draw_index(self.identity.as_ref(), entropy);
         if decision == WireDecision::Accept {
             let bound = matches!(access, Access::Bound(_));
             match self.make_room(&peer, &context, bound, entropy) {
@@ -643,11 +643,11 @@ impl<C: Config> Responder<C> {
 
     /// Answers a first contact without a valid `mac2` under load: its cookie,
     /// encrypted to whoever knows this address and bound to that first
-    /// contact's `mac1`. 62 bytes, against the first contact's 134.
+    /// contact's `mac1`. 66 bytes, against the first contact's 138.
     fn cookie_reply(
         &self,
         packet: &[u8],
-        initiator_index: u32,
+        initiator_index: Index,
         cookie: &dos::Cookie,
         entropy: &mut impl Entropy,
         out: &mut [u8],
@@ -735,13 +735,13 @@ impl<C: Config> Responder<C> {
         context: &Context,
         bound: bool,
         entropy: &mut impl Entropy,
-    ) -> Option<u32> {
+    ) -> Option<Index> {
         let full = self
             .pending
             .capacity()
             .is_some_and(|capacity| self.pending.len() >= capacity);
         if bound && full {
-            let mut oldest: Option<(u64, u32)> = None;
+            let mut oldest: Option<(u64, Index)> = None;
             self.pending.for_each(|index, pending| {
                 if pending.context != *context
                     && oldest.is_none_or(|(accepted, _)| pending.accepted < accepted)
@@ -754,7 +754,7 @@ impl<C: Config> Responder<C> {
             }
         }
         let mut from_peer = 0;
-        let mut oldest: Option<(u64, u32)> = None;
+        let mut oldest: Option<(u64, Index)> = None;
         self.pending.for_each(|index, pending| {
             if pending.peer == *peer {
                 from_peer += 1;
@@ -775,7 +775,7 @@ impl<C: Config> Responder<C> {
             return None;
         }
         (0..INDEX_DRAWS)
-            .map(|_| draw_index(entropy))
+            .map(|_| draw_index(self.identity.as_ref(), entropy))
             .find(|index| self.pending.get(index).is_none())
     }
 
@@ -798,7 +798,7 @@ impl<C: Config> Responder<C> {
 
     /// The pending handshake under a responder index.
     #[must_use]
-    pub fn pending(&self, responder_index: u32) -> Option<&Pending> {
+    pub fn pending(&self, responder_index: Index) -> Option<&Pending> {
         self.pending.get(&responder_index)
     }
 
@@ -841,13 +841,13 @@ impl<C: Config> Responder<C> {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_mut(&mut self, responder_index: u32) -> Option<&mut Pending> {
+    pub(crate) fn pending_mut(&mut self, responder_index: Index) -> Option<&mut Pending> {
         self.pending.get_mut(&responder_index)
     }
 
     /// Takes a pending handshake out, to promote it: its first transport packet
     /// opened.
-    pub(crate) fn take_pending(&mut self, responder_index: u32) -> Option<Pending> {
+    pub(crate) fn take_pending(&mut self, responder_index: Index) -> Option<Pending> {
         self.pending.remove(&responder_index)
     }
 
@@ -870,13 +870,12 @@ impl<C: Config> Responder<C> {
 
 /// A first contact's fields the responder works on, of either type.
 struct Initiation<'a> {
-    initiator_index: u32,
+    initiator_index: Index,
     noise: &'a [u8],
     renewal: bool,
 }
 
-fn draw_index(entropy: &mut impl Entropy) -> u32 {
-    let mut bytes = [0u8; 4];
-    entropy.fill(&mut bytes);
-    u32::from_le_bytes(bytes)
+/// A new index issued by `identity`, or 0 without one, which answers nothing.
+fn draw_index(identity: Option<&Identity>, entropy: &mut impl Entropy) -> Index {
+    identity.map_or(0, |identity| identity.issue_index(entropy))
 }

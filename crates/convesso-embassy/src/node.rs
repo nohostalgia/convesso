@@ -1225,6 +1225,23 @@ impl<'d, M: RawMutex, T: Tables, D: Datagrams> Context<'d, M, T, D> {
         Ok(())
     }
 
+    /// Holds the session with `peer`, or releases it, for that session's
+    /// life: a held session is never closed to make room for another
+    /// (`PROTOCOL.md §5`). An application that keeps a peer connected holds
+    /// its session again each time it opens.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NoSession`] without a session with `peer`.
+    pub async fn hold(&self, peer: PeerId, held: bool) -> Result<(), NodeError> {
+        let mut inner = self.shared.inner.lock().await;
+        inner
+            .endpoint
+            .hold(peer, self.name.as_bytes(), held)
+            .map_err(|_| NodeError::NoSession)?;
+        Ok(())
+    }
+
     /// Sends `data` to `peer`, which must have a session with keys.
     ///
     /// # Errors

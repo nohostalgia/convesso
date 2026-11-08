@@ -295,7 +295,10 @@ fn an_idle_month_after_an_exchange_sends_nothing() {
 fn loss_sweep() {
     let messages: Vec<_> = (0..200).map(message).collect();
     let bytes: usize = messages.iter().map(Vec::len).sum();
-    let fragments: usize = messages.iter().map(|m| m.len().div_ceil(1332)).sum();
+    let fragments: usize = messages
+        .iter()
+        .map(|m| m.len().div_ceil(convesso_stream::frame::MAX_FRAGMENT))
+        .sum();
     std::println!("loss | delivered | goodput (KB/s) | retransmissions per message");
     for loss in [0, 1, 2, 5, 10] {
         let (mut delivered, mut elapsed, mut sent) = (0, 0, 0);

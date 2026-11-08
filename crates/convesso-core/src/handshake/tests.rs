@@ -215,14 +215,14 @@ fn crafted_first_contact(
 fn only_exact_messages_parse() {
     let mut entropy = TestEntropy(0);
     let (_, first) = dial(&mut entropy, None);
-    assert_eq!(first.len(), 134);
+    assert_eq!(first.len(), 138);
     assert_eq!(&first[..2], &[0x01, 0x01]);
     assert!(messages::parse_first_contact(&first).is_ok());
     assert_eq!(
-        messages::parse_first_contact(&first[..133]),
+        messages::parse_first_contact(&first[..137]),
         Err(MessageError::WrongLength {
-            expected: 134,
-            actual: 133
+            expected: 138,
+            actual: 137
         })
     );
     let mut longer = first.clone();
@@ -237,7 +237,7 @@ fn only_exact_messages_parse() {
 
     let mut responder = responder();
     let mut admission = Fixed::accept();
-    for packet in [&first[..133], &longer[..], &wrong_type[..]] {
+    for packet in [&first[..137], &longer[..], &wrong_type[..]] {
         assert_eq!(
             answer(&mut responder, packet, t(0), &mut admission, &mut entropy),
             None
@@ -245,7 +245,7 @@ fn only_exact_messages_parse() {
     }
     // A response sent to a responder is not a first contact either.
     let response = answer(&mut responder, &first, t(0), &mut admission, &mut entropy).unwrap();
-    assert_eq!(response.len(), 61);
+    assert_eq!(response.len(), 69);
     assert_eq!(&response[..2], &[0x01, 0x02]);
     assert!(messages::parse_response(&response).is_ok());
     assert!(messages::parse_response(&response[..60]).is_err());
@@ -586,9 +586,9 @@ fn a_small_order_ephemeral_meets_silence() {
     let mut entropy = TestEntropy(700);
     let (_, mut first) = dial(&mut entropy, None);
     // Replace `e` with the u-coordinate 0, a point of small order, and re-MAC.
-    first[6..38].copy_from_slice(&[0; 32]);
-    let mac1 = Mac1Key::for_address(responder_address().as_bytes()).compute(&first[..102]);
-    first[102..118].copy_from_slice(&mac1);
+    first[10..42].copy_from_slice(&[0; 32]);
+    let mac1 = Mac1Key::for_address(responder_address().as_bytes()).compute(&first[..106]);
+    first[106..122].copy_from_slice(&mac1);
     let mut admission = Fixed::accept();
     assert_eq!(
         answer(&mut responder(), &first, t(0), &mut admission, &mut entropy),
@@ -609,7 +609,7 @@ fn a_refusal_names_its_code() {
         let mut responder = responder();
         let mut admission = Fixed::with(Decision::Refuse { code, psk: None });
         let response = answer(&mut responder, &first, t(0), &mut admission, &mut entropy).unwrap();
-        assert_eq!(response.len(), 61);
+        assert_eq!(response.len(), 69);
         assert_eq!(responder.pending_count(), 0);
         assert!(matches!(
             dial.handle(&identity(INITIATOR), &response, t(1)),
@@ -847,8 +847,8 @@ fn an_unknown_version_is_answered_and_reported() {
 
     let mut v2 = first.clone();
     v2[0] = 0x02;
-    let mac1 = Mac1Key::for_address(responder_address().as_bytes()).compute(&v2[..102]);
-    v2[102..118].copy_from_slice(&mac1);
+    let mac1 = Mac1Key::for_address(responder_address().as_bytes()).compute(&v2[..106]);
+    v2[106..122].copy_from_slice(&mac1);
     let answer_bytes = answer(&mut responder, &v2, t(0), &mut admission, &mut entropy).unwrap();
     let decoded = VersionNotSupported::decode(&answer_bytes).unwrap();
     assert_eq!(decoded.versions(), &[Version::V1]);
@@ -898,8 +898,8 @@ fn retries_follow_the_schedule_then_give_up() {
     // Each attempt has its own index and ephemeral key.
     for (i, (_, a)) in sent.iter().enumerate() {
         for (_, b) in &sent[i + 1..] {
-            assert_ne!(a[2..6], b[2..6]);
-            assert_ne!(a[6..38], b[6..38]);
+            assert_ne!(a[2..10], b[2..10]);
+            assert_ne!(a[10..42], b[10..42]);
         }
     }
 
@@ -927,7 +927,7 @@ fn a_late_response_to_an_earlier_attempt_completes() {
     let mut out = [0u8; 256];
     assert!(matches!(
         dial.poll(&initiator, t(1000), &mut entropy, &mut out),
-        DialPoll::Send(134)
+        DialPoll::Send(138)
     ));
     let first_index = messages::parse_first_contact(&first)
         .unwrap()
@@ -992,8 +992,10 @@ struct Transcript {
     responder: usize,
     context: &'static [u8],
     psk: Option<Psk>,
+    /// The random half of the initiator's index: the tag is its identity's.
     initiator_index: u32,
     initiator_ephemeral: [u8; 32],
+    /// The random half of the responder's index.
     responder_index: u32,
     responder_ephemeral: [u8; 32],
     decision: Decision,
@@ -1307,7 +1309,7 @@ fn run_transcript(transcript: &Transcript) -> Value {
     let n = snow_init.write_message(&payload, &mut buffer).unwrap();
     assert_eq!(
         &buffer[..n],
-        &first[6..first.len() - 32],
+        &first[10..first.len() - 32],
         "{}: snow disagrees on the first contact",
         transcript.name
     );
@@ -1323,7 +1325,7 @@ fn run_transcript(transcript: &Transcript) -> Value {
         .unwrap();
     assert_eq!(
         &buffer[..n],
-        &response[10..61],
+        &response[18..69],
         "{}: snow disagrees on the response",
         transcript.name
     );
@@ -1337,9 +1339,9 @@ fn run_transcript(transcript: &Transcript) -> Value {
         "responder_key": transcript.responder,
         "context": to_hex(transcript.context),
         "psk": transcript.psk.map(|p| to_hex(&p)),
-        "initiator_index": transcript.initiator_index,
+        "initiator_index": u64::from_le_bytes(first[2..10].try_into().unwrap()),
         "initiator_ephemeral": to_hex(&transcript.initiator_ephemeral),
-        "responder_index": transcript.responder_index,
+        "responder_index": u64::from_le_bytes(response[2..10].try_into().unwrap()),
         "responder_ephemeral": to_hex(&transcript.responder_ephemeral),
         "decision": to_hex(&decision_bytes),
         "first_contact": to_hex(&first),
@@ -1479,8 +1481,8 @@ fn cookie_for(
 /// A fresh first contact with its mac2 computed under `cookie`.
 fn with_mac2(entropy: &mut TestEntropy, cookie: &crate::dos::Cookie) -> Vec<u8> {
     let (_, mut first) = dial(entropy, None);
-    let mac2 = crate::dos::mac2(cookie, &first[..118]);
-    first[118..].copy_from_slice(&mac2);
+    let mac2 = crate::dos::mac2(cookie, &first[..122]);
+    first[122..].copy_from_slice(&mac2);
     first
 }
 
@@ -1504,14 +1506,14 @@ fn beyond_the_rate_a_cookie_reply_and_no_diffie_hellman() {
 
     let (_, zeros) = dial(&mut entropy, None);
     let mut wrong = with_mac2(&mut entropy, &[0x42; 16]);
-    wrong[133] ^= 1;
+    wrong[137] ^= 1;
     for packet in [zeros, wrong] {
         let reply = answer(&mut responder, &packet, t(0), &mut admission, &mut entropy).unwrap();
-        assert_eq!(reply.len(), 62);
+        assert_eq!(reply.len(), 66);
         assert_eq!(&reply[..2], &[0x01, 0x03]);
         assert_eq!(
-            &reply[2..6],
-            &packet[2..6],
+            &reply[2..10],
+            &packet[2..10],
             "the reply names the initiator's index"
         );
     }
@@ -1557,7 +1559,7 @@ fn a_cookie_from_another_source_is_refused() {
         &mut entropy,
     )
     .unwrap();
-    assert_eq!(reply.len(), 62);
+    assert_eq!(reply.len(), 66);
     assert_eq!(responder.diffie_hellmans, 5);
 }
 
@@ -1633,7 +1635,7 @@ fn the_next_attempt_carries_mac2() {
     let initiator = identity(INITIATOR);
 
     let (mut dial, first) = dial(&mut entropy, None);
-    assert_eq!(&first[118..], &[0; 16], "no cookie yet: mac2 is zeros");
+    assert_eq!(&first[122..], &[0; 16], "no cookie yet: mac2 is zeros");
     let reply = answer(
         &mut responder,
         &first,
@@ -1662,7 +1664,7 @@ fn the_next_attempt_carries_mac2() {
         panic!("the retry is due at 1 s");
     };
     let retry = &out[..len];
-    assert_eq!(&retry[118..], &crate::dos::mac2(&cookie, &retry[..118]));
+    assert_eq!(&retry[122..], &crate::dos::mac2(&cookie, &retry[..122]));
 
     // Still under load at that instant, the retry goes through on its mac2.
     exhaust(&mut responder, t(1000), &mut entropy);
@@ -1683,7 +1685,7 @@ fn a_forged_cookie_reply_is_ignored() {
     let mut entropy = TestEntropy(2700);
     let initiator = identity(INITIATOR);
     let (mut dial, first) = dial(&mut entropy, None);
-    let index = u32::from_le_bytes(first[2..6].try_into().unwrap());
+    let index = u64::from_le_bytes(first[2..10].try_into().unwrap());
     let mac1 = crate::wire::carried_mac1(&first).unwrap();
 
     let other_address = *identity(2).address().as_bytes();
@@ -1720,7 +1722,7 @@ fn a_forged_cookie_reply_is_ignored() {
     let DialPoll::Send(len) = dial.poll(&initiator, t(1000), &mut entropy, &mut out) else {
         panic!("the retry is due at 1 s");
     };
-    assert_eq!(&out[118..len], &[0; 16]);
+    assert_eq!(&out[122..len], &[0; 16]);
 }
 
 /// Scenario: a cookie older than 120 seconds is no longer used.
@@ -1779,7 +1781,7 @@ fn an_honest_dial_completes_through_a_spoofed_flood() {
             &mut Fixed::accept(),
             entropy,
         ) {
-            Some(reply) if reply.len() == 62 => cookie_replies += 1,
+            Some(reply) if reply.len() == 66 => cookie_replies += 1,
             Some(_) => answered += 1,
             None => {}
         }
@@ -1800,7 +1802,7 @@ fn an_honest_dial_completes_through_a_spoofed_flood() {
     .unwrap();
     assert_eq!(
         reply.len(),
-        62,
+        66,
         "the honest first contact meets a cookie reply"
     );
     dial.handle(&honest, &reply, t(51));
@@ -1871,7 +1873,7 @@ fn under_load_time() {
         );
         cookie_path.push(started.elapsed());
         let reply = reply.unwrap();
-        assert_eq!(reply.len(), 62);
+        assert_eq!(reply.len(), 66);
 
         let parsed = crate::dos::parse_cookie_reply(&reply).unwrap();
         let mac1 = crate::wire::carried_mac1(&without).unwrap();
@@ -2076,13 +2078,13 @@ fn an_empty_or_oversized_payload_is_dropped() {
     let mut responder = payload_responder();
     let mut admission = Fixed::accept();
 
-    // Type 0x05, 134 bytes: a valid 0x01 first contact relabelled.
+    // Type 0x05, 138 bytes: a valid 0x01 first contact relabelled.
     let (_, mut first) = dial_with(&mut entropy, RELAY_CONTEXT, &[]);
     assert_eq!(first[1], 0x01);
     first[1] = 0x05;
     assert!(matches!(
         messages::parse_payload_first_contact(&first),
-        Err(MessageError::WrongLength { actual: 134, .. })
+        Err(MessageError::WrongLength { actual: 138, .. })
     ));
     assert_eq!(
         answer_payload(&mut responder, &first, t(0), &mut admission, &mut entropy),
@@ -2098,7 +2100,7 @@ fn an_empty_or_oversized_payload_is_dropped() {
         (None, None)
     );
 
-    // A payload first contact relabelled 0x01: not 134 bytes, dropped.
+    // A payload first contact relabelled 0x01: not 138 bytes, dropped.
     let (_, mut first) = dial_with(&mut entropy, RELAY_CONTEXT, &a_payload(10));
     first[1] = 0x01;
     assert_eq!(
@@ -2166,8 +2168,8 @@ fn retries_carry_the_same_payload() {
     let retry = out[..len].to_vec();
     assert_eq!(retry.len(), first.len());
     assert_ne!(
-        retry[2..38],
-        first[2..38],
+        retry[2..42],
+        first[2..42],
         "a fresh index and ephemeral key"
     );
     let mut responder = payload_responder();
@@ -2320,14 +2322,14 @@ fn only_served_contexts_can_be_bound() {
     served.serve(b"c", Access::Policy).unwrap();
 }
 
-/// A renewal is the 134 bytes of a first contact with byte 1 `0x06`: it
+/// A renewal is the 138 bytes of a first contact with byte 1 `0x06`: it
 /// parses as a renewal, refuses a payload and any other length, and `mac1`
 /// fails when byte 1 is changed in transit.
 #[test]
 fn a_renewal_is_a_first_contact_of_its_own_type() {
     let mut entropy = TestEntropy(0);
     let (_, opening) = dial(&mut entropy, None);
-    let noise = &opening[6..6 + messages::INITIATION_NOISE_LEN];
+    let noise = &opening[10..10 + messages::INITIATION_NOISE_LEN];
     let key = Mac1Key::for_address(identity(0).address().as_bytes());
     let mut renewal = vec![0u8; FIRST_CONTACT_LEN];
     let len = messages::write_first_contact_into(&mut renewal, 7, noise, true, &key, None).unwrap();
@@ -2402,7 +2404,7 @@ fn renewal_round(renewal: bool, stands: Standing) -> (Option<[u8; 3]>, DialEvent
     };
     let response = answer[..len].to_vec();
     let opens = responder
-        .pending(u32::from_le_bytes(response[2..6].try_into().unwrap()))
+        .pending(u64::from_le_bytes(response[2..10].try_into().unwrap()))
         .map(Pending::opens);
     let event = dial.handle(&identity(INITIATOR), &response, t(2));
     // The decision as sent: read back through the initiator's own keys is not
@@ -2513,4 +2515,29 @@ fn a_bound_context_is_never_refused_for_room() {
             + responder.pending_for(&identity(2).peer_id()),
         3
     );
+}
+
+/// Scenarios: an index issued before a restart is recognised, and a
+/// stranger's index is not (`PROTOCOL.md §3`). The same identity built again
+/// stands for the endpoint after a restart.
+#[test]
+fn an_endpoint_recognises_the_indices_it_issued() {
+    let mut entropy = TestEntropy(7700);
+    let before = identity(INITIATOR);
+    let issued: Vec<Index> = (0..1000)
+        .map(|_| before.issue_index(&mut entropy))
+        .collect();
+    let after = identity(INITIATOR);
+    assert!(issued.iter().all(|&index| after.issued(index)));
+    let other = identity(2);
+    assert!(issued.iter().all(|&index| !other.issued(index)));
+    let mut random = TestEntropy(7800);
+    let mut bytes = [0u8; 8];
+    let recognised = (0..100_000)
+        .filter(|_| {
+            random.fill(&mut bytes);
+            after.issued(Index::from_le_bytes(bytes))
+        })
+        .count();
+    assert_eq!(recognised, 0, "a random index passes once in 2^32");
 }

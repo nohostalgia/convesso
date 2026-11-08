@@ -23,8 +23,8 @@ use crate::dos::{Source, SourceKey};
 use crate::handshake::messages::{TYPE_RESPONSE, is_first_contact_type};
 use crate::handshake::{
     Access, Admission, ChannelBinding, Context, ContextTooLong, Decision, Dial, DialError,
-    DialEvent, DialPoll, Entropy, Established, RESPONSE_LEN, Responder, ResponderError,
-    ResponderOutput, Standing,
+    DialEvent, DialPoll, Entropy, Established, INDEX_LEN, Index, RESPONSE_LEN, Responder,
+    ResponderError, ResponderOutput, Standing,
 };
 use crate::identity::{Address, Identity, PeerId};
 use crate::paths::PathKind;
@@ -71,26 +71,31 @@ impl crate::storage::Empty for Owner {
 /// (`PROTOCOL.md §5`), sent as `02 00`.
 pub const CLOSE_TO_MAKE_ROOM: u16 = 0x0002;
 
-/// How long a session of a bounded profile must have done nothing, sent or
-/// heard, before it may be closed to make room for a new one
-/// (`PROTOCOL.md §5`): above the passive keepalive (10 s) and the time UDP
-/// stays proven to the relay (15 s), below the 180 s a silent session keeps
-/// its keys. A peer that exchanges anything twice a minute keeps its place.
-pub const IDLE_BEFORE_EVICTION: core::time::Duration = core::time::Duration::from_secs(30);
-
 /// A close with its inner type and code: what an eviction sends.
 const FAREWELL_LEN: usize = OVERHEAD + 2;
 
 /// A session closed to make room: its close, sealed when it was evicted, and
 /// the event the application is owed once the close left.
-struct Farewell {
+pub(crate) struct Farewell {
     peer: PeerId,
     context: Context,
     close: [u8; FAREWELL_LEN],
     /// The close's length; 0 when the session had no keys to seal it with.
-    len: usize,
-    to: Hop,
+    len: u8,
+    /// The path the session last took to the peer, where the close goes.
+    last_source: Maybe<SourceKey>,
     sent: bool,
+}
+
+impl crate::storage::Empty for Farewell {
+    const EMPTY: Self = Self {
+        peer: crate::identity::Address::UNSET.peer_id(),
+        context: Context::EMPTY,
+        close: [0; FAREWELL_LEN],
+        len: 0,
+        last_source: Maybe::None,
+        sent: false,
+    };
 }
 
 /// Where a new session would go.
@@ -100,7 +105,8 @@ enum Room {
     Held,
     /// A slot is free for it.
     Free,
-    /// This idle session is to be closed to make room.
+    /// This session, the least recently active of those that may go, is to
+    /// be closed to make room.
     Evict(Key),
     /// No room: every other session is busy, or the last slot is the relay's.
     Full,
@@ -109,9 +115,11 @@ enum Room {
 /// The room for `key`'s session, on a table that the pinned relay's session
 /// `relay` may still need (`PROTOCOL.md §6`). A bounded table keeps its last
 /// slot for the relay session while that is not held, and makes room by
-/// closing the session least recently active among those idle for
-/// [`IDLE_BEFORE_EVICTION`]: never the relay's, nor one dialling, queueing or
-/// closing. `farewell_free`: an eviction's close can be held.
+/// closing the session least recently active, whatever its age: never the
+/// relay's, one the application holds, nor one dialling, queueing or closing
+/// (`PROTOCOL.md §5`). A peer whose close is lost learns of it from its next
+/// packet, the unknown-index signal. `farewell_free`: an eviction's close can
+/// be held until a poll sends it.
 fn room<C: Config>(
     sessions: &Sessions<C>,
     dials: &C::Dials<Key, Dial>,
@@ -119,7 +127,6 @@ fn room<C: Config>(
     relay: Option<Key>,
     farewell_free: bool,
     key: &Key,
-    now: Instant,
 ) -> Room {
     if sessions.get(key).is_some() {
         return Room::Held;
@@ -140,12 +147,12 @@ fn room<C: Config>(
     let mut victim: Option<(Instant, Key)> = None;
     sessions.for_each(|held, session| {
         let spared = Some(*held) == relay
+            || session.held
             || dials.get(held).is_some()
             || !queues.is_empty(held)
             || session.closing.is_some();
         let active = session.last_active().unwrap_or(Instant::from_millis(0));
-        let idle = now >= active.saturating_add(IDLE_BEFORE_EVICTION);
-        if !spared && idle && victim.is_none_or(|(at, _)| active < at) {
+        if !spared && victim.is_none_or(|(at, _)| active < at) {
             victim = Some((active, *held));
         }
     });
@@ -529,12 +536,21 @@ pub struct Endpoint<C: Config> {
     /// The queues lent to the sessions reopening with datagrams waiting.
     queues: Queues<C>,
     /// The owners of indices, when the profile keeps them (`Config::INDEXED`).
-    indices: C::Indices<u32, Owner>,
+    indices: C::Indices<Index, Owner>,
+    /// The session whose current key pair the peer receives under each
+    /// index, when the profile keeps indices: what finds the session an
+    /// unknown-index signal names (`PROTOCOL.md §5`).
+    remotes: C::Indices<Index, Owner>,
+    /// The unknown-index signals this endpoint may still send: full when
+    /// first needed.
+    signals: Maybe<crate::dos::Bucket>,
     /// A response owed to the source of the last packet, sent by the next poll.
     owed: Maybe<([u8; RESPONSE_LEN], Hop)>,
-    /// A session closed to make room, whose close and event the next poll
-    /// owes.
-    farewell: Maybe<Farewell>,
+    /// The sessions closed to make room, whose closes and events the next
+    /// polls owe, in the order of the evictions.
+    farewells: C::Farewells<u64, Farewell>,
+    /// The order of the next eviction among `farewells`.
+    farewell_seq: u64,
     /// First contacts owed to the hints after the first, one per dial attempt,
     /// by the order they were made in.
     fans: C::Dials<u32, relayed::Fan>,
@@ -584,9 +600,12 @@ impl<C: Config> Endpoint<C> {
         dials: <C::Dials<Key, Dial> as Table<Key, Dial>>::EMPTY,
         sessions: Sessions::EMPTY,
         queues: Queues::EMPTY,
-        indices: <C::Indices<u32, Owner> as Table<u32, Owner>>::EMPTY,
+        indices: <C::Indices<Index, Owner> as Table<Index, Owner>>::EMPTY,
+        remotes: <C::Indices<Index, Owner> as Table<Index, Owner>>::EMPTY,
+        signals: Maybe::None,
         owed: Maybe::None,
-        farewell: Maybe::None,
+        farewells: <C::Farewells<u64, Farewell> as Table<u64, Farewell>>::EMPTY,
+        farewell_seq: 0,
         fans: <C::Dials<u32, relayed::Fan> as Table<u32, relayed::Fan>>::EMPTY,
         fan_seq: 0,
         hints: <C::Hints<(PeerId, u8), relayed::Hint> as Table<(PeerId, u8), relayed::Hint>>::EMPTY,
@@ -614,6 +633,7 @@ impl<C: Config> Endpoint<C> {
         self.fans.reserve(sizes.dials);
         self.sessions.reserve(sizes.sessions);
         self.queues.reserve(sizes.queues);
+        self.farewells.reserve(sizes.farewells);
         self.hints.reserve(sizes.hints);
         self.excluded.reserve(sizes.excluded);
         self.settings.reserve(sizes.contexts);
@@ -880,9 +900,10 @@ impl<C: Config> Endpoint<C> {
                 Some(kind) if is_first_contact_type(kind) => {
                     self.first_contact(packet, source, now, policy, entropy, out)
                 }
-                Some(TYPE_RESPONSE) => self.route_to_dial(packet, 6, source, now),
+                Some(TYPE_RESPONSE) => self.route_to_dial(packet, 2 + INDEX_LEN, source, now),
                 Some(crate::dos::TYPE_COOKIE_REPLY) => self.route_to_dial(packet, 2, source, now),
                 Some(TYPE_TRANSPORT) => self.transport(packet, source, now, out),
+                Some(transport::TYPE_UNKNOWN_INDEX) => self.index_unknown_there(packet, now),
                 _ => Output::Nothing,
             },
             Classified::Version(_) => self.first_contact(packet, source, now, policy, entropy, out),
@@ -928,7 +949,7 @@ impl<C: Config> Endpoint<C> {
         // A session that could not be kept is refused by name, before the
         // application's policy is asked.
         let (queues, relay) = (&self.queues, self.relay.as_ref().map(RelayClient::key));
-        let farewell_free = self.farewell.is_none();
+        let farewell_free = self.farewell_free();
         let mut policy = Roomy {
             inner: policy,
             holds: |peer: &PeerId, context: &[u8]| {
@@ -940,7 +961,6 @@ impl<C: Config> Endpoint<C> {
                         relay,
                         farewell_free,
                         &(*peer, context),
-                        now,
                     ) != Room::Full
                 })
             },
@@ -1002,11 +1022,7 @@ impl<C: Config> Endpoint<C> {
         source: Source<'_>,
         now: Instant,
     ) -> Output<'a, Hop> {
-        let Some(index) = packet
-            .get(at..at + 4)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_le_bytes)
-        else {
+        let Some(index) = crate::handshake::messages::index_at(packet, at) else {
             return Output::Nothing;
         };
         let Some(Owner::Dial(peer, context)) = self.owner(index) else {
@@ -1078,6 +1094,7 @@ impl<C: Config> Endpoint<C> {
             established.local_index(),
             established.remote_index(),
             now,
+            true,
         );
         let local_index = pair.local_index;
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
@@ -1099,6 +1116,8 @@ impl<C: Config> Endpoint<C> {
         // A handshake both ends agreed opens the session starts its life: a
         // connection, whether it had no keys or keys the new ones replace.
         let first = established.opens();
+        let replaced = session.current.as_ref().map(|pair| pair.remote_index);
+        let remote_index = pair.remote_index;
         let freed = session.promote(pair, established.channel_binding(), first);
         session.connected |= first;
         // The dial carried the head of the queue in its first contact.
@@ -1110,6 +1129,9 @@ impl<C: Config> Endpoint<C> {
         let queued = !self.queues.is_empty(&key);
         if let Some(session) = self.sessions.get_mut(&key) {
             session.confirm = !queued;
+            // Its address goes first, and confirms the handshake: the
+            // responder may know this side by `PeerId` only.
+            session.owes_address = true;
         }
         if C::INDEXED {
             if let Some(index) = freed {
@@ -1119,6 +1141,7 @@ impl<C: Config> Endpoint<C> {
             let _ = self
                 .indices
                 .insert(local_index, Owner::Session(key.0, key.1));
+            self.track_remote(key, replaced, remote_index);
         }
         if first {
             Output::Event(Event::Connected {
@@ -1132,6 +1155,11 @@ impl<C: Config> Endpoint<C> {
 
     fn dial_failed(&mut self, key: Key, error: DialError) -> Event<'static> {
         self.remove_dial(key);
+        if matches!(error, DialError::Refused(_)) {
+            self.drop_signalled_keys(key);
+        } else if let Some(session) = self.sessions.get_mut(&key) {
+            session.signalled = false;
+        }
         // The relay session refused or unanswered on the link: that attempt is
         // over, and the next one waits for the backoff.
         if let Some(relay) = self.relay.as_mut()
@@ -1166,6 +1194,87 @@ impl<C: Config> Endpoint<C> {
         }
     }
 
+    /// A transport packet named `index`, and nothing here holds live keys or
+    /// a pending handshake under it: when this endpoint issued it, before a
+    /// restart or an eviction perhaps, its peer is told, within the rate of
+    /// signals, so that it renews at once (`PROTOCOL.md §5`). A stranger's
+    /// index, which this endpoint never issued, is answered with nothing.
+    fn index_unknown_here<'a>(
+        &mut self,
+        index: Index,
+        now: Instant,
+        out: &mut [u8],
+    ) -> Output<'a, Hop> {
+        let issued = self
+            .responder
+            .identity()
+            .is_some_and(|identity| identity.issued(index));
+        if !issued {
+            return Output::Nothing;
+        }
+        let signals = self
+            .signals
+            .get_or_insert_with(|| crate::dos::Bucket::full(C::SIGNAL_BURST, now));
+        if !signals.take(C::SIGNAL_RATE_PER_SECOND, C::SIGNAL_BURST, now) {
+            return Output::Nothing;
+        }
+        let Some(field) = out.get_mut(..transport::UNKNOWN_INDEX_LEN) else {
+            return Output::Nothing;
+        };
+        field.copy_from_slice(&transport::write_unknown_index(index));
+        Output::Transmit {
+            to: Hop::Source,
+            len: transport::UNKNOWN_INDEX_LEN,
+        }
+    }
+
+    /// The peer says it holds no keys under `index`: when that is the index
+    /// the peer receives under for a session's current, live pair, the
+    /// session renews at once, as it would once its keys were 120 seconds
+    /// old, keeping its pairs until the renewal ends. A side without the
+    /// peer's address cannot renew, and waits for the peer that can. The
+    /// signal changes no key by itself, and is never answered
+    /// (`PROTOCOL.md §5`).
+    fn index_unknown_there<'a>(&mut self, packet: &[u8], now: Instant) -> Output<'a, Hop> {
+        let Ok(index) = transport::parse_unknown_index(packet) else {
+            return Output::Nothing;
+        };
+        let names = |session: &SessionOf<C>| {
+            session
+                .current
+                .as_ref()
+                .is_some_and(|pair| pair.remote_index == index && pair.live(now))
+        };
+        let key = if C::INDEXED {
+            match self.remotes.get(&index) {
+                Some(Owner::Session(peer, context)) => Some((*peer, *context)),
+                _ => None,
+            }
+            .filter(|key| self.sessions.get(key).is_some_and(names))
+        } else {
+            let mut found = None;
+            self.sessions.for_each(|key, session| {
+                if found.is_none() && names(session) {
+                    found = Some(*key);
+                }
+            });
+            found
+        };
+        let Some(key) = key else {
+            return Output::Nothing;
+        };
+        let dialling = self.dials.get(&key).is_some();
+        if let Some(session) = self.sessions.get_mut(&key)
+            && session.address.is_some()
+            && !dialling
+        {
+            session.rekey = true;
+            session.signalled = true;
+            self.sessions.touch(&key);
+        }
+        Output::Nothing
+    }
+
     /// A packet under one of a session's key pairs.
     fn session_packet<'a>(
         &mut self,
@@ -1189,7 +1298,7 @@ impl<C: Config> Endpoint<C> {
             .flatten()
             .find(|pair| pair.local_index == header.receiver_index);
         let Some(pair) = pair.filter(|pair| pair.live(now)) else {
-            return Output::Nothing;
+            return self.index_unknown_here(header.receiver_index, now, out);
         };
         if !pair.window.may_accept(header.counter) {
             return Output::Nothing;
@@ -1234,7 +1343,7 @@ impl<C: Config> Endpoint<C> {
         out: &mut [u8],
     ) -> Output<'a, Hop> {
         let Some(pending) = self.responder.pending(header.receiver_index) else {
-            return Output::Nothing;
+            return self.index_unknown_here(header.receiver_index, now, out);
         };
         let Some(keys) = pending.keys() else {
             return Output::Nothing;
@@ -1247,6 +1356,7 @@ impl<C: Config> Endpoint<C> {
             pending.responder_index(),
             pending.initiator_index(),
             pending.completed_at(),
+            false,
         );
         if !pair.live(now) {
             return Output::Nothing;
@@ -1278,6 +1388,8 @@ impl<C: Config> Endpoint<C> {
         heard(session, opened.inner_type, source, path, true, true, now);
         let local_index = pair.local_index;
         let first = opens;
+        let replaced = session.current.as_ref().map(|pair| pair.remote_index);
+        let remote_index = pair.remote_index;
         let freed = session.promote(pair, &binding, opens);
         session.connected |= first;
         if C::INDEXED {
@@ -1288,6 +1400,7 @@ impl<C: Config> Endpoint<C> {
             let _ = self
                 .indices
                 .insert(local_index, Owner::Session(peer, context));
+            self.track_remote(key, replaced, remote_index);
         }
         self.last_opened = Maybe::Some((key, true));
         if let Some(relay) = self.relay.as_mut().filter(|relay| relay.is(&key)) {
@@ -1307,6 +1420,54 @@ impl<C: Config> Endpoint<C> {
     }
 
     /// What an opened packet means to its session.
+    /// The initiator's address, owed after a handshake it completed: sent
+    /// before anything queued, so that the responder can renew and act on
+    /// signals as the initiator does (`PROTOCOL.md §5`).
+    fn address_step(&mut self, key: Key, now: Instant, out: &mut [u8]) -> Option<Poll<Hop>> {
+        let address = *self.responder.identity()?.address();
+        let relayed = self.relay.is_some();
+        let session = self.sessions.get_mut(&key)?;
+        if !session.owes_address {
+            return None;
+        }
+        let to = Hop::Peer {
+            peer: key.0,
+            last_source: direct::route_source(key.0, session, now, relayed),
+            attempt: None,
+        };
+        let pair = session.current.as_mut().filter(|pair| pair.live(now))?;
+        let len = transport::seal(
+            &pair.send,
+            pair.remote_index,
+            pair.next_counter,
+            inner::ADDRESS,
+            address.as_bytes(),
+            out,
+        )
+        .ok()?;
+        pair.next_counter += 1;
+        session.owes_address = false;
+        session.confirm = false;
+        session.last_sent = Some(now);
+        Some(Poll::Transmit { to, len })
+    }
+
+    /// The peer told its address: kept for the session when it is the
+    /// address of the identity the handshake authenticated, ignored
+    /// otherwise (`PROTOCOL.md §5`).
+    fn learn_address(&mut self, key: Key, data: &[u8]) {
+        let Some(address) = <[u8; 32]>::try_from(data)
+            .ok()
+            .and_then(|bytes| Address::parse(bytes).ok())
+            .filter(|address| address.peer_id() == key.0)
+        else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.address = Some(address);
+        }
+    }
+
     fn deliver<'a>(
         &mut self,
         key: Key,
@@ -1375,6 +1536,10 @@ impl<C: Config> Endpoint<C> {
             },
             (inner::ANSWER, data) => {
                 self.take_answer(key, data, source, now);
+                connected_event()
+            }
+            (inner::ADDRESS, data) => {
+                self.learn_address(key, data);
                 connected_event()
             }
             (inner::CLOSE, &[lo, hi]) if u16::from_le_bytes([lo, hi]) != 0 => {
@@ -1738,11 +1903,20 @@ impl<C: Config> Endpoint<C> {
             return Err(SendError::Capacity);
         }
         let identity = self.responder.identity().ok_or(SendError::NotStarted)?;
-        // The last free dial is the pinned relay's while its session is not
-        // being dialled (`PROTOCOL.md §6`).
+        // The last free dial is the pinned relay's while its session has no
+        // live keys and is not being dialled (`PROTOCOL.md §6`). With keys,
+        // the relay session needs a dial only to renew, which its next send
+        // starts again if none is free.
         let relay = self.relay.as_ref().map(RelayClient::key);
+        let relay_needs_a_dial = relay.is_some_and(|relay| {
+            relay != key
+                && self.dials.get(&relay).is_none()
+                && !self.sessions.get(&relay).is_some_and(|session| {
+                    session.current.as_ref().is_some_and(|pair| pair.live(now))
+                })
+        });
         if let Some(capacity) = self.dials.capacity()
-            && relay.is_some_and(|relay| relay != key && self.dials.get(&relay).is_none())
+            && relay_needs_a_dial
             && self.dials.len() + 1 >= capacity
         {
             return Err(SendError::Capacity);
@@ -1890,6 +2064,26 @@ impl<C: Config> Endpoint<C> {
         Ok(())
     }
 
+    /// Holds the session with `peer` in `context`, or releases it, for the
+    /// session's life: a held session is never closed to make room for
+    /// another (`PROTOCOL.md §5`), whatever its activity. It still goes
+    /// dormant when its keys expire, and is forgotten then with its hold: an
+    /// application that keeps a peer holds the session again once it reopens.
+    /// A hold sends nothing and sets no deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`NoSession`] when the endpoint holds no session with `peer` in
+    /// `context`; nothing changes.
+    pub fn hold(&mut self, peer: PeerId, context: &[u8], held: bool) -> Result<(), NoSession> {
+        let session = Context::new(context)
+            .ok()
+            .and_then(|context| self.sessions.get_mut(&(peer, context)))
+            .ok_or(NoSession)?;
+        session.held = held;
+        Ok(())
+    }
+
     /// Does what is due at `now`: dial retries and failures, confirmations,
     /// rekeys, queued datagrams, closes, passive keepalives. Call until it says
     /// [`Poll::Wait`] or [`Poll::Idle`].
@@ -1965,23 +2159,29 @@ impl<C: Config> Endpoint<C> {
         }
 
         // A session closed to make room: its close, then its event.
-        if let Some(farewell) = self.farewell.as_mut() {
+        let oldest = self.farewells.first().map(|(seq, _)| *seq);
+        if let Some(seq) = oldest
+            && let Some(farewell) = self.farewells.get_mut(&seq)
+        {
             if !farewell.sent {
                 farewell.sent = true;
-                if let (Some(field), Some(close)) = (
-                    out.get_mut(..farewell.len),
-                    farewell.close.get(..farewell.len),
-                ) && farewell.len > 0
+                let len = usize::from(farewell.len);
+                if let (Some(field), Some(close)) = (out.get_mut(..len), farewell.close.get(..len))
+                    && len > 0
                 {
                     field.copy_from_slice(close);
                     return Poll::Transmit {
-                        to: farewell.to,
-                        len: farewell.len,
+                        to: Hop::Peer {
+                            peer: farewell.peer,
+                            last_source: farewell.last_source.into(),
+                            attempt: None,
+                        },
+                        len,
                     };
                 }
             }
             let (peer, context) = (farewell.peer, farewell.context);
-            self.farewell = Maybe::None;
+            self.farewells.discard(&seq);
             return Poll::Event(Event::Closed {
                 peer,
                 context,
@@ -2012,7 +2212,7 @@ impl<C: Config> Endpoint<C> {
             if let Some(dial) = self.dials.get_mut(&key) {
                 match dial.poll_with_payload(identity, payload, now, entropy, out) {
                     DialPoll::Send(len) => {
-                        let mut indices = [0u32; 4];
+                        let mut indices = [0 as Index; 4];
                         let mut count = 0;
                         for (slot, index) in indices.iter_mut().zip(dial.attempt_indices()) {
                             *slot = index;
@@ -2138,6 +2338,10 @@ impl<C: Config> Endpoint<C> {
             }
         }
 
+        if let Some(poll) = self.address_step(key, now, out) {
+            return Some(poll);
+        }
+
         let generation = self.own.owed_generation();
         let mut list = [0u8; crate::paths::MAX_CANDIDATES_LEN];
         let list_len = crate::paths::encode_candidates(
@@ -2219,7 +2423,7 @@ impl<C: Config> Endpoint<C> {
 
     /// The next instant anything is due, or `None` when nothing ever is.
     fn next_deadline(&self) -> Option<Instant> {
-        if self.farewell.is_some() {
+        if self.farewells.len() > 0 {
             return Some(Instant::from_millis(0));
         }
         let mut next: Option<Instant> = self.responder.next_deadline();
@@ -2264,14 +2468,21 @@ impl<C: Config> Endpoint<C> {
     /// progress: a dial, a queued datagram, a close (`PROTOCOL.md §5`). The
     /// endpoint thus holds the sessions in use, whatever the peers it met.
     fn expire(&mut self, now: Instant) {
-        let indices = &mut self.indices;
+        let (indices, remotes) = (&mut self.indices, &mut self.remotes);
         let (dials, queues) = (&self.dials, &self.queues);
         let generation = self.own.owed_generation();
         self.sessions.refresh(now, |key, session| {
+            let remote = session.current.as_ref().map(|pair| pair.remote_index);
             for index in session.expire(now).into_iter().flatten() {
                 if C::INDEXED {
                     indices.remove(&index);
                 }
+            }
+            if C::INDEXED
+                && session.current.is_none()
+                && let Some(remote) = remote
+            {
+                remotes.remove(&remote);
             }
             look(key, session, now, generation, dials, !queues.is_empty(key))
         });
@@ -2284,16 +2495,22 @@ impl<C: Config> Endpoint<C> {
     }
 
     /// The room for `key`'s session at `now`, as [`room`] says.
-    fn room(&self, key: &Key, now: Instant) -> Room {
+    fn room(&self, key: &Key) -> Room {
         room::<C>(
             &self.sessions,
             &self.dials,
             &self.queues,
             self.relay.as_ref().map(RelayClient::key),
-            self.farewell.is_none(),
+            self.farewell_free(),
             key,
-            now,
         )
+    }
+
+    /// Whether an eviction's close can wait for a poll.
+    fn farewell_free(&self) -> bool {
+        self.farewells
+            .capacity()
+            .is_none_or(|capacity| self.farewells.len() < capacity)
     }
 
     /// Closes `victim` to make room: its close is sealed now, under its live
@@ -2302,14 +2519,10 @@ impl<C: Config> Endpoint<C> {
     fn evict(&mut self, victim: Key, now: Instant) {
         let mut close = [0u8; FAREWELL_LEN];
         let mut len = 0;
-        let mut to = Hop::Source;
+        let mut last_source = None;
         let relayed = self.relay.is_some();
         if let Some(session) = self.sessions.get_mut(&victim) {
-            to = Hop::Peer {
-                peer: victim.0,
-                last_source: direct::route_source(victim.0, session, now, relayed),
-                attempt: None,
-            };
+            last_source = direct::route_source(victim.0, session, now, relayed);
             if let Some(pair) = session.current.as_mut().filter(|pair| pair.live(now))
                 && let Ok(sealed) = transport::seal(
                     &pair.send,
@@ -2325,21 +2538,27 @@ impl<C: Config> Endpoint<C> {
             }
         }
         self.remove_session(victim);
-        self.farewell = Maybe::Some(Farewell {
-            peer: victim.0,
-            context: victim.1,
-            close,
-            len,
-            to,
-            sent: false,
-        });
+        let seq = self.farewell_seq;
+        self.farewell_seq += 1;
+        // Room was checked by `room`: a farewell is free.
+        let _ = self.farewells.insert(
+            seq,
+            Farewell {
+                peer: victim.0,
+                context: victim.1,
+                close,
+                len: u8::try_from(len).unwrap_or(0),
+                last_source: last_source.into(),
+                sent: false,
+            },
+        );
     }
 
     /// The session for `key`, created if needed, closing an idle session to
     /// make room when the table is full ([`room`]); `None` when there is no
     /// room.
     fn session_for(&mut self, key: Key, now: Instant) -> Option<&mut SessionOf<C>> {
-        match self.room(&key, now) {
+        match self.room(&key) {
             Room::Held => return self.sessions.get_mut(&key),
             Room::Free => {}
             Room::Evict(victim) => self.evict(victim, now),
@@ -2360,11 +2579,44 @@ impl<C: Config> Endpoint<C> {
             {
                 self.indices.remove(&pair.local_index);
             }
+            if let Some(pair) = session.current.as_ref() {
+                self.remotes.remove(&pair.remote_index);
+            }
         }
         // Dropped where it is kept.
         self.sessions.discard(&key);
         self.queues.clear(&key);
         self.remove_dial(key);
+    }
+
+    /// Records that `key`'s current pair is now received by the peer under
+    /// `remote`, in place of `replaced`: what finds the session an
+    /// unknown-index signal names, on a profile that keeps indices.
+    fn track_remote(&mut self, key: Key, replaced: Option<Index>, remote: Index) {
+        if let Some(replaced) = replaced {
+            self.remotes.remove(&replaced);
+        }
+        // Unbounded: an index always finds room.
+        let _ = self.remotes.insert(remote, Owner::Session(key.0, key.1));
+    }
+
+    /// The renewal a signal started was refused: the peer holds no keys for
+    /// the session and will not take new ones, so this side drops its own,
+    /// once, without an idle event (`PROTOCOL.md §5`).
+    fn drop_signalled_keys(&mut self, key: Key) {
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        if !core::mem::take(&mut session.signalled) {
+            return;
+        }
+        let pairs = [session.current.take(), session.previous.take()];
+        session.end_life();
+        for pair in pairs.into_iter().flatten() {
+            self.indices.remove(&pair.local_index);
+            self.remotes.remove(&pair.remote_index);
+        }
+        self.sessions.touch(&key);
     }
 
     fn remove_dial(&mut self, key: Key) {
@@ -2400,7 +2652,7 @@ impl<C: Config> Endpoint<C> {
 
     /// The owner of `index`: from the table of indices when the profile keeps
     /// one, otherwise found among the sessions and dials that hold it.
-    fn owner(&self, index: u32) -> Option<Owner> {
+    fn owner(&self, index: Index) -> Option<Owner> {
         if C::INDEXED {
             return self.indices.get(&index).copied();
         }
@@ -2536,9 +2788,9 @@ fn close_unheld<W: ReplayWindow>(pair: &mut KeyPair<W>, out: &mut [u8]) -> Optio
 /// The dial whose attempt registered `index`: from the table of indices when
 /// the profile keeps one, otherwise found among the dials.
 fn dial_owning<C: Config>(
-    indices: &C::Indices<u32, Owner>,
+    indices: &C::Indices<Index, Owner>,
     dials: &C::Dials<Key, Dial>,
-    index: u32,
+    index: Index,
 ) -> Option<Key> {
     if C::INDEXED {
         return match indices.get(&index)? {
@@ -2594,7 +2846,7 @@ fn wants<W: ReplayWindow>(
 ) -> bool {
     let live = session.current.as_ref().is_some_and(|pair| pair.live(now));
     session.closing.is_some()
-        || (live && session.confirm)
+        || (live && (session.confirm || session.owes_address))
         || (live && queued)
         || (live && candidates_owed(key, session, generation))
         || (session.rekey && session.address.is_some() && dials.get(key).is_none())

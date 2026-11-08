@@ -74,11 +74,11 @@ def main():
         data_vector("a whole message in one frame, the channel's first", INCARNATION, 0, 5, True, True,
                     b"hello"),
         data_vector("the first fragment of a 3,000-byte message", INCARNATION, 7, 3000, False, False,
-                    pattern(1332)),
-        data_vector("a middle fragment", INCARNATION, 8, None, False, False, pattern(1332, 1)),
-        data_vector("the last fragment", INCARNATION, 9, None, True, False, pattern(336, 2)),
-        data_vector("the longest frame: FIRST, LAST, 1,332 bytes", OTHER, 41, 1332, True, False,
-                    pattern(1332, 3)),
+                    pattern(1328)),
+        data_vector("a middle fragment", INCARNATION, 8, None, False, False, pattern(1328, 1)),
+        data_vector("the last fragment", INCARNATION, 9, None, True, False, pattern(344, 2)),
+        data_vector("the longest frame: FIRST, LAST, 1,328 bytes", OTHER, 41, 1328, True, False,
+                    pattern(1328, 3)),
         data_vector("a sequence about to wrap, START still set", OTHER, 0xFFFFFFFF, 1, True, True,
                     b"\x00"),
         data_vector("a middle fragment of one byte, START set", OTHER, 3, None, False, True, b"\xff"),
@@ -88,7 +88,7 @@ def main():
         ack_vector("four ranges beyond a hole", INCARNATION, False, 100, 65536, 262144,
                    [(101, 103), (104, 105), (110, 120), (120, 121)]),
         ack_vector("a reset", OTHER, True, 0, 0, 0, []),
-        ack_vector("ranges across the wrap", OTHER, False, 0xFFFFFFFE, 1332, 2048,
+        ack_vector("ranges across the wrap", OTHER, False, 0xFFFFFFFE, 1328, 2048,
                    [(0xFFFFFFFF, 2), (5, 6)]),
     ]
     good = data(INCARNATION, 1, None, False, False, b"abc")
@@ -98,7 +98,7 @@ def main():
         ("reserved flag bit 3", INCARNATION + struct.pack("<IB", 1, 0x08) + b"abc"),
         ("FIRST with a length of 0", data(INCARNATION, 1, 0, True, False, b"abc")),
         ("FIRST with a truncated length", INCARNATION + struct.pack("<IB", 1, FIRST) + b"\x01\x00\x00"),
-        ("1,333 bytes of fragment", data(INCARNATION, 1, None, False, False, pattern(1333))),
+        ("1,329 bytes of fragment", data(INCARNATION, 1, None, False, False, pattern(1329))),
     ]
     ok_ack = ack(INCARNATION, False, 100, 0, 0, [(101, 102)])
     malformed_acks = [

@@ -108,11 +108,11 @@ fn client_wrap_and_unwrap() {
     for _ in 0..2000 {
         let client = &mut world.clients[0];
         let mut out = [0u8; 2048];
-        out[..DATAGRAM + 31].fill(0x01);
+        out[..DATAGRAM + 35].fill(0x01);
         let start = Clock::now();
         let result = client.endpoint.through_relay(
             b,
-            DATAGRAM + 31,
+            DATAGRAM + 35,
             now,
             &mut client.policy,
             &mut client.entropy,

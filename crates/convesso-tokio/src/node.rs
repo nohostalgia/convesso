@@ -569,6 +569,7 @@ enum Command {
     IsLive(Name, PeerId, oneshot::Sender<bool>),
     PeerCandidates(Name, PeerId, oneshot::Sender<Vec<Candidate>>),
     PassiveKeepalive(Name, PeerId, bool, oneshot::Sender<Result<(), NodeError>>),
+    Hold(Name, PeerId, bool, oneshot::Sender<Result<(), NodeError>>),
     RelayKeepalive(Duration, oneshot::Sender<Result<(), NodeError>>),
     PinnedRelay(oneshot::Sender<Option<RelayLocation>>),
 }
@@ -1052,6 +1053,21 @@ impl Context {
     pub async fn set_passive_keepalive(&self, peer: PeerId, on: bool) -> Result<(), NodeError> {
         let context = self.name_of();
         self.answer(|reply| Command::PassiveKeepalive(context, peer, on, reply))
+            .await
+    }
+
+    /// Holds the session with `peer`, or releases it, for that session's
+    /// life: a held session is never closed to make room for another
+    /// (`PROTOCOL.md §5`). An application that keeps a peer connected holds
+    /// its session again each time it opens.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::NoSession`] without a session with `peer`; or
+    /// [`NodeError::Stopped`].
+    pub async fn hold(&self, peer: PeerId, held: bool) -> Result<(), NodeError> {
+        let context = self.name_of();
+        self.answer(|reply| Command::Hold(context, peer, held, reply))
             .await
     }
 
@@ -2180,6 +2196,13 @@ impl<E: SystemEntropy, C: Profile> Task<E, C> {
                 let result = self
                     .endpoint
                     .set_passive_keepalive(peer, context.as_bytes(), on)
+                    .map_err(|NoSession| NodeError::NoSession);
+                let _ = reply.send(result);
+            }
+            Command::Hold(context, peer, held, reply) => {
+                let result = self
+                    .endpoint
+                    .hold(peer, context.as_bytes(), held)
                     .map_err(|NoSession| NodeError::NoSession);
                 let _ = reply.send(result);
             }

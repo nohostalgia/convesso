@@ -92,7 +92,7 @@ fn run(packet: &[u8]) -> Option<Vec<u8>> {
     ) {
         ResponderOutput::Silent => None,
         ResponderOutput::Send(len) => {
-            assert!(len <= 62);
+            assert!(len <= convesso_core::handshake::MAX_RESPONDER_OUTPUT);
             None
         }
         ResponderOutput::Payload { len, payload, .. } => {

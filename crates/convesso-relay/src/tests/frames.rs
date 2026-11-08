@@ -19,7 +19,7 @@ fn the_largest_frame_crosses_the_relay_whole() {
     world.run_for(2000);
 
     let logged = world.clients[0].udp_log.len();
-    let frame: Vec<u8> = (0..1349u32).map(|i| (i % 251) as u8).collect();
+    let frame: Vec<u8> = (0..1345u32).map(|i| (i % 251) as u8).collect();
     world.send_frame(0, 1, FrameKind::Data, &frame).unwrap();
     world.run_for(2000);
     // The relay session's packet around a forward of the 1,380-byte packet.

@@ -15,9 +15,17 @@
 //!
 //! The transport key never signs: its Ed25519 form only names an endpoint.
 
+use blake2::Blake2sMac256;
+use blake2::digest::{KeyInit, Mac as _};
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use crate::handshake::{Entropy, Index};
+
+/// The label the index key is derived under (`PROTOCOL.md §3`). It is never
+/// on the wire: only this endpoint computes or checks its indices' tags.
+const INDEX_LABEL: &[u8] = b"convesso-index";
 
 /// `p = 2^255 − 19`, little-endian.
 const P_BYTES: [u8; 32] = {
@@ -234,6 +242,9 @@ impl core::error::Error for IdentityMismatch {}
 pub struct Identity {
     secret: StaticSecret,
     address: Address,
+    /// Keyed BLAKE2s-256 of [`INDEX_LABEL`] under the X25519 scalar: what
+    /// tags the indices this endpoint issues (`PROTOCOL.md §3`).
+    index_key: [u8; 32],
 }
 
 impl Identity {
@@ -251,7 +262,14 @@ impl Identity {
         if PublicKey::from(&secret).as_bytes() != address.peer_id().as_bytes() {
             return Err(IdentityMismatch);
         }
-        Ok(Self { secret, address })
+        let mut mac = <Blake2sMac256 as KeyInit>::new(&scalar.into());
+        mac.update(INDEX_LABEL);
+        let index_key = mac.finalize().into_bytes().into();
+        Ok(Self {
+            secret,
+            address,
+            index_key,
+        })
     }
 
     /// An identity from an Ed25519 seed, deriving its X25519 scalar as RFC 8032
@@ -284,5 +302,39 @@ impl Identity {
 
     pub(crate) const fn secret(&self) -> &StaticSecret {
         &self.secret
+    }
+
+    /// The tag of an index whose random half is `random`: the first 4 bytes
+    /// of keyed BLAKE2s-256 of it under the index key.
+    fn index_tag(&self, random: [u8; 4]) -> [u8; 4] {
+        let mut mac = <Blake2sMac256 as KeyInit>::new(&self.index_key.into());
+        mac.update(&random);
+        let full: [u8; 32] = mac.finalize().into_bytes().into();
+        let mut tag = [0u8; 4];
+        tag.copy_from_slice(full.get(..4).unwrap_or(&[0; 4]));
+        tag
+    }
+
+    /// A new index: 4 random bytes, then their tag, so that this endpoint
+    /// recognises it later, after a restart too, with no state
+    /// (`PROTOCOL.md §3`).
+    pub(crate) fn issue_index(&self, entropy: &mut impl Entropy) -> Index {
+        let mut random = [0u8; 4];
+        entropy.fill(&mut random);
+        let tag = self.index_tag(random);
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&random);
+        bytes[4..].copy_from_slice(&tag);
+        Index::from_le_bytes(bytes)
+    }
+
+    /// Whether this endpoint issued `index`: its tag matches its random half.
+    /// A random index passes with probability 2^-32.
+    #[must_use]
+    pub fn issued(&self, index: Index) -> bool {
+        let bytes = index.to_le_bytes();
+        let mut random = [0u8; 4];
+        random.copy_from_slice(bytes.get(..4).unwrap_or(&[0; 4]));
+        bytes.get(4..) == Some(&self.index_tag(random)[..])
     }
 }

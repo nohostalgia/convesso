@@ -480,9 +480,10 @@ fn a_receive_only_initiator_connects_with_a_keepalive() {
     net.connected();
     assert_eq!(net.a.events, vec![Ev::Connected(b"session".to_vec())]);
     assert_eq!(net.b.events, vec![Ev::Connected(b"session".to_vec())]);
-    // A sent its first contact and one keepalive: 134 + 31 bytes.
+    // A sent its first contact and its address, which confirms: 138 + 67
+    // bytes.
     let lens: Vec<usize> = net.a.sent.iter().map(Vec::len).collect();
-    assert_eq!(lens, vec![134, 31]);
+    assert_eq!(lens, vec![138, 67]);
     assert!(
         net.b
             .endpoint
@@ -490,17 +491,25 @@ fn a_receive_only_initiator_connects_with_a_keepalive() {
     );
 }
 
-/// The first datagram confirms as a keepalive would, and is delivered.
+/// The initiator's address confirms the handshake, and the first datagram,
+/// queued behind it, is delivered after it.
 #[test]
-fn the_first_datagram_confirms_and_is_delivered() {
+fn the_address_confirms_and_the_first_datagram_follows() {
     let mut net = Net::new();
     net.a_sends(b"hello").unwrap();
     assert_eq!(
         net.b.events,
-        vec![Ev::Datagram(b"session".to_vec(), b"hello".to_vec(), true)]
+        vec![
+            Ev::Connected(b"session".to_vec()),
+            Ev::Datagram(b"session".to_vec(), b"hello".to_vec(), false)
+        ]
     );
     assert_eq!(net.a.events, vec![Ev::Connected(b"session".to_vec())]);
-    assert_eq!(net.a.sent.len(), 2, "first contact, then the datagram");
+    assert_eq!(
+        net.a.sent.len(),
+        3,
+        "first contact, the address, then the datagram"
+    );
 }
 
 /// Scenario: a replayed first contact never displaces a session.
@@ -695,25 +704,34 @@ fn a_late_packet_does_not_move_the_session_back() {
     assert_eq!(to, To::Direct(Source::Direct(&source).key().unwrap()));
 }
 
-/// Scenario: a deleted key pair opens nothing (expiry).
+/// Scenario: a deleted key pair opens nothing (expiry): the packet is
+/// answered with the unknown-index signal, and nothing is delivered.
 #[test]
 fn an_expired_key_pair_opens_nothing() {
     let mut net = Net::new();
     net.a_sends(b"one").unwrap();
     let packet = net.a.sent[1].clone();
+    let index = transport::parse_header(&packet).unwrap().receiver_index;
     net.at(181);
-    assert_eq!(net.deliver(true, &packet), None);
+    assert_eq!(
+        net.deliver(true, &packet),
+        Some(transport::write_unknown_index(index).to_vec())
+    );
     assert_eq!(net.b_datagrams(), vec![b"one".to_vec()]);
 }
 
 // --- rekey ------------------------------------------------------------------------------
 
-/// Scenario: without the address, the peer renews the keys.
+/// Scenario: without the address, the peer renews the keys: a responder
+/// whose initiator's address packet was lost starts no handshake, even past
+/// the time it would renew keys it answered.
 #[test]
 fn a_responder_without_the_address_starts_no_handshake() {
     let mut net = Net::new();
     net.a_sends(b"one").unwrap();
-    net.at(121);
+    let key = (net.a.peer_id(), ctx());
+    net.b.endpoint.sessions.get_mut(&key).unwrap().address = None;
+    net.at(151);
     net.b_replies(b"reply").unwrap();
     assert_eq!(net.b.first_contacts_sent(), 0);
     assert!(
@@ -855,7 +873,7 @@ fn the_path_size_is_respected() {
         &mut net.a.entropy,
         &mut out,
     );
-    assert!(matches!(sent, Ok(Output::Transmit { len: 1311, .. })));
+    assert!(matches!(sent, Ok(Output::Transmit { len: 1315, .. })));
     let refused = net.a.endpoint.send(
         Target::Address(&address),
         b"session",
@@ -869,7 +887,7 @@ fn the_path_size_is_respected() {
     assert_eq!(
         refused,
         Err(SendError::TooLarge {
-            packet: 1311,
+            packet: 1315,
             path: 1280
         })
     );
@@ -1118,7 +1136,7 @@ fn the_passive_keepalive_when_enabled() {
     assert_eq!(net.b.sent.len(), sent);
     net.at(10);
     assert_eq!(net.b.sent.len(), sent + 1);
-    assert_eq!(net.b.sent.last().unwrap().len(), 31);
+    assert_eq!(net.b.sent.last().unwrap().len(), 35);
     for second in 11..=60 {
         net.at(second);
     }
@@ -1178,7 +1196,7 @@ fn a_reserved_inner_type_is_ignored_and_not_replayable() {
     let mut net = Net::new();
     net.a_sends(b"hello").unwrap();
     let events = net.b.events.len();
-    let packet = crafted(&mut net, 0x08, b"later");
+    let packet = crafted(&mut net, 0x09, b"later");
     assert_eq!(net.deliver(true, &packet), None);
     assert_eq!(net.deliver(true, &packet), None);
     assert_eq!(net.b.events.len(), events);
@@ -1701,14 +1719,14 @@ fn stream_frames_are_handed_up_never_as_datagrams() {
     assert_eq!(net.b_datagrams().len(), datagrams);
 }
 
-/// A frame goes as a datagram would: one packet, 31 bytes longer than the
+/// A frame goes as a datagram would: one packet, 35 bytes longer than the
 /// frame, handed up whole; and datagrams keep flowing beside frames.
 #[test]
 fn a_frame_is_sent_as_a_datagram_would_be() {
     let mut net = Net::new();
     net.a_sends(b"hello").unwrap();
     let sent = net.a.sent.len();
-    let frame = vec![0x5a; 1349];
+    let frame = vec![0x5a; 1345];
     net.a_sends_frame(FrameKind::Data, &frame).unwrap();
     assert_eq!(net.a.sent.len(), sent + 1);
     assert_eq!(net.a.sent[sent].len(), 1380);
@@ -1759,7 +1777,7 @@ fn an_oversized_frame_is_refused() {
     net.a_sends(b"hello").unwrap();
     let sent = net.a.sent.len();
     assert_eq!(
-        net.a_sends_frame(FrameKind::Data, &[0; 1350]),
+        net.a_sends_frame(FrameKind::Data, &[0; 1346]),
         Err(SendError::TooLarge {
             packet: 1381,
             path: 1380
@@ -3967,8 +3985,8 @@ fn a_renewal_raises_no_event() {
     }
 }
 
-/// A full table on the microcontroller profile refuses a fifth peer, and the
-/// four live sessions are untouched: nothing is evicted.
+/// A full table on the microcontroller profile whose four sessions are held
+/// refuses a fifth peer, and the four are untouched: nothing is evicted.
 #[cfg(feature = "ed25519-seed")]
 #[test]
 fn a_full_table_refuses_and_evicts_nothing() {
@@ -3987,6 +4005,7 @@ fn a_full_table_refuses_and_evicts_nothing() {
         a.endpoint.set_hints(id, &[&peer.source], now).unwrap();
         let packet = a.send_to(&peer.address(), b"hello", now);
         settle_pair(&mut a, peer, packet, now);
+        a.endpoint.hold(id, b"session", true).unwrap();
     }
     assert_eq!(a.endpoint.session_count(), 4);
     let mut out = [0u8; 2048];
@@ -4096,9 +4115,9 @@ fn context_settings_apply_whenever_given() {
     endpoint.set_context_settings(b"dial-d", early).unwrap();
 }
 
-/// How many keepalives (31-byte transport packets) `node` sends at `now`.
+/// How many keepalives (35-byte transport packets) `node` sends at `now`.
 fn keepalives_at<C: Config>(node: &mut Peer<C>, now: Instant) -> usize {
-    node.drain(now).iter().filter(|p| p.len() == 31).count()
+    node.drain(now).iter().filter(|p| p.len() == 35).count()
 }
 
 /// Scenario: a context's default applies to every session: two peers each
@@ -4504,3 +4523,57 @@ fn a_start_refused_changes_nothing() {
 }
 
 mod room;
+mod signal;
+
+// --- the initiator's address -------------------------------------------------------------
+
+/// Scenario: a responder learns its initiator's address, and renews the keys
+/// it answered once they are 150 seconds old, as their initiator renews its
+/// own at 120.
+#[test]
+fn a_responder_that_learned_the_address_renews() {
+    let mut net = Net::new();
+    net.a_sends(b"one").unwrap();
+    let key = (net.a.peer_id(), ctx());
+    assert_eq!(
+        net.b.endpoint.sessions.get(&key).unwrap().address,
+        Some(net.a.address())
+    );
+    net.at(121);
+    net.b_replies(b"not yet").unwrap();
+    assert_eq!(net.b.first_contacts_sent(), 0, "the initiator renews first");
+    net.at(151);
+    net.b_replies(b"now").unwrap();
+    assert_eq!(net.b.first_contacts_sent(), 1);
+    net.b_replies(b"after").unwrap();
+    assert!(
+        net.a
+            .events
+            .contains(&Ev::Datagram(b"session".to_vec(), b"after".to_vec(), false))
+    );
+}
+
+/// Scenario: an address of another identity, or of another length, is
+/// ignored: the session keeps the address it had, and nothing is sent.
+#[test]
+fn an_address_of_another_identity_is_ignored() {
+    let mut net = Net::new();
+    net.a_sends(b"one").unwrap();
+    let key = (net.a.peer_id(), ctx());
+    net.b.endpoint.sessions.get_mut(&key).unwrap().address = None;
+    let other = *identity(2).address();
+    let own = net.a.address();
+    for data in [&other.as_bytes()[..], &own.as_bytes()[..31]] {
+        let packet = crafted(&mut net, inner::ADDRESS, data);
+        let sent = net.b.sent.len();
+        assert_eq!(net.deliver(true, &packet), None);
+        assert_eq!(net.b.sent.len(), sent);
+        assert_eq!(net.b.endpoint.sessions.get(&key).unwrap().address, None);
+    }
+    let packet = crafted(&mut net, inner::ADDRESS, own.as_bytes());
+    assert_eq!(net.deliver(true, &packet), None);
+    assert_eq!(
+        net.b.endpoint.sessions.get(&key).unwrap().address,
+        Some(own)
+    );
+}

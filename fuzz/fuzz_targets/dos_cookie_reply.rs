@@ -1,4 +1,4 @@
-//! Parsing a cookie reply: never panics, and accepts exactly the 62-byte
+//! Parsing a cookie reply: never panics, and accepts exactly the 66-byte
 //! packets with the right header. Opening one with any address and mac1 never
 //! panics either.
 

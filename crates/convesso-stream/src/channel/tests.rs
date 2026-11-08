@@ -21,7 +21,7 @@ use convesso_core::time::Instant;
 use serde_json::Value;
 
 use crate::config::{Mcu, StreamConfig};
-use crate::frame::{self, Ack, Data, MAX_DATA_LEN};
+use crate::frame::{self, Ack, Data, MAX_DATA_LEN, MAX_FRAGMENT};
 use crate::{Channels, Event, Poll, Reason, SendError};
 
 pub(crate) fn address(i: usize) -> Address {
@@ -625,8 +625,8 @@ fn a_fragment_outside_the_window_is_not_held() {
     let mut out = [0u8; MAX_DATA_LEN];
     for (sequence, bytes) in [
         (70_000u32, &[1u8; 100][..]),
-        (5, &[2u8; 1332][..]),
-        (6, &[3u8; 1332][..]),
+        (5, &[2u8; MAX_FRAGMENT][..]),
+        (6, &[3u8; MAX_FRAGMENT][..]),
     ] {
         let data = Data {
             incarnation,
@@ -643,7 +643,7 @@ fn a_fragment_outside_the_window_is_not_held() {
     assert!(after - before <= 2048, "never beyond the buffer");
     assert_eq!(
         after - before,
-        1332,
+        MAX_FRAGMENT,
         "only what the window holds: one of the two"
     );
 }

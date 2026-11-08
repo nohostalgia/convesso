@@ -333,6 +333,9 @@ pub(crate) struct Client {
     /// This client's link silently drops everything, both ways, without a
     /// close reaching either end.
     pub(crate) link_blackhole: bool,
+    /// Every UDP datagram and direct packet to this client is lost, as on a
+    /// radio out of reach; its TCP link, whose bytes stay in order, is not.
+    pub(crate) deaf: bool,
     /// The relay answers this client's keep-alives but never its handshakes:
     /// its first contacts to the relay are lost.
     pub(crate) handshakes_ignored: bool,
@@ -513,6 +516,7 @@ impl<P: Policy> World<P> {
                 tcp_refused: false,
                 tcp_hangs: false,
                 link_blackhole: false,
+                deaf: false,
                 handshakes_ignored: false,
                 first_contacts_delayed: 0,
                 opens: Vec::new(),
@@ -802,6 +806,50 @@ impl<P: Policy> World<P> {
             context,
             data,
             RELAY_PATH_MAX,
+            now,
+            &mut client.policy,
+            &mut client.entropy,
+            &mut out,
+        )?;
+        self.client_output(i, output.into(), &mut out);
+        Ok(())
+    }
+
+    /// Client `i` sends `data` to client `to` by its `PeerId` only, as a side
+    /// that answered a handshake and was given no address does.
+    pub(crate) fn send_by_peer(
+        &mut self,
+        i: usize,
+        to: usize,
+        data: &[u8],
+    ) -> Result<(), SendError> {
+        let peer = self.clients[to].peer_id();
+        let now = self.instant();
+        let client = &mut self.clients[i];
+        let mut out = [0u8; 2048];
+        let output = client.endpoint.send(
+            Target::Peer(peer),
+            SESSION,
+            data,
+            RELAY_PATH_MAX,
+            now,
+            &mut client.policy,
+            &mut client.entropy,
+            &mut out,
+        )?;
+        self.client_output(i, output.into(), &mut out);
+        Ok(())
+    }
+
+    /// Client `i` opens a session with client `to` without sending data.
+    pub(crate) fn connect(&mut self, i: usize, to: usize) -> Result<(), SendError> {
+        let address = self.clients[to].address();
+        let now = self.instant();
+        let client = &mut self.clients[i];
+        let mut out = [0u8; 2048];
+        let output = client.endpoint.connect(
+            &address,
+            SESSION,
             now,
             &mut client.policy,
             &mut client.entropy,
@@ -1295,6 +1343,15 @@ impl<P: Policy> World<P> {
 
     fn deliver(&mut self, msg: Msg) {
         let now = self.instant();
+        let deaf = match &msg {
+            Msg::Direct { to, .. } | Msg::DirectIp { to, .. } => self.clients[*to].deaf,
+            Msg::ClientUdp { client, .. } => self.clients[*client].deaf,
+            _ => false,
+        };
+        if deaf {
+            self.relay_actions();
+            return;
+        }
         match msg {
             Msg::RelayUdp {
                 from,

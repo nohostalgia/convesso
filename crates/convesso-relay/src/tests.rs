@@ -25,5 +25,6 @@ mod link;
 mod measure;
 mod messages;
 mod paths;
+mod recovery;
 mod relay;
 mod simulation;

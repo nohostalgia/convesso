@@ -39,13 +39,16 @@ bytes and the next deadline come out.
   sizes when the endpoint starts, allocates each table once then, and never grows or frees one,
   so a device with a heap chooses its slots without a rebuild and its heap does not fragment.
   When a table is full, the core returns a named error instead of growing.
-- **A bounded endpoint serves more peers than it has slots.** A session holds its slot while it
-  is in use; one silent both ways for 30 seconds may be closed to make room for a new peer, with
-  an authenticated close that tells the peer why (§5), so that four slots serve any number of
-  peers that are not all active at once. When no session can make room, a first contact is
-  refused by name rather than accepted and dropped. The pinned relay keeps a session slot, a dial
-  and a pending handshake that peers cannot take: whatever the peers do, the relay can reach the
-  device. A bounded profile keeps no table of the indices peers put in packets: an index is found
+- **A bounded endpoint serves more peers than it has slots.** When a new peer needs a slot, the
+  session least recently active is closed to make room, whatever its age, with an authenticated
+  close that tells the peer why. A peer whose close is lost learns it from its next packet, which
+  is answered with the unknown index, and renews at once: losing a session costs about two round
+  trips, not minutes. So four slots serve any number of peers, and slow down only when more are
+  active at once than there are slots. An application holds the sessions it keeps, and those are
+  never closed. When no session can make room, a first contact is refused by name rather than
+  accepted and dropped. The pinned relay keeps a session slot, a pending handshake and, while
+  its session has no keys, a dial that peers cannot take: whatever the peers do, the relay can
+  reach the device. A bounded profile keeps no table of the indices peers put in packets: an index is found
   among the sessions and dials that hold it, so none can outlive its owner. The queue a session
   fills while it reopens is lent to it, and given back when it empties: the few sessions that
   reopen at once share a handful of queues.
@@ -130,6 +133,11 @@ convesso tries to avoid it.
   *dormant*: it sends nothing and sets no timer, and it is forgotten, so that a server's memory
   and the cost of each packet follow the peers in use, not every peer it met. The next datagram
   opens a session again.
+- **A lost session is found on use, not by a timer.** A side that lost a session, restarted or
+  evicted, answers the next packet under it with its index, and the sender renews at once
+  (`PROTOCOL.md §5`). That answer costs nothing at rest and nothing on a session that works; the
+  usual alternative, a keepalive after every burst received and a timer on the sender, would send
+  on every one-way flow.
 - **Traffic at rest is measured.** The tests run an idle month on a virtual clock and count what
   was sent.
 

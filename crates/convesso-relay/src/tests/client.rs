@@ -175,13 +175,13 @@ fn relay_frames_never_reach_the_application() {
 
 // --- the wake -------------------------------------------------------------------------
 
-/// The wake is one datagram: the relay's first contact, 302 bytes, carrying
+/// The wake is one datagram: the relay's first contact, 310 bytes, carrying
 /// the forward of A's first contact to B.
 #[test]
-fn a_wake_is_one_datagram_of_302_bytes() {
+fn a_wake_is_one_datagram_of_310_bytes() {
     let world = connected();
     let wake = &world.clients[0].udp_log[0];
-    assert_eq!(wake.len(), 302);
+    assert_eq!(wake.len(), 310);
     assert_eq!(&wake[..2], &[0x01, 0x05]);
 }
 
@@ -255,8 +255,9 @@ fn a_slow_relay_that_admits_every_first_contact_leaves_the_session_working() {
 }
 
 /// Scenario: a live relay session forwards every attempt. A's relay session
-/// has keys; B's link has died without the relay knowing yet, so B never
-/// answers: A's attempts at 0 and 1 s are both forwarded when they are made.
+/// has keys; B's link has died without the relay knowing yet, and its UDP
+/// is lost, so B never answers: A's attempts at 0 and 1 s are both forwarded
+/// when they are made.
 #[test]
 fn a_live_relay_session_forwards_every_attempt() {
     let mut world = World::new(Open, Config::default(), 2);
@@ -265,6 +266,7 @@ fn a_live_relay_session_forwards_every_attempt() {
     world.open_link(1);
     world.run_for(1000);
     world.clients[1].link_blackhole = true;
+    world.clients[1].udp_blocked = true;
     world.send(0, 1, b"unanswered").unwrap();
     world.run_for(500);
     assert_eq!(first_contacts_to(&world, 1), (1, 1), "the first, at once");
@@ -277,7 +279,7 @@ fn a_live_relay_session_forwards_every_attempt() {
 fn a_datagram_too_large_for_the_relay_is_refused() {
     let mut world = connected();
     assert_eq!(
-        world.send(0, 1, &[7; MAX_CARRIED + 1 - 31]),
+        world.send(0, 1, &[7; MAX_CARRIED + 1 - 35]),
         Err(SendError::TooLarge {
             packet: 1381,
             path: 1380
@@ -304,7 +306,7 @@ fn a_datagram_too_large_for_the_relay_is_refused() {
 }
 
 /// A forward is built around the packet in place: an output buffer of the
-/// packet plus 65 bytes is enough, one byte less is not.
+/// packet plus 69 bytes is enough, one byte less is not.
 #[test]
 fn a_forward_needs_no_second_buffer() {
     let mut world = connected();
@@ -312,7 +314,7 @@ fn a_forward_needs_no_second_buffer() {
     let now = world.instant();
     let client = &mut world.clients[0];
     let packet = [0x01u8; 100];
-    let mut tight = [0u8; 165];
+    let mut tight = [0u8; 169];
     tight[..100].copy_from_slice(&packet);
     assert!(matches!(
         client.endpoint.through_relay(
@@ -325,10 +327,10 @@ fn a_forward_needs_no_second_buffer() {
         ),
         Ok(Output::Transmit {
             to: To::Relay(_),
-            len: 165
+            len: 169
         })
     ));
-    let mut short = [0u8; 164];
+    let mut short = [0u8; 168];
     short[..100].copy_from_slice(&packet);
     assert!(matches!(
         client.endpoint.through_relay(
@@ -644,7 +646,7 @@ fn a_forward_too_large_to_carry_dials_first() {
     else {
         panic!("a dial to the relay");
     };
-    assert_eq!(len, 134, "a plain first contact");
+    assert_eq!(len, 138, "a plain first contact");
     assert_eq!(out[1], 0x01);
     let mut to_relay = vec![out[..len].to_vec()];
     let mut forwarded = false;
@@ -673,7 +675,7 @@ fn a_forward_too_large_to_carry_dials_first() {
         while let Poll::Transmit { len, .. } =
             server.poll(now, &mut AcceptAll, &mut entropy, &mut out)
         {
-            forwarded |= len == 31 + 34 + 1300;
+            forwarded |= len == 35 + 34 + 1300;
             to_relay.push(out[..len].to_vec());
         }
     }

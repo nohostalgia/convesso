@@ -204,6 +204,23 @@ impl<C: Config> Mesh<C> {
     }
 
     /// Delivers what was held, in order, and holds nothing more.
+    /// Lets the packets held for node `j` go, and no longer holds its own.
+    fn release_to(&mut self, j: usize) {
+        self.holding.retain(|&held| held != j);
+        let held = core::mem::take(&mut self.held);
+        let (go, stay): (VecDeque<_>, VecDeque<_>) = held
+            .into_iter()
+            .partition(|(from, to, _)| self.dest(*from, *to) == Some(j));
+        self.held = stay;
+        self.settle(go);
+    }
+
+    /// Node `i`'s application holds its session with node `j`.
+    fn hold(&mut self, i: usize, j: usize) {
+        let peer = self.nodes[j].endpoint.identity().unwrap().peer_id();
+        self.nodes[i].endpoint.hold(peer, b"session", true).unwrap();
+    }
+
     fn release(&mut self) {
         self.holding.clear();
         let held = core::mem::take(&mut self.held);
@@ -235,11 +252,11 @@ impl<C: Config> Mesh<C> {
 // --- indices ------------------------------------------------------------------------------
 
 /// The first contacts' initiator indices among `packets`.
-fn first_contact_indices(packets: &[Vec<u8>]) -> Vec<u32> {
+fn first_contact_indices(packets: &[Vec<u8>]) -> Vec<u64> {
     packets
         .iter()
         .filter(|p| p[0] == 0x01 && crate::handshake::messages::is_first_contact_type(p[1]))
-        .map(|p| u32::from_le_bytes([p[2], p[3], p[4], p[5]]))
+        .map(|p| u64::from_le_bytes(p[2..10].try_into().unwrap()))
         .collect()
 }
 
@@ -401,13 +418,15 @@ fn an_idle_session_makes_room_and_its_peer_is_told() {
     assert_eq!(mesh.closes(0, CLOSE_TO_MAKE_ROOM, false), 2);
 }
 
-/// Scenarios: busy sessions are never evicted; a full board refuses a new
+/// Scenarios: held sessions are never evicted; a full board refuses a new
 /// peer by name; a send with no room is refused by name.
 #[test]
-fn a_busy_board_refuses_a_newcomer_by_name() {
+fn a_held_board_refuses_a_newcomer_by_name() {
     let mut mesh: Mesh<Tiny> = Mesh::new(4);
     mesh.send(1, 0, b"from 1").unwrap();
     mesh.send(2, 0, b"from 2").unwrap();
+    mesh.hold(0, 1);
+    mesh.hold(0, 2);
     mesh.at(10_000);
     mesh.send(3, 0, b"from 3").unwrap();
     assert!(!mesh.got(0, b"from 3"));
@@ -445,17 +464,27 @@ fn pin_unreachable_relay<C: Config>(mesh: &mut Mesh<C>, i: usize) {
 }
 
 /// Scenario: peers cannot crowd out the relay. On a two-session board whose
-/// relay session is not held, one peer takes the free slot, and the next is
-/// refused: the last slot is the relay's.
+/// relay session is not held, one peer takes the free slot; the next takes
+/// its place, never the relay's slot; and with the first held, the next is
+/// refused.
 #[test]
 fn the_last_session_slot_is_the_relays() {
-    let mut mesh: Mesh<Tiny> = Mesh::new(3);
+    let mut mesh: Mesh<Tiny> = Mesh::new(4);
     pin_unreachable_relay(&mut mesh, 0);
     mesh.send(1, 0, b"from 1").unwrap();
     assert!(mesh.got(0, b"from 1"));
     mesh.send(2, 0, b"from 2").unwrap();
-    assert!(!mesh.got(0, b"from 2"), "the relay's slot is not given");
-    assert!(mesh.nodes[2].events.contains(&Ev::ReopenFailed(
+    assert!(mesh.got(0, b"from 2"), "in the first peer's place");
+    assert_eq!(mesh.closes(0, CLOSE_TO_MAKE_ROOM, false), 1);
+    assert_eq!(
+        mesh.nodes[0].endpoint.session_count(),
+        1,
+        "the relay's slot is not given"
+    );
+    mesh.hold(0, 2);
+    mesh.send(3, 0, b"from 3").unwrap();
+    assert!(!mesh.got(0, b"from 3"));
+    assert!(mesh.nodes[3].events.contains(&Ev::ReopenFailed(
         b"session".to_vec(),
         DialError::Refused(RefusalCode::CAPACITY_EXHAUSTED)
     )));
@@ -476,15 +505,19 @@ fn the_last_dial_is_the_relays() {
 /// Scenario: a confirmation that arrives when the session can no longer be
 /// kept is answered with a close `0x0002`, and leaves the initiator holding
 /// no keys. Two first contacts reach a board with one free slot, both
-/// accepted; the first confirmation takes the slot, the second is closed.
+/// accepted; the first confirmation takes the slot, the application holds
+/// both sessions, and the second confirmation is closed.
 #[test]
 fn a_confirmation_without_room_is_closed() {
     let mut mesh: Mesh<Tiny> = Mesh::new(4);
     mesh.send(1, 0, b"from 1").unwrap();
-    mesh.holding.push(0);
+    mesh.hold(0, 1);
+    mesh.holding.extend([2, 3]);
     mesh.send(2, 0, b"from 2").unwrap();
     mesh.send(3, 0, b"from 3").unwrap();
-    mesh.release();
+    mesh.release_to(2);
+    mesh.hold(0, 2);
+    mesh.release_to(3);
     assert!(mesh.got(0, b"from 2"));
     assert!(!mesh.got(0, b"from 3"));
     assert_eq!(
@@ -504,4 +537,104 @@ fn a_confirmation_without_room_is_closed() {
             .is_none_or(|session| session.current.is_none()),
         "no keys left on the initiator"
     );
+}
+
+// --- eviction at any age, holds, several evictions between polls ---------------------------
+
+/// Scenario: a full board serves more peers than its slots, evicting the
+/// least recently active whatever its age: two peers that each exchanged a
+/// datagram within the last second, then a third and a fourth.
+#[test]
+fn a_board_evicts_the_least_recently_active_at_any_age() {
+    let mut mesh: Mesh<Tiny> = Mesh::new(5);
+    mesh.at(1000);
+    mesh.send(1, 0, b"from 1").unwrap();
+    mesh.at(1300);
+    mesh.send(2, 0, b"from 2").unwrap();
+    mesh.at(1600);
+    mesh.send(3, 0, b"from 3").unwrap();
+    assert!(mesh.got(0, b"from 3"));
+    assert_eq!(mesh.closes(1, CLOSE_TO_MAKE_ROOM, true), 1, "the oldest");
+    assert_eq!(mesh.closes(2, CLOSE_TO_MAKE_ROOM, true), 0);
+    mesh.at(1900);
+    mesh.send(4, 0, b"from 4").unwrap();
+    assert!(mesh.got(0, b"from 4"));
+    assert_eq!(mesh.closes(2, CLOSE_TO_MAKE_ROOM, true), 1, "the next");
+    assert_eq!(mesh.closes(3, CLOSE_TO_MAKE_ROOM, true), 0);
+    assert_eq!(mesh.closes(0, CLOSE_TO_MAKE_ROOM, false), 2);
+}
+
+/// Scenarios: a held session outlasts a silent peer; a released one can be
+/// evicted again; a hold needs a session.
+#[test]
+fn a_held_session_is_never_evicted_until_released() {
+    let mut mesh: Mesh<Tiny> = Mesh::new(5);
+    mesh.send(1, 0, b"from 1").unwrap();
+    mesh.hold(0, 1);
+    mesh.at(1000);
+    mesh.send(2, 0, b"from 2").unwrap();
+    // Two minutes on, 1 silent all along, its keys still live.
+    mesh.at(120_000);
+    mesh.send(3, 0, b"from 3").unwrap();
+    assert!(mesh.got(0, b"from 3"));
+    assert_eq!(mesh.closes(1, CLOSE_TO_MAKE_ROOM, true), 0, "held");
+    assert_eq!(mesh.closes(2, CLOSE_TO_MAKE_ROOM, true), 1);
+    // Released, 1 goes before 3, which was active since.
+    let one = mesh.nodes[1].endpoint.identity().unwrap().peer_id();
+    mesh.nodes[0].endpoint.hold(one, b"session", false).unwrap();
+    mesh.at(121_000);
+    mesh.send(4, 0, b"from 4").unwrap();
+    assert!(mesh.got(0, b"from 4"));
+    assert_eq!(mesh.closes(1, CLOSE_TO_MAKE_ROOM, true), 1, "released");
+    // A peer with no session cannot be held, nor its next session.
+    let two = mesh.nodes[2].endpoint.identity().unwrap().peer_id();
+    assert_eq!(
+        mesh.nodes[0].endpoint.hold(two, b"session", true),
+        Err(NoSession)
+    );
+}
+
+/// Scenario: two newcomers between two polls are both served: the board
+/// handles both first contacts and both confirmations before it polls, each
+/// confirmation evicting a session; the two closes and their events follow.
+#[test]
+fn two_newcomers_between_two_polls_are_both_served() {
+    let mut mesh: Mesh<Tiny> = Mesh::new(5);
+    mesh.send(1, 0, b"from 1").unwrap();
+    mesh.at(1000);
+    mesh.send(2, 0, b"from 2").unwrap();
+    mesh.at(2000);
+    mesh.holding.push(0);
+    mesh.send(3, 0, b"from 3").unwrap();
+    mesh.send(4, 0, b"from 4").unwrap();
+    mesh.release();
+    assert!(mesh.got(0, b"from 3") && mesh.got(0, b"from 4"));
+    assert_eq!(mesh.closes(1, CLOSE_TO_MAKE_ROOM, true), 1);
+    assert_eq!(mesh.closes(2, CLOSE_TO_MAKE_ROOM, true), 1);
+    assert_eq!(mesh.closes(0, CLOSE_TO_MAKE_ROOM, false), 2, "both told");
+}
+
+/// With every eviction's close waiting for a poll, a full table finds no room.
+#[test]
+fn a_full_farewell_queue_leaves_no_room() {
+    let mut mesh: Mesh<Tiny> = Mesh::new(4);
+    mesh.send(1, 0, b"from 1").unwrap();
+    mesh.send(2, 0, b"from 2").unwrap();
+    let endpoint = &mesh.nodes[0].endpoint;
+    let newcomer = (
+        mesh.nodes[3].endpoint.identity().unwrap().peer_id(),
+        Context::new(b"session").unwrap(),
+    );
+    let room_with = |farewell_free| {
+        super::super::room::<Tiny>(
+            &endpoint.sessions,
+            &endpoint.dials,
+            &endpoint.queues,
+            None,
+            farewell_free,
+            &newcomer,
+        )
+    };
+    assert!(matches!(room_with(true), Room::Evict(_)));
+    assert_eq!(room_with(false), Room::Full);
 }

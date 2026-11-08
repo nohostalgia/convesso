@@ -164,8 +164,8 @@ fuzz_target!(|data: &[u8]| {
 
     // The fuzzed packet, with the live session's index grafted in half the time.
     let mut packet = data.to_vec();
-    if packet.len() >= 31 && packet[0] == 0x01 && packet[1] == 0x04 && packet[2] & 1 == 1 {
-        packet[2..6].copy_from_slice(&keepalive[2..6]);
+    if packet.len() >= 35 && packet[0] == 0x01 && packet[1] == 0x04 && packet[2] & 1 == 1 {
+        packet[2..10].copy_from_slice(&keepalive[2..10]);
     }
     for round in 0..2 {
         for i in [2 * round, 2 * round + 1] {

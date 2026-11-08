@@ -46,7 +46,7 @@ embassy-sync = "0.8.0"
 embassy-executor = { version = "0.10.0", features = ["platform-std", "executor-thread"] }
 embassy-net-driver = "0.2.0"
 embassy-time = { version = "0.5.1", features = ["std", "generic-queue-64"] }
-convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc"] }
+convesso-core = { path = "../convesso-core", version = "0.0.0", features = ["alloc", "ed25519-seed"] }
 convesso-relay = { path = "../convesso-relay", version = "0.0.0" }
 proptest.workspace = true
 tokio = { version = "1.53.3", features = ["macros", "rt", "time"] }

@@ -85,6 +85,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "transport_signal"
+path = "fuzz_targets/transport_signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "endpoint"
 path = "fuzz_targets/endpoint.rs"
 test = false

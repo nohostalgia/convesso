@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! initiator                                             responder
-//!   Dial::start ---- first contact (134 B) ---------------->  mac1, decrypt, canonical s,
+//!   Dial::start ---- first contact (138 B) ---------------->  mac1, decrypt, canonical s,
 //!                                                              Admission::admit(PeerId)
-//!               <--- response (61 B): accept | refuse(code) -- Pending (5 s, no event)
+//!               <--- response (69 B): accept | refuse(code) -- Pending (5 s, no event)
 //!   Established                                            confirmed later, by the
 //!                                                          first transport packet
 //! ```
@@ -30,8 +30,15 @@ pub use responder::{
 
 use crate::identity::PeerId;
 
+/// A session index: 8 bytes chosen by the side that receives under it, and
+/// echoed by its peer (`PROTOCOL.md §3`).
+pub type Index = u64;
+
+/// Length of an [`Index`] on the wire, little-endian.
+pub const INDEX_LEN: usize = 8;
+
 /// Length of version 1's first contact.
-pub const FIRST_CONTACT_LEN: usize = 134;
+pub const FIRST_CONTACT_LEN: usize = 138;
 
 /// The longest payload a first contact carries (type `0x05`).
 pub const MAX_PAYLOAD: usize = 1200;
@@ -40,11 +47,15 @@ pub const MAX_PAYLOAD: usize = 1200;
 pub const MAX_FIRST_CONTACT_LEN: usize = FIRST_CONTACT_LEN + MAX_PAYLOAD;
 
 /// Length of version 1's response.
-pub const RESPONSE_LEN: usize = 61;
+pub const RESPONSE_LEN: usize = 69;
 
-/// The most a responder writes in answer to a packet: a response (61 bytes), a
-/// cookie reply (62) or a "version not supported" (at most 33).
-pub const MAX_RESPONDER_OUTPUT: usize = 62;
+/// The most a responder writes in answer to a packet: a response (69 bytes), a
+/// cookie reply (66) or a "version not supported" (at most 33).
+pub const MAX_RESPONDER_OUTPUT: usize = if RESPONSE_LEN > crate::dos::COOKIE_REPLY_LEN {
+    RESPONSE_LEN
+} else {
+    crate::dos::COOKIE_REPLY_LEN
+};
 
 /// The longest context an application may bind a handshake to.
 pub const MAX_CONTEXT_LEN: usize = 32;
@@ -60,7 +71,7 @@ pub const PENDING_LIFETIME: Duration = Duration::from_secs(5);
 
 /// When an initiator sends a first contact, counted from the start of a dial.
 ///
-/// Sends at most 4 × 134 bytes per dial, and nothing on an idle device. Without
+/// Sends at most 4 × 138 bytes per dial, and nothing on an idle device. Without
 /// retries, one lost packet would fail the dial.
 pub const ATTEMPT_OFFSETS: [Duration; 4] = [
     Duration::from_secs(0),

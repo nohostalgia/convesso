@@ -149,7 +149,7 @@ def mac2(cookie_value, prefix):
 def cookie_reply(address, initiator_index, nonce, cookie_value, mac1):
     key = hashlib.blake2s(COOKIE_LABEL + address).digest()
     ciphertext, tag = xchacha20_poly1305_seal(key, nonce, cookie_value, mac1)
-    return bytes([0x01, 0x03]) + struct.pack("<I", initiator_index) + nonce + ciphertext + tag
+    return bytes([0x01, 0x03]) + struct.pack("<Q", initiator_index) + nonce + ciphertext + tag
 
 
 def main():
@@ -176,18 +176,18 @@ def main():
     assert len({c["cookie"] for c in cookies}) == len(cookies), "every source and secret gives its own cookie"
 
     cookie_value = bytes.fromhex(cookies[0]["cookie"])
-    prefixes = [b"", bytes(range(118)), bytes([0x01]) * 118]
+    prefixes = [b"", bytes(range(122)), bytes([0x01]) * 122]
     mac2s = [
         {"cookie": cookie_value.hex(), "prefix": prefix.hex(), "mac2": mac2(cookie_value, prefix).hex()}
         for prefix in prefixes
     ]
 
     replies = []
-    for index, nonce_seed, mac1_seed in [(0x01020304, b"nonce 1", b"mac1 1"), (0xFFFFFFFF, b"nonce 2", b"mac1 2")]:
+    for index, nonce_seed, mac1_seed in [(0x0102030405060708, b"nonce 1", b"mac1 1"), (0xFFFFFFFFFFFFFFFF, b"nonce 2", b"mac1 2")]:
         nonce = hashlib.blake2s(nonce_seed).digest()[:24]
         mac1 = hashlib.blake2s(mac1_seed).digest()[:16]
         packet = cookie_reply(address, index, nonce, cookie_value, mac1)
-        assert len(packet) == 62
+        assert len(packet) == 66
         replies.append({"address": address.hex(), "initiator_index": index, "nonce": nonce.hex(),
                         "cookie": cookie_value.hex(), "mac1": mac1.hex(), "packet": packet.hex()})
 

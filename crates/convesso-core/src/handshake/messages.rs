@@ -1,22 +1,22 @@
 //! Version 1's handshake messages, byte for byte (`PROTOCOL.md §3`).
 //!
 //! ```text
-//! first contact, 134 bytes:
-//!   0x01 | 0x01 | initiator index (4, LE) | e (32) | s, encrypted (48)
+//! first contact, 138 bytes:
+//!   0x01 | 0x01 | initiator index (8, LE) | e (32) | s, encrypted (48)
 //!        | empty payload, encrypted (16) | mac1 (16) | mac2 (16)
-//! response, 61 bytes:
-//!   0x01 | 0x02 | responder index (4, LE) | initiator index (4, LE) | e (32)
+//! response, 69 bytes:
+//!   0x01 | 0x02 | responder index (8, LE) | initiator index (8, LE) | e (32)
 //!        | decision, encrypted (3 + 16)
-//! decision: 00 00 00 accept | 01 code-lo code-hi refuse
-//! first contact with a payload, 134 + n bytes, 1 <= n <= 1200:
-//!   0x01 | 0x05 | initiator index (4, LE) | e (32) | s, encrypted (48)
+//! decision: 00 00 00 accept | 02 00 00 accept as new | 01 code-lo code-hi refuse
+//! first contact with a payload, 138 + n bytes, 1 <= n <= 1200:
+//!   0x01 | 0x05 | initiator index (8, LE) | e (32) | s, encrypted (48)
 //!        | payload, encrypted (n + 16) | mac1 (16) | mac2 (16)
 //! ```
 //!
 //! Decoders check lengths and header bytes only; authentication is the Noise
 //! layer's. None panics or allocates on any input.
 
-use super::{FIRST_CONTACT_LEN, MAX_PAYLOAD, RESPONSE_LEN, RefusalCode};
+use super::{FIRST_CONTACT_LEN, INDEX_LEN, Index, MAX_PAYLOAD, RESPONSE_LEN, RefusalCode};
 use crate::wire::{MAC_LEN, Mac1Key};
 
 /// Byte 1 of a first contact.
@@ -26,7 +26,7 @@ pub const TYPE_RESPONSE: u8 = 0x02;
 /// Byte 1 of a first contact with a payload.
 pub const TYPE_INITIATION_PAYLOAD: u8 = 0x05;
 /// Byte 1 of a first contact that renews keys the initiator still holds: the
-/// 134 bytes of [`TYPE_INITIATION`], with no payload.
+/// 138 bytes of [`TYPE_INITIATION`], with no payload.
 pub const TYPE_RENEWAL: u8 = 0x06;
 
 /// Whether byte 1 of a version 1 packet names a first contact: an opening,
@@ -47,8 +47,8 @@ pub const RESPONSE_NOISE_LEN: usize = 32 + DECISION_LEN + 16;
 pub const DECISION_LEN: usize = 3;
 
 const VERSION: u8 = 0x01;
-const INITIATION_NOISE_AT: usize = 6;
-const RESPONSE_NOISE_AT: usize = 10;
+const INITIATION_NOISE_AT: usize = 2 + INDEX_LEN;
+const RESPONSE_NOISE_AT: usize = 2 + 2 * INDEX_LEN;
 
 /// Why bytes are not a version 1 handshake message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,7 @@ pub struct FirstContact<'a> {
     /// than open a session ([`TYPE_INITIATION`]).
     pub renewal: bool,
     /// The initiator's index.
-    pub initiator_index: u32,
+    pub initiator_index: Index,
     /// `e`, `s` encrypted and the empty payload encrypted.
     pub noise: &'a [u8; INITIATION_NOISE_LEN],
 }
@@ -107,7 +107,7 @@ pub struct FirstContact<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadFirstContact<'a> {
     /// The initiator's index.
-    pub initiator_index: u32,
+    pub initiator_index: Index,
     /// `e`, `s` encrypted and the payload encrypted: `INITIATION_NOISE_LEN + n`
     /// bytes, for a payload of `n`.
     pub noise: &'a [u8],
@@ -125,9 +125,9 @@ impl PayloadFirstContact<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Response<'a> {
     /// The responder's index.
-    pub responder_index: u32,
+    pub responder_index: Index,
     /// The initiator's index it answers.
-    pub initiator_index: u32,
+    pub initiator_index: Index,
     /// `e` and the decision encrypted.
     pub noise: &'a [u8; RESPONSE_NOISE_LEN],
 }
@@ -149,11 +149,12 @@ fn check(packet: &[u8], kind: u8, expected: usize) -> Result<(), MessageError> {
     }
 }
 
-fn u32_at(packet: &[u8], at: usize) -> Option<u32> {
+/// The index at `at`, little-endian.
+pub(crate) fn index_at(packet: &[u8], at: usize) -> Option<Index> {
     packet
-        .get(at..at + 4)
+        .get(at..at + INDEX_LEN)
         .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
+        .map(Index::from_le_bytes)
 }
 
 /// Reads a first contact's header.
@@ -178,7 +179,7 @@ pub fn parse_first_contact(packet: &[u8]) -> Result<FirstContact<'_>, MessageErr
     };
     Ok(FirstContact {
         renewal,
-        initiator_index: u32_at(packet, 2).ok_or(length)?,
+        initiator_index: index_at(packet, 2).ok_or(length)?,
         noise: packet
             .get(INITIATION_NOISE_AT..INITIATION_NOISE_AT + INITIATION_NOISE_LEN)
             .and_then(|n| n.try_into().ok())
@@ -187,7 +188,7 @@ pub fn parse_first_contact(packet: &[u8]) -> Result<FirstContact<'_>, MessageErr
 }
 
 /// Reads the header of a first contact with a payload, checking its length,
-/// `135 ..= 1334` bytes, before anything else.
+/// `139 ..= 1338` bytes, before anything else.
 ///
 /// # Errors
 ///
@@ -213,7 +214,7 @@ pub fn parse_payload_first_contact(packet: &[u8]) -> Result<PayloadFirstContact<
     };
     let noise_end = packet.len() - 2 * MAC_LEN;
     Ok(PayloadFirstContact {
-        initiator_index: u32_at(packet, 2).ok_or(length)?,
+        initiator_index: index_at(packet, 2).ok_or(length)?,
         noise: packet.get(INITIATION_NOISE_AT..noise_end).ok_or(length)?,
     })
 }
@@ -230,8 +231,8 @@ pub fn parse_response(packet: &[u8]) -> Result<Response<'_>, MessageError> {
         actual: packet.len(),
     };
     Ok(Response {
-        responder_index: u32_at(packet, 2).ok_or(length)?,
-        initiator_index: u32_at(packet, 6).ok_or(length)?,
+        responder_index: index_at(packet, 2).ok_or(length)?,
+        initiator_index: index_at(packet, 2 + INDEX_LEN).ok_or(length)?,
         noise: packet
             .get(RESPONSE_NOISE_AT..RESPONSE_NOISE_AT + RESPONSE_NOISE_LEN)
             .and_then(|n| n.try_into().ok())
@@ -279,7 +280,7 @@ pub fn encode_decision(decision: WireDecision) -> [u8; DECISION_LEN] {
 /// [`MAX_PAYLOAD`], or a renewal given one.
 pub(crate) fn write_first_contact_into(
     out: &mut [u8],
-    initiator_index: u32,
+    initiator_index: Index,
     noise: &[u8],
     renewal: bool,
     key: &Mac1Key,
@@ -317,15 +318,15 @@ pub(crate) fn write_first_contact_into(
 
 /// Writes a response: header and Noise part.
 pub(crate) fn write_response(
-    responder_index: u32,
-    initiator_index: u32,
+    responder_index: Index,
+    initiator_index: Index,
     noise: &[u8; RESPONSE_NOISE_LEN],
 ) -> [u8; RESPONSE_LEN] {
     let mut packet = [0u8; RESPONSE_LEN];
     packet[0] = VERSION;
     packet[1] = TYPE_RESPONSE;
-    packet[2..6].copy_from_slice(&responder_index.to_le_bytes());
-    packet[6..10].copy_from_slice(&initiator_index.to_le_bytes());
+    packet[2..2 + INDEX_LEN].copy_from_slice(&responder_index.to_le_bytes());
+    packet[2 + INDEX_LEN..RESPONSE_NOISE_AT].copy_from_slice(&initiator_index.to_le_bytes());
     packet[RESPONSE_NOISE_AT..].copy_from_slice(noise);
     packet
 }

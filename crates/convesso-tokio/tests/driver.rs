@@ -889,3 +889,13 @@ async fn early_data_arrives_before_the_connection() {
     .await;
     assert_eq!(data, b"then".to_vec());
 }
+
+/// Scenario: holding a peer with no session is refused with the core's error.
+#[tokio::test]
+async fn holding_a_peer_with_no_session_is_refused() {
+    let (_node, _events, app, _app_events) = node(36, None, 16).await;
+    assert_eq!(
+        app.hold(identity(37).peer_id(), true).await,
+        Err(NodeError::NoSession)
+    );
+}
