@@ -61,12 +61,12 @@ fuzz_target!(|data: &[u8]| {
     // Graft the attempt's index into the fuzzed bytes half the time, so that
     // the fuzzer reaches the Noise layer behind the index lookup.
     let mut packet = data.to_vec();
-    if packet.len() == 61 && packet[0] == 0x01 && packet[1] == 0x02 && packet[2] & 1 == 1 {
-        packet[6..10].copy_from_slice(&out[2..6]);
+    if packet.len() == 69 && packet[0] == 0x01 && packet[1] == 0x02 && packet[2] & 1 == 1 {
+        packet[10..18].copy_from_slice(&out[2..10]);
     }
-    // The same for cookie replies, whose index is at bytes 2..6.
-    if packet.len() == 62 && packet[0] == 0x01 && packet[1] == 0x03 && packet[6] & 1 == 1 {
-        packet[2..6].copy_from_slice(&out[2..6]);
+    // The same for cookie replies, whose index is at bytes 2..10.
+    if packet.len() == 66 && packet[0] == 0x01 && packet[1] == 0x03 && packet[10] & 1 == 1 {
+        packet[2..10].copy_from_slice(&out[2..10]);
     }
     let _ = first;
     match dial.handle(&identity, &packet, Instant::from_millis(1)) {

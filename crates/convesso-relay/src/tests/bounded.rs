@@ -96,10 +96,10 @@ fn a_board_serves_more_peers_than_its_slots() {
     );
 }
 
-/// When every session of a full board is busy, a newcomer is refused by
-/// name, and nothing the board holds is closed.
+/// When every session of a full board is held by its application, a
+/// newcomer is refused by name, and nothing the board holds is closed.
 #[test]
-fn a_busy_board_refuses_by_name() {
+fn a_held_board_refuses_by_name() {
     let mut world = World::new(Open, Config::default(), 5);
     world.open_link(0);
     for peer in 1..5 {
@@ -113,13 +113,35 @@ fn a_busy_board_refuses_by_name() {
             world.run_for(1000);
         }
     }
+    for peer in 1..4 {
+        let id = world.clients[peer].peer_id();
+        world.clients[0].endpoint.hold(id, SESSION, true).unwrap();
+    }
     world.send(4, 0, b"no room").unwrap();
     world.run_for(20_000);
     assert!(!got(&world, 0, 4, b"no room"));
-    assert_eq!(evictions(&world, 0), 0, "busy sessions are never evicted");
+    assert_eq!(evictions(&world, 0), 0, "held sessions are never evicted");
     let board = world.clients[0].peer_id();
     assert!(
         world.clients[4].events.contains(&Ev::ReopenFailed(board)),
         "the newcomer's dial ends, refused"
     );
+}
+
+/// Scenario: a board dials two peers at once while its relay session has
+/// keys: the dial kept for the relay is kept only while the relay needs one.
+#[test]
+fn a_board_dials_two_peers_at_once_while_its_relay_session_has_keys() {
+    let mut world = World::new(Open, Config::default(), 3);
+    world.open_link(0);
+    world.hint(0, 1);
+    world.hint(0, 2);
+    world.run_for(2000);
+    world.connect(0, 1).unwrap();
+    world.connect(0, 2).unwrap();
+    world.run_for(2000);
+    for peer in [1, 2] {
+        let id = world.clients[peer].peer_id();
+        assert!(world.clients[0].events.contains(&Ev::Connected(id)));
+    }
 }

@@ -26,8 +26,8 @@ use blake2::{Blake2s256, Blake2sMac};
 use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
 
-use crate::handshake::Entropy;
 use crate::handshake::messages::MessageError;
+use crate::handshake::{Entropy, INDEX_LEN, Index};
 use crate::identity::PeerId;
 use crate::storage::Table;
 use crate::time::Instant;
@@ -40,7 +40,11 @@ pub type Cookie = [u8; COOKIE_LEN];
 pub const COOKIE_LEN: usize = 16;
 
 /// Length of version 1's cookie reply.
-pub const COOKIE_REPLY_LEN: usize = 62;
+pub const COOKIE_REPLY_LEN: usize = NONCE_AT + NONCE_LEN + COOKIE_LEN + 16;
+
+/// Where a cookie reply's nonce starts: after the version, the type and the
+/// index.
+const NONCE_AT: usize = 2 + INDEX_LEN;
 
 /// Byte 1 of a cookie reply.
 pub const TYPE_COOKIE_REPLY: u8 = 0x03;
@@ -267,7 +271,7 @@ fn cookie_key(address: &[u8; 32]) -> Key {
 #[must_use]
 pub fn write_cookie_reply(
     address: &[u8; 32],
-    initiator_index: u32,
+    initiator_index: Index,
     nonce: &[u8; NONCE_LEN],
     cookie: &Cookie,
     mac1: &Mac,
@@ -277,10 +281,12 @@ pub fn write_cookie_reply(
         .encrypt_inout_detached(&XNonce::from(*nonce), mac1, sealed.as_mut_slice().into())
         .ok()?;
     let mut packet = [0u8; COOKIE_REPLY_LEN];
-    let (header, rest) = packet.split_at_mut(6);
-    header.copy_from_slice(&[0x01, TYPE_COOKIE_REPLY, 0, 0, 0, 0]);
+    let (header, rest) = packet.split_at_mut(NONCE_AT);
     header
-        .get_mut(2..6)?
+        .get_mut(..2)?
+        .copy_from_slice(&[0x01, TYPE_COOKIE_REPLY]);
+    header
+        .get_mut(2..NONCE_AT)?
         .copy_from_slice(&initiator_index.to_le_bytes());
     let (nonce_field, rest) = rest.split_at_mut(NONCE_LEN);
     nonce_field.copy_from_slice(nonce);
@@ -294,7 +300,7 @@ pub fn write_cookie_reply(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CookieReply<'a> {
     /// The initiator's index it answers.
-    pub initiator_index: u32,
+    pub initiator_index: Index,
     /// The nonce.
     pub nonce: &'a [u8; NONCE_LEN],
     /// The cookie, encrypted, and its tag.
@@ -323,17 +329,13 @@ pub fn parse_cookie_reply(packet: &[u8]) -> Result<CookieReply<'_>, MessageError
         actual: packet.len(),
     };
     Ok(CookieReply {
-        initiator_index: packet
-            .get(2..6)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_le_bytes)
-            .ok_or(length)?,
+        initiator_index: crate::handshake::messages::index_at(packet, 2).ok_or(length)?,
         nonce: packet
-            .get(6..30)
+            .get(NONCE_AT..NONCE_AT + NONCE_LEN)
             .and_then(|b| b.try_into().ok())
             .ok_or(length)?,
         sealed: packet
-            .get(30..62)
+            .get(NONCE_AT + NONCE_LEN..COOKIE_REPLY_LEN)
             .and_then(|b| b.try_into().ok())
             .ok_or(length)?,
     })

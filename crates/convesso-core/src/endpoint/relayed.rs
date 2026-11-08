@@ -43,7 +43,7 @@ use super::{
 };
 use crate::dos::SourceKey;
 use crate::handshake::messages::is_first_contact_type;
-use crate::handshake::{Access, Decision, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
+use crate::handshake::{Access, Decision, Index, MAX_FIRST_CONTACT_LEN, Psk, ResponderError};
 use crate::relay::{self, Frame, Link, MAX_CARRIED, ROUTED_HEADER_LEN, frame_type};
 use crate::storage::{Config, Maybe, Table};
 use crate::transport::{self, DATA_AT, OVERHEAD, TAG_LEN, inner};
@@ -625,19 +625,19 @@ fn offset(base: usize, data: &[u8]) -> usize {
 /// The dial whose attempt the relay frame `frame` forwards: a forward to a
 /// peer, carrying a version 1 first contact whose index `dial_of` gives to
 /// that peer's dial. The frames are the endpoint's own.
-fn attempt_of(dial_of: impl Fn(u32) -> Option<Key>, frame: &[u8]) -> Option<Key> {
+fn attempt_of(dial_of: impl Fn(Index) -> Option<Key>, frame: &[u8]) -> Option<Key> {
     let [frame_type::FORWARD, relay::KIND_PEER_ID, rest @ ..] = frame else {
         return None;
     };
     let (peer, packet) = rest.split_at_checked(ROUTED_HEADER_LEN - 2)?;
     // Version 1, a first contact, then the initiator's index.
-    let [0x01, kind, a, b, c, d, ..] = *packet else {
+    let [0x01, kind, ..] = *packet else {
         return None;
     };
     if !is_first_contact_type(kind) {
         return None;
     }
-    dial_of(u32::from_le_bytes([a, b, c, d]))
+    dial_of(crate::handshake::messages::index_at(packet, 2)?)
         .filter(|(owner, _)| owner.as_bytes().as_slice() == peer)
 }
 

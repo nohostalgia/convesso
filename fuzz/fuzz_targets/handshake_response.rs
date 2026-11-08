@@ -1,4 +1,4 @@
-//! Parsing a version 1 response: never panics, and accepts exactly the 61-byte
+//! Parsing a version 1 response: never panics, and accepts exactly the 69-byte
 //! packets with the right header.
 
 #![no_main]

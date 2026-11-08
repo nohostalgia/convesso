@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! 0x06 data   incarnation (8) | sequence (4, LE) | flags (1: FIRST, LAST, START)
-//!             | [message length (4, LE), with FIRST] | 1 to 1,332 bytes
+//!             | [message length (4, LE), with FIRST] | 1 to 1,328 bytes
 //! 0x07 ack    incarnation (8) | flags (1: RESET) | cumulative (4, LE) | window (4, LE)
 //!             | maximum message (4, LE) | count (1, 0 to 4) | count x (start (4), end (4))
 //! ```
@@ -17,9 +17,10 @@ pub const INCARNATION_LEN: usize = 8;
 /// A channel's incarnation: 8 random bytes chosen when the channel starts.
 pub type Incarnation = [u8; INCARNATION_LEN];
 
-/// The most bytes a data frame carries: so that a FIRST frame's packet is
-/// 1,380 bytes, the longest the relay carries.
-pub const MAX_FRAGMENT: usize = 1332;
+/// The most bytes a data frame carries: 1,328, so that a FIRST frame's packet
+/// is 1,380 bytes, the longest the relay carries.
+pub const MAX_FRAGMENT: usize =
+    convesso_core::relay::MAX_CARRIED - convesso_core::transport::OVERHEAD - DATA_HEADER_LEN - 4;
 
 /// The most ranges of selective acknowledgement in one acknowledgement.
 pub const MAX_RANGES: usize = 4;

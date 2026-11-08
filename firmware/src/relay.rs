@@ -154,11 +154,11 @@ fn run() -> Option<()> {
     let mut carried = [0u8; 1500];
 
     // The wake: the client dials the peer, and the core sends it through the
-    // relay, in one datagram of 302 bytes: the relay's first contact carrying
+    // relay, in one datagram of 310 bytes: the relay's first contact carrying
     // the forward.
     let Ok(Output::Transmit {
         to: To::Relay(_),
-        len: 302,
+        len: 310,
     }) = client.connect(
         &peer_address,
         b"session",
@@ -170,8 +170,8 @@ fn run() -> Option<()> {
     else {
         return None;
     };
-    wire.get_mut(..302)?.copy_from_slice(out.get(..302)?);
-    let first = relay_receives(relay_ep, wire.get_mut(..302)?, now, &mut er, &mut carried)?;
+    wire.get_mut(..310)?.copy_from_slice(out.get(..310)?);
+    let first = relay_receives(relay_ep, wire.get_mut(..310)?, now, &mut er, &mut carried)?;
     // The relay's response, then the client's confirmation.
     let Poll::Transmit { len, .. } = relay_ep.poll(now, &mut AcceptAll, &mut er, &mut wire) else {
         return None;

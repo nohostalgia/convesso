@@ -82,18 +82,25 @@ both sides must use:
 
 The pre-shared key is the one the application holds for the peer, or 32 zero bytes.
 
-**The first contact** is exactly 134 bytes:
+**The first contact** is exactly 138 bytes:
 
 | Offset | Length | Content |
 |---|---|---|
 | 0 | 1 | `0x01`, the version |
 | 1 | 1 | `0x01`, an opening; `0x06`, a renewal |
-| 2 | 4 | the initiator's index |
-| 6 | 32 | the initiator's ephemeral public key |
-| 38 | 48 | the initiator's static public key, encrypted |
-| 86 | 16 | the tag of the empty payload |
-| 102 | 16 | `mac1` (§1) |
-| 118 | 16 | `mac2` (§4), or zeros |
+| 2 | 8 | the initiator's index |
+| 10 | 32 | the initiator's ephemeral public key |
+| 42 | 48 | the initiator's static public key, encrypted |
+| 90 | 16 | the tag of the empty payload |
+| 106 | 16 | `mac1` (§1) |
+| 122 | 16 | `mac2` (§4), or zeros |
+
+**Indices.** An index is 8 bytes, little-endian, chosen by the side that receives under it; its
+peer only echoes it. Each side makes its indices so that it recognises them later, after a restart
+too, without keeping anything: 4 random bytes, then the first 4 bytes of keyed BLAKE2s-256 of them
+under a key derived once from its own X25519 scalar, as keyed BLAKE2s-256 of the 14 bytes
+`convesso-index` under the scalar. That label never travels, and the tag tells nothing of the
+identity or of other sessions. A random index passes as one's own once in 2^32 (§5).
 
 **Opening or renewal.** The initiator says which: a renewal (`0x06`) renews keys it still holds
 for the peer in the context, and every other first contact opens a session. A renewal never
@@ -101,7 +108,7 @@ carries a payload. The type byte is outside the Noise message, and `mac1` covers
 
 **A first contact may carry a payload** of 1 to 1,200 bytes, where the context allows it. Its type
 byte is `0x05`, and the payload with its tag takes the place of the empty payload's tag, so the
-packet is `134 + n` bytes. Such a payload is authenticated, but it can be replayed, and it loses
+packet is `138 + n` bytes. Such a payload is authenticated, but it can be replayed, and it loses
 its secrecy if the responder's key is ever stolen; the application is told it is *unconfirmed*. The
 relay uses it to deliver a first packet in one datagram (§6).
 
@@ -112,16 +119,16 @@ ephemeral key. Once the dial completes, that datagram counts as sent. The respon
 as an early datagram, before the connection: it can arrive once for each attempt admitted, and
 again on a replay. A context not declared drops a first contact with a payload in silence.
 
-**The response** is exactly 61 bytes:
+**The response** is exactly 69 bytes:
 
 | Offset | Length | Content |
 |---|---|---|
 | 0 | 1 | `0x01`, the version |
 | 1 | 1 | `0x02`, response |
-| 2 | 4 | the responder's index |
-| 6 | 4 | the initiator's index |
-| 10 | 32 | the responder's ephemeral public key |
-| 42 | 19 | the decision, encrypted: 3 bytes and a tag |
+| 2 | 8 | the responder's index |
+| 10 | 8 | the initiator's index |
+| 18 | 32 | the responder's ephemeral public key |
+| 50 | 19 | the decision, encrypted: 3 bytes and a tag |
 
 The decision is `00 00 00` to accept, or `01` and a 2-byte refusal code. To a renewal, a responder
 that holds no live keys for that peer in that context answers `02 00 00`: accepted, as opening a
@@ -174,15 +181,15 @@ senders prove they can receive at the address they claim.
 - Under load, a first contact with a valid `mac2` proceeds, at no more than 20 a second per
   source. One without it is answered with a cookie reply, and costs no Diffie-Hellman.
 
-**The cookie reply** is exactly 62 bytes, never more than the packet it answers:
+**The cookie reply** is exactly 66 bytes, never more than the packet it answers:
 
 | Offset | Length | Content |
 |---|---|---|
 | 0 | 1 | `0x01`, the version |
 | 1 | 1 | `0x03`, cookie reply |
-| 2 | 4 | the initiator's index |
-| 6 | 24 | a random nonce |
-| 30 | 32 | the cookie, encrypted, and its tag |
+| 2 | 8 | the initiator's index |
+| 10 | 24 | a random nonce |
+| 34 | 32 | the cookie, encrypted, and its tag |
 
 The cookie is encrypted with XChaCha20-Poly1305 under
 `key = BLAKE2s-256("convesso-cookie" || A)`, with the first contact's `mac1` as associated data.
@@ -203,12 +210,12 @@ Vectors: `dos-v1.json`.
 |---|---|---|
 | 0 | 1 | `0x01`, the version |
 | 1 | 1 | `0x04`, transport |
-| 2 | 4 | the receiver's index for the session |
-| 6 | 8 | the counter |
-| 14 | `1 + n + 16` | ChaCha20-Poly1305 of the inner type and `n` bytes of data, and its tag |
+| 2 | 8 | the receiver's index for the session |
+| 10 | 8 | the counter |
+| 18 | `1 + n + 16` | ChaCha20-Poly1305 of the inner type and `n` bytes of data, and its tag |
 
-The key is the sender's, from the handshake. The nonce is 4 zero bytes and the counter. The 14
-header bytes are the associated data. There is no padding: a packet is 31 bytes longer than its
+The key is the sender's, from the handshake. The nonce is 4 zero bytes and the counter. The 18
+header bytes are the associated data. There is no padding: a packet is 35 bytes longer than its
 data.
 
 **The inner type** is the first decrypted byte:
@@ -223,6 +230,7 @@ data.
 | `0x05` | a probe's answer (§7) |
 | `0x06` | stream data (§8) |
 | `0x07` | a stream acknowledgement (§8) |
+| `0x08` | the sender's 32-byte address |
 
 Other values are reserved: such a packet is counted against replay, and its content ignored.
 
@@ -230,11 +238,33 @@ Other values are reserved: such a packet is counted against replay, and its cont
 - **Each packet is accepted once.** A receiver keeps the highest counter seen and a window below
   it (256 counters on a microcontroller, 8,192 on a server). A packet that is older, or already
   seen, is dropped.
-- **Confirmation.** The responder starts using a handshake's keys when the initiator's first
-  packet opens under them. An initiator with nothing to send confirms with a keepalive.
-- **Renewal, only while sending.** Sending under keys older than 120 seconds starts a new
-  handshake. Receiving never does. Keys are deleted 180 seconds after their handshake, or after
-  2^60 packets.
+- **Confirmation, and the initiator's address.** The responder starts using a handshake's keys
+  when the initiator's first packet opens under them. After every handshake it completes, the
+  initiator sends its own address (inner type `0x08`) at once, before anything queued: it
+  confirms the handshake, and tells a responder that knows it only by peer id the address it
+  needs to renew and to reopen (§1, `mac1`). A responder keeps it only when it is the address of
+  the identity the handshake authenticated. It costs 32 bytes a handshake, and nothing at rest.
+- **Renewal, only while sending.** Sending under keys older than 120 seconds, when this side
+  initiated their handshake, or 150 seconds, when it answered it, starts a new handshake: the
+  initiator renews first while it sends, so the two never renew across each other and drop keys
+  with packets in flight. Receiving never does. Keys are deleted 180 seconds after their
+  handshake, or after 2^60 packets.
+- **Unknown index.** A transport packet whose index this side issued (§3) but that no live keys
+  and no pending handshake hold, after a restart, an eviction or an expiry, is answered with:
+
+  | Offset | Length | Content |
+  |---|---|---|
+  | 0 | 1 | `0x01`, the version |
+  | 1 | 1 | `0x07`, unknown index |
+  | 2 | 8 | the index of the packet answered |
+
+  at most 20 a second on a microcontroller, 1,000 on a server. An index it did not issue, a packet
+  that live keys hold but that does not open, and a signal itself get nothing: a stranger hears
+  nothing, and the 10 bytes are fewer than any packet they answer. A side told that the index of
+  its current, live keys is unknown renews at once, if it knows the peer's address and is not
+  dialling it; the signal changes no key by itself, so a forged one costs one renewal and nothing
+  else. A renewal it started that is refused drops the session's keys, and the application is told
+  of the refusal, without an idle. Vectors: `transport-v1.json`.
 - **Two key pairs.** A session sends with its current keys, and still receives with the previous
   ones, so packets in flight across a renewal are not lost.
 - **Dormancy.** A session with no keys left sends nothing and waits for nothing. The application
@@ -262,12 +292,18 @@ Other values are reserved: such a packet is counted against replay, and its cont
   dropping its handle (`DESIGN.md §10`). `0x0002` (`02 00`) closes a session to make room for
   another.
 - **Room.** An endpoint with a bounded session table that needs a slot for a new session closes
-  the session least recently active among those silent both ways for 30 seconds, never the
-  pinned relay's, nor one dialling, with queued datagrams or closing, with code `0x0002`. When none
-  can be closed, it refuses the first contact with `0x0001`, rather than accept a handshake whose
-  session it could not keep; and a confirmation that finds no room after all is answered with a
-  close `0x0002`, under the keys it confirms. The pinned relay's session, a dial and a pending
-  handshake in the relay context are kept from the peers (§6).
+  the session least recently active, whatever its age, never the pinned relay's, one the
+  application holds, nor one dialling, with queued datagrams or closing, with code `0x0002`. A
+  peer whose close is lost learns of it from its next packet, answered with the unknown index.
+  Several sessions may be closed between two polls, up to a bound (4 on a microcontroller); their
+  closes and events follow in order. When none can be closed, it refuses the first contact with
+  `0x0001`, rather than accept a handshake whose session it could not keep; and a confirmation
+  that finds no room after all is answered with a close `0x0002`, under the keys it confirms. The
+  pinned relay's session, a pending handshake in the relay context and, while the relay session
+  has no live keys, a dial are kept from the peers (§6).
+- **Holding a session.** The application may hold a session, for its life: it is never closed to
+  make room. It still goes dormant when its keys expire, and is forgotten then with its hold. A
+  hold sends nothing.
 - **A datagram too large for the path is refused,** never truncated.
 - **The channel binding** of a session is that of the handshake that opened it, kept across
   renewals. It is forgotten, with what the session knew of its paths, when the session is told
@@ -426,7 +462,7 @@ order, or the channel is reset.
 | 4 | the fragment's sequence number |
 | 1 | flags: bit 0 FIRST fragment of a message, bit 1 LAST, bit 2 START (no acknowledgement received yet in this incarnation) |
 | 4 | the message's length, only with FIRST |
-| 1 to 1,332 | the fragment |
+| 1 to 1,328 | the fragment |
 
 **Stream acknowledgement** (`0x07`):
 

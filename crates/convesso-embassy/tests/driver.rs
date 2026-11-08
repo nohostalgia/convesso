@@ -592,7 +592,9 @@ async fn two_nodes_agree_on_the_binding() {
 }
 
 /// Scenarios: a device reset in the middle of a session is reached again,
-/// and nothing of a session from before the reset is accepted after it.
+/// and nothing of a session from before the reset is accepted after it: a
+/// packet of the old session is answered only with its unknown index
+/// (`PROTOCOL.md §5`), and delivers nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_device_reset_mid_session_is_reached_again() {
     local(async {
@@ -626,14 +628,8 @@ async fn a_device_reset_mid_session_is_reached_again() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (device, mut device_events, _) =
             node_with(&net, 2, 7500, &relay, 8192, MemInterfaces::new(&device_ips)).await;
-        let sent = net.sent(|from, _| from == device_at);
         net.inject(relay.udp[0], device_at, &captured);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            net.sent(|from, _| from == device_at),
-            sent,
-            "nothing in response to a packet of the old session"
-        );
 
         // The device sends first: a fresh session, and the datagrams arrive.
         device.send(&a_address, b"after").await.unwrap();
@@ -641,6 +637,8 @@ async fn a_device_reset_mid_session_is_reached_again() {
         a.send_to_peer(device.address().await.peer_id(), b"welcome back")
             .await
             .unwrap();
+        // The first datagram the device is handed: nothing of the old
+        // session came before it.
         assert_eq!(
             datagram(&mut device_events, 5).await,
             (b"welcome back".to_vec(), true)
@@ -786,6 +784,10 @@ async fn the_controls_return_the_cores_errors() {
                 .await,
             Err(NodeError::NoSession)
         );
+        assert_eq!(
+            a.app.hold(support::identity(3).peer_id(), true).await,
+            Err(NodeError::NoSession)
+        );
         assert_eq!(a.node.relay().await, Some(location(&relay)));
     })
     .await;
@@ -903,4 +905,56 @@ async fn a_boot_node_holds_what_it_was_given_and_a_fixed_one_ignores_it() {
         contexts_opened::<Mcu>(2, 7601, one, &[b"first", b"second"]).await,
         [true, true]
     );
+}
+
+/// Scenario: a held session survives a full board: a reachable embedded node,
+/// four sessions with the relay's, holds the session of a peer it keeps
+/// connected; three more peers fill its table and overflow it, and the held
+/// session is never closed to make room.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_session_survives_a_full_board() {
+    local(async {
+        let (net, relay) = world();
+        let (board, mut board_events) = node(&net, 1, &[ip("10.0.0.1")], 7500, &relay, 8192).await;
+        board.set_reachable(true).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut peers = Vec::new();
+        for (i, key) in [2usize, 3, 4, 5].into_iter().enumerate() {
+            let at = format!("10.0.{}.1", i + 1);
+            let (peer, _events) = node(&net, key, &[ip(&at)], 7500, &relay, 8192).await;
+            peers.push(peer);
+        }
+        let to = board.address().await;
+        let kept = peers[0].address().await.peer_id();
+        peers[0].send(&to, b"kept").await.unwrap();
+        assert_eq!(datagram(&mut board_events, 5).await.0, b"kept".to_vec());
+        board.app.hold(kept, true).await.unwrap();
+        for peer in &peers[1..] {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            peer.send(&to, b"more").await.unwrap();
+            assert_eq!(datagram(&mut board_events, 5).await.0, b"more".to_vec());
+        }
+        let mut closed = Vec::new();
+        let _ = timeout(Duration::from_millis(500), async {
+            let mut buf = [0u8; 1500];
+            loop {
+                if let Some(ContextEvent::Closed { peer, code, .. }) =
+                    board_events.next(&mut buf).await
+                {
+                    closed.push((peer, code));
+                }
+            }
+        })
+        .await;
+        assert!(
+            !closed.iter().any(|(peer, _)| *peer == kept),
+            "the held session is never closed: {closed:?}"
+        );
+        let first_unheld = peers[1].address().await.peer_id();
+        assert!(
+            closed.contains(&(first_unheld, convesso_core::endpoint::CLOSE_TO_MAKE_ROOM)),
+            "another took its place: {closed:?}"
+        );
+    })
+    .await;
 }

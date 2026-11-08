@@ -96,7 +96,7 @@ pub fn run() -> bool {
     ) else {
         return false;
     };
-    let mut response = [0u8; 64];
+    let mut response = [0u8; convesso_core::handshake::MAX_RESPONDER_OUTPUT];
     let ResponderOutput::Send(response_len) = responder.handle(
         black_box(&first[..len]),
         Source::Direct(black_box(&[192, 0, 2, 1, 0xCA, 0x6C])),
@@ -153,7 +153,7 @@ pub fn under_load() -> bool {
         ) else {
             return false;
         };
-        let mut answer = [0u8; 64];
+        let mut answer = [0u8; convesso_core::handshake::MAX_RESPONDER_OUTPUT];
         let ResponderOutput::Send(answer_len) = responder.handle(
             black_box(&first[..len]),
             source,
@@ -164,7 +164,11 @@ pub fn under_load() -> bool {
         ) else {
             return false;
         };
-        let expected = if attempt < 5 { 61 } else { 62 };
+        let expected = if attempt < 5 {
+            convesso_core::handshake::RESPONSE_LEN
+        } else {
+            convesso_core::dos::COOKIE_REPLY_LEN
+        };
         if answer_len != expected {
             return false;
         }

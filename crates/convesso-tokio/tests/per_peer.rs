@@ -766,7 +766,9 @@ async fn stopped_reader(window: Duration, keepalives: bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_event_stream_stops_nothing() {
     let relay = relay().await;
-    let (r, mut r_events) = node(16, Some(&relay), 4, Delivery::Events).await;
+    // Room for five events: the connection, which the initiator's address
+    // brings, and four datagrams.
+    let (r, mut r_events) = node(16, Some(&relay), 5, Delivery::Events).await;
     let (s, mut s_events) = node(17, Some(&relay), 64, Delivery::Events).await;
     reachable(&r).await;
     reachable(&s).await;

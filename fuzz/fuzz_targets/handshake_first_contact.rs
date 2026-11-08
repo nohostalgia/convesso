@@ -1,5 +1,5 @@
 //! Parsing a version 1 first contact: never panics, accepts exactly the
-//! 134-byte packets with the right header (an opening, `0x01`, or a renewal,
+//! 138-byte packets with the right header (an opening, `0x01`, or a renewal,
 //! `0x06`), and says which.
 
 #![no_main]

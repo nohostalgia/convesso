@@ -95,7 +95,7 @@ fn cookie_replies_match_the_vectors() {
         let nonce: [u8; 24] = hex(&vector["nonce"]).try_into().unwrap();
         let cookie_value: Cookie = hex(&vector["cookie"]).try_into().unwrap();
         let mac1: Mac = hex(&vector["mac1"]).try_into().unwrap();
-        let index = u32::try_from(vector["initiator_index"].as_u64().unwrap()).unwrap();
+        let index = vector["initiator_index"].as_u64().unwrap();
         let packet = write_cookie_reply(&address, index, &nonce, &cookie_value, &mac1).unwrap();
         assert_eq!(packet.as_slice(), hex(&vector["packet"]).as_slice());
 
@@ -137,9 +137,9 @@ fn a_cookie_is_bound_to_its_source() {
             assert_ne!(a, b);
         }
     }
-    let packet = [0x5a; 134];
+    let packet = [0x5a; 138];
     let mut with_mac2 = packet;
-    with_mac2[118..].copy_from_slice(&mac2(&cookies[0], &packet[..118]));
+    with_mac2[122..].copy_from_slice(&mac2(&cookies[0], &packet[..122]));
     assert!(verify_mac2(&cookies[0], &with_mac2));
     assert!(!verify_mac2(&cookies[1], &with_mac2));
 
@@ -159,18 +159,18 @@ fn the_secret_rotates_after_120_seconds() {
 
     let source = Source::Direct(&[1, 2, 3]).key().unwrap();
     let old_cookie = cookie(&first, &source);
-    let mut packet = [0x11; 134];
-    packet[118..].copy_from_slice(&mac2(&old_cookie, &[0x11; 118]));
+    let mut packet = [0x11; 138];
+    packet[122..].copy_from_slice(&mac2(&old_cookie, &[0x11; 122]));
     assert!(verify_mac2(&cookie(&first, &source), &packet));
     assert!(!verify_mac2(&cookie(&second, &source), &packet));
 }
 
 /// Scenario: a cookie reply of any other length or type is not acted on.
 #[test]
-fn only_62_byte_cookie_replies_parse() {
+fn only_66_byte_cookie_replies_parse() {
     let packet = write_cookie_reply(&[1; 32], 9, &[2; 24], &[3; 16], &[4; 16]).unwrap();
     assert!(parse_cookie_reply(&packet).is_ok());
-    for len in [0, 1, 2, 61, 63, 134] {
+    for len in [0, 1, 2, 62, 65, 67, 138] {
         let mut bytes = packet.to_vec();
         bytes.resize(len, 0);
         if len >= 2 {

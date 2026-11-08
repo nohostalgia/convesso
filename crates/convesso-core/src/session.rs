@@ -11,15 +11,22 @@
 use core::time::Duration;
 
 use crate::dos::SourceKey;
-use crate::handshake::ChannelBinding;
+use crate::handshake::{ChannelBinding, Index};
 use crate::identity::Address;
 use crate::paths::PeerPaths;
 use crate::storage::Maybe;
 use crate::time::Instant;
 use crate::transport::{MAX_COUNTER, ReplayWindow};
 
-/// A side that sends under keys at least this old starts a new handshake.
+/// A side that sends under keys it initiated, at least this old, starts a
+/// new handshake.
 pub const REKEY_AFTER: Duration = Duration::from_secs(120);
+
+/// A side that sends under keys it answered, at least this old, starts a new
+/// handshake: later than its initiator, which renews first while it sends, so
+/// that the two do not renew across each other; early enough to renew before
+/// the keys expire when only this side sends (`PROTOCOL.md §5`).
+pub const ANSWERED_REKEY_AFTER: Duration = Duration::from_secs(150);
 
 /// Keys at least this old are used for nothing: no send, no receive.
 pub const KEYS_EXPIRE_AFTER: Duration = Duration::from_secs(180);
@@ -302,10 +309,12 @@ pub(crate) struct KeyPair<W> {
     pub(crate) send: [u8; 32],
     pub(crate) recv: [u8; 32],
     /// The index the peer puts in packets to us.
-    pub(crate) local_index: u32,
+    pub(crate) local_index: Index,
     /// The index we put in packets to the peer.
-    pub(crate) remote_index: u32,
+    pub(crate) remote_index: Index,
     pub(crate) created: Instant,
+    /// Whether this side initiated the handshake that gave these keys.
+    pub(crate) initiated: bool,
     pub(crate) next_counter: u64,
     pub(crate) received: u64,
     pub(crate) window: W,
@@ -322,9 +331,10 @@ impl<W> Drop for KeyPair<W> {
 impl<W: ReplayWindow> KeyPair<W> {
     pub(crate) fn new(
         (send, recv): ([u8; 32], [u8; 32]),
-        local_index: u32,
-        remote_index: u32,
+        local_index: Index,
+        remote_index: Index,
         created: Instant,
+        initiated: bool,
     ) -> Self {
         Self {
             send,
@@ -332,6 +342,7 @@ impl<W: ReplayWindow> KeyPair<W> {
             local_index,
             remote_index,
             created,
+            initiated,
             next_counter: 0,
             received: 0,
             window: W::default(),
@@ -345,9 +356,16 @@ impl<W: ReplayWindow> KeyPair<W> {
             && self.received < MAX_COUNTER
     }
 
-    /// Whether sending at `now` should start a new handshake.
+    /// Whether sending at `now` should start a new handshake: after
+    /// [`REKEY_AFTER`] on keys this side initiated, [`ANSWERED_REKEY_AFTER`]
+    /// on keys it answered.
     pub(crate) fn wants_rekey(&self, now: Instant) -> bool {
-        now >= self.created.saturating_add(REKEY_AFTER)
+        let after = if self.initiated {
+            REKEY_AFTER
+        } else {
+            ANSWERED_REKEY_AFTER
+        };
+        now >= self.created.saturating_add(after)
     }
 
     pub(crate) fn expires_at(&self) -> Instant {
@@ -364,8 +382,18 @@ pub(crate) struct Session<W> {
     /// Set when this side completed a handshake as initiator and owes the
     /// responder its confirming packet.
     pub(crate) confirm: bool,
-    /// Set when a send found the keys old enough to renew.
+    /// Set when a send found the keys old enough to renew, or the peer said
+    /// it holds none (`PROTOCOL.md §5`).
     pub(crate) rekey: bool,
+    /// The renewal in progress was started by the peer's unknown-index
+    /// signal: refused, it ends the session's keys (`PROTOCOL.md §5`).
+    pub(crate) signalled: bool,
+    /// The application holds the session: it is never evicted to make room
+    /// (`PROTOCOL.md §5`). For the session's life.
+    pub(crate) held: bool,
+    /// This side completed a handshake as initiator and owes the responder
+    /// its address, at the next poll (`PROTOCOL.md §5`).
+    pub(crate) owes_address: bool,
     /// A close to send, with its code, before the session is removed.
     pub(crate) closing: Option<u16>,
     pub(crate) passive_keepalive: bool,
@@ -403,6 +431,9 @@ impl<W: ReplayWindow> crate::storage::Empty for Session<W> {
         last_source: None,
         confirm: false,
         rekey: false,
+        signalled: false,
+        held: false,
+        owes_address: false,
         closing: None,
         passive_keepalive: false,
         last_received_data: None,
@@ -433,7 +464,7 @@ impl<W: ReplayWindow> Session<W> {
     /// Deletes every key pair past its life. Returns the local indices freed.
     /// What the session knew of its paths and its binding stays until it is
     /// told idle ([`Self::end_life`]): a renewal still in flight keeps them.
-    pub(crate) fn expire(&mut self, now: Instant) -> [Option<u32>; 2] {
+    pub(crate) fn expire(&mut self, now: Instant) -> [Option<Index>; 2] {
         let mut freed = [None, None];
         if self.previous.as_ref().is_some_and(|keys| !keys.live(now)) {
             freed[0] = self.previous.take().map(|keys| keys.local_index);
@@ -471,7 +502,7 @@ impl<W: ReplayWindow> Session<W> {
         keys: KeyPair<W>,
         binding: &ChannelBinding,
         opens: bool,
-    ) -> Option<u32> {
+    ) -> Option<Index> {
         if opens || self.binding.is_none() {
             self.binding = Some(*binding);
         }
@@ -479,6 +510,7 @@ impl<W: ReplayWindow> Session<W> {
         self.previous = self.current.take().into();
         self.current = Maybe::Some(keys);
         self.rekey = false;
+        self.signalled = false;
         self.paths.new_keys();
         dropped
     }

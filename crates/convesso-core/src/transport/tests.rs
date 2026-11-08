@@ -39,7 +39,7 @@ fn hex(value: &Value) -> Vec<u8> {
 fn packets_match_the_vectors() {
     for vector in vectors()["packets"].as_array().unwrap() {
         let key: [u8; 32] = hex(&vector["key"]).try_into().unwrap();
-        let index = u32::try_from(vector["index"].as_u64().unwrap()).unwrap();
+        let index = vector["index"].as_u64().unwrap();
         let counter = vector["counter"].as_u64().unwrap();
         let inner_type = u8::try_from(vector["inner_type"].as_u64().unwrap()).unwrap();
         let data = hex(&vector["data"]);
@@ -118,14 +118,14 @@ fn the_counter_cap_holds_both_ways() {
         &mut out,
     )
     .unwrap();
-    out[6..14].copy_from_slice(&MAX_COUNTER.to_le_bytes());
+    out[10..18].copy_from_slice(&MAX_COUNTER.to_le_bytes());
     assert_eq!(
         open(&[1; 32], &mut out[..len]),
         Err(TransportError::CounterExhausted)
     );
     assert_eq!(
         seal(&[1; 32], 1, 0, inner::DATAGRAM, &[0; 10], &mut [0u8; 40]),
-        Err(TransportError::BufferTooSmall { needed: 41 })
+        Err(TransportError::BufferTooSmall { needed: 45 })
     );
 }
 
@@ -207,5 +207,28 @@ proptest! {
                 highest = Some(highest.map_or(counter, |h| h.max(counter)));
             }
         }
+    }
+}
+
+/// The unknown-index signal matches its committed vectors both ways, and only
+/// its exact 10 bytes parse (`PROTOCOL.md §5`).
+#[test]
+fn the_unknown_index_signal_matches_its_vectors() {
+    for vector in vectors()["unknown_index_signals"].as_array().unwrap() {
+        let index = vector["index"].as_u64().unwrap();
+        let packet = hex(&vector["packet"]);
+        assert_eq!(write_unknown_index(index).as_slice(), packet.as_slice());
+        assert_eq!(parse_unknown_index(&packet), Ok(index));
+        for len in [0, 1, 2, 9, 11, 35] {
+            let mut other = packet.clone();
+            other.resize(len, 0);
+            assert!(parse_unknown_index(&other).is_err(), "{len} bytes");
+        }
+        let mut wrong_type = packet.clone();
+        wrong_type[1] = TYPE_TRANSPORT;
+        assert_eq!(
+            parse_unknown_index(&wrong_type),
+            Err(MessageError::WrongType)
+        );
     }
 }

@@ -26,8 +26,8 @@ use zeroize::Zeroize;
 
 use super::messages::{self, INITIATION_NOISE_LEN, RESPONSE_NOISE_LEN, WireDecision};
 use super::{
-    ATTEMPT_OFFSETS, ChannelBinding, Context, ContextTooLong, Entropy, GIVE_UP_AFTER, MAX_PAYLOAD,
-    NO_PSK, PROLOGUE_MAX, Psk, RefusalCode,
+    ATTEMPT_OFFSETS, ChannelBinding, Context, ContextTooLong, Entropy, GIVE_UP_AFTER, Index,
+    MAX_PAYLOAD, NO_PSK, PROLOGUE_MAX, Psk, RefusalCode,
 };
 use crate::dos::{self, COOKIE_LIFETIME, Cookie};
 use crate::identity::{Address, Identity, PeerId};
@@ -97,8 +97,8 @@ pub enum DialEvent {
 /// A completed handshake on the initiator's side.
 pub struct Established {
     peer: PeerId,
-    local_index: u32,
-    remote_index: u32,
+    local_index: Index,
+    remote_index: Index,
     context: Context,
     completed: Completed,
     opens: bool,
@@ -113,13 +113,13 @@ impl Established {
 
     /// This initiator's index for the session.
     #[must_use]
-    pub const fn local_index(&self) -> u32 {
+    pub const fn local_index(&self) -> Index {
         self.local_index
     }
 
     /// The responder's index for the session.
     #[must_use]
-    pub const fn remote_index(&self) -> u32 {
+    pub const fn remote_index(&self) -> Index {
         self.remote_index
     }
 
@@ -159,7 +159,7 @@ impl Established {
 }
 
 struct Attempt {
-    index: u32,
+    index: Index,
     mac1: Mac,
     awaiting: InitiatorAwaiting,
 }
@@ -525,9 +525,7 @@ impl Dial {
         self.sent += 1;
 
         let index = loop {
-            let mut bytes = [0u8; 4];
-            entropy.fill(&mut bytes);
-            let index = u32::from_le_bytes(bytes);
+            let index = identity.issue_index(entropy);
             if !self.attempts.iter().flatten().any(|a| a.index == index) {
                 break index;
             }
@@ -591,7 +589,7 @@ impl Dial {
 
     /// The indices its attempts registered, which responses name: kept once
     /// the dial is over, until whoever holds it discards it.
-    pub(crate) fn attempt_indices(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn attempt_indices(&self) -> impl Iterator<Item = Index> + '_ {
         self.attempts.iter().flatten().map(|attempt| attempt.index)
     }
 

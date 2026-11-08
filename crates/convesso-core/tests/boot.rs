@@ -249,8 +249,8 @@ fn sizes_after_the_start_change_nothing() {
 }
 
 /// Scenario: the sessions given at start bound the table. With room for one
-/// session, a busy one in a context, a second in another context is refused
-/// by name.
+/// session, held by the application in a context, a second in another
+/// context is refused by name.
 #[test]
 fn a_session_beyond_the_sizes_given_is_refused() {
     let sizes = Sizes {
@@ -267,6 +267,7 @@ fn a_session_beyond_the_sizes_given_is_refused() {
     pair.nodes[0].set_hints(peer, &[&SOURCES[1]], now).unwrap();
     pair.send(0, b"first", now).unwrap();
     assert_eq!(pair.received, 1);
+    pair.nodes[0].hold(peer, b"session", true).unwrap();
     let address = *pair.nodes[1].identity().unwrap().address();
     let mut out = [0u8; 2048];
     let sent = pair.nodes[0].send(

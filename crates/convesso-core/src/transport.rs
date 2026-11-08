@@ -1,13 +1,13 @@
 //! Transport packets (`PROTOCOL.md §5`).
 //!
 //! ```text
-//! 0x01 | 0x04 | receiver index (4, LE) | counter (8, LE) | AEAD( inner type (1) | data ) | tag (16)
+//! 0x01 | 0x04 | receiver index (8, LE) | counter (8, LE) | AEAD( inner type (1) | data ) | tag (16)
 //! ```
 //!
 //! Datagrams arrive late, lost or twice, so the counter travels with each
 //! packet and is the nonce (4 zero bytes, then the counter, little-endian, as
 //! Noise lays out ChaChaPoly's nonce), instead of Noise's implicit counter. The
-//! 14 header bytes are the associated data, so the version, type, index and
+//! 18 header bytes are the associated data, so the version, type, index and
 //! counter are all authenticated. A receiver accepts each counter at most once,
 //! through a sliding window ([`ReplayWindow`], RFC 6479).
 //!
@@ -16,13 +16,58 @@
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 
-use crate::handshake::messages::MessageError;
+use crate::handshake::messages::{MessageError, index_at};
+use crate::handshake::{INDEX_LEN, Index};
 
 /// Byte 1 of a transport packet.
 pub const TYPE_TRANSPORT: u8 = 0x04;
 
+/// Byte 1 of the unknown-index signal (`PROTOCOL.md §5`).
+pub const TYPE_UNKNOWN_INDEX: u8 = 0x07;
+
+/// The unknown-index signal: version, type, the index it answers.
+pub const UNKNOWN_INDEX_LEN: usize = 2 + INDEX_LEN;
+
+/// The unknown-index signal answering a transport packet whose receiver index
+/// was `index`: `0x01 | 0x07 | index (8, LE)`, smaller than any packet it
+/// answers.
+#[must_use]
+pub fn write_unknown_index(index: Index) -> [u8; UNKNOWN_INDEX_LEN] {
+    let mut packet = [0u8; UNKNOWN_INDEX_LEN];
+    packet[0] = 0x01;
+    packet[1] = TYPE_UNKNOWN_INDEX;
+    packet[2..].copy_from_slice(&index.to_le_bytes());
+    packet
+}
+
+/// Reads an unknown-index signal: the index it names.
+///
+/// # Errors
+///
+/// [`MessageError`] when it is not exactly a version 1 unknown-index signal.
+pub fn parse_unknown_index(packet: &[u8]) -> Result<Index, MessageError> {
+    match packet {
+        [0x01, TYPE_UNKNOWN_INDEX, ..] if packet.len() == UNKNOWN_INDEX_LEN => {}
+        [0x01, TYPE_UNKNOWN_INDEX, ..] => {
+            return Err(MessageError::WrongLength {
+                expected: UNKNOWN_INDEX_LEN,
+                actual: packet.len(),
+            });
+        }
+        [0x01, ..] => return Err(MessageError::WrongType),
+        _ => return Err(MessageError::WrongVersion),
+    }
+    index_at(packet, 2).ok_or(MessageError::WrongLength {
+        expected: UNKNOWN_INDEX_LEN,
+        actual: packet.len(),
+    })
+}
+
 /// The header: version, type, index, counter.
-pub const HEADER_LEN: usize = 14;
+pub const HEADER_LEN: usize = COUNTER_AT + 8;
+
+/// Where the counter starts: after the version, the type and the index.
+const COUNTER_AT: usize = 2 + INDEX_LEN;
 
 /// The AEAD tag.
 pub const TAG_LEN: usize = 16;
@@ -53,6 +98,9 @@ pub mod inner {
     pub const STREAM_DATA: u8 = 0x06;
     /// A stream acknowledgement (`PROTOCOL.md §8`), carried unread.
     pub const STREAM_ACK: u8 = 0x07;
+    /// The sender's 32-byte address, told by an initiator after each
+    /// handshake it completes (`PROTOCOL.md §5`).
+    pub const ADDRESS: u8 = 0x08;
 }
 
 /// Why a transport packet could not be sealed or opened.
@@ -75,7 +123,7 @@ pub enum TransportError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// The receiver's index for the session.
-    pub receiver_index: u32,
+    pub receiver_index: Index,
     /// The counter, which is the nonce.
     pub counter: u64,
 }
@@ -103,13 +151,9 @@ pub fn parse_header(packet: &[u8]) -> Result<Header, MessageError> {
         actual: packet.len(),
     };
     Ok(Header {
-        receiver_index: packet
-            .get(2..6)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_le_bytes)
-            .ok_or(short)?,
+        receiver_index: index_at(packet, 2).ok_or(short)?,
         counter: packet
-            .get(6..14)
+            .get(COUNTER_AT..HEADER_LEN)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .ok_or(short)?,
@@ -132,7 +176,7 @@ fn nonce(counter: u64) -> Nonce {
 /// the packet.
 pub fn seal(
     key: &[u8; 32],
-    receiver_index: u32,
+    receiver_index: Index,
     counter: u64,
     inner_type: u8,
     data: &[u8],
@@ -157,7 +201,7 @@ pub const DATA_AT: usize = HEADER_LEN + 1;
 /// As [`seal`].
 pub fn seal_in_place(
     key: &[u8; 32],
-    receiver_index: u32,
+    receiver_index: Index,
     counter: u64,
     inner_type: u8,
     data_len: usize,
@@ -173,8 +217,8 @@ pub fn seal_in_place(
     let mut fields = [0u8; HEADER_LEN];
     fields[0] = 0x01;
     fields[1] = TYPE_TRANSPORT;
-    fields[2..6].copy_from_slice(&receiver_index.to_le_bytes());
-    fields[6..].copy_from_slice(&counter.to_le_bytes());
+    fields[2..COUNTER_AT].copy_from_slice(&receiver_index.to_le_bytes());
+    fields[COUNTER_AT..].copy_from_slice(&counter.to_le_bytes());
     let (header, rest) = out.split_at_mut(HEADER_LEN);
     header.copy_from_slice(&fields);
     let (body, tag_out) = rest.split_at_mut(1 + data_len);
