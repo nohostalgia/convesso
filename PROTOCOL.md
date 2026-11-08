@@ -353,9 +353,11 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
   from that sender through the relay; every check of §3, §4 and §5 applies to it.
 - **Not connected.** When the relay cannot reach a recipient, it tells the sender, at most once a
   second per pair. It is reported as information, not as the failure of a session.
-- **No address is trusted before it is authenticated.** The relay records a client's address only
-  from a packet that opened under that client's keys with a new counter. Until then it sends an
-  address no more bytes than it received from it.
+- **No address is trusted before it is authenticated.** The relay records a client's UDP address
+  only from a packet that opened under that client's keys with a new counter. Until then it sends
+  an address no more bytes than it received from it. It binds a TCP link to a client on any packet
+  that opened under that client's keys on the link, even when a newer one came over UDP first: a
+  link is an ordered stream, and one replaced is closed.
 - **UDP for traffic, TCP for reachability.** UDP counts as *proven* for 15 seconds after an
   authenticated packet arrived over it. Each side uses UDP while it is proven, and the TCP link
   otherwise. A client on TCP also sends one packet every 10 seconds over UDP, to find out when UDP

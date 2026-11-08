@@ -464,6 +464,9 @@ pub(crate) struct World<P: Policy> {
     /// Whether a NAT forwards a packet from its own LAN to its own public
     /// address back in, as some routers do.
     pub(crate) hairpin: bool,
+    /// Extra one-way delay of the TCP link from a client to the relay: a
+    /// stream slower than UDP, as behind a busy socket or a real stack.
+    pub(crate) link_lag: u64,
 }
 
 pub(crate) fn t(ms: u64) -> Instant {
@@ -492,6 +495,7 @@ impl<P: Policy> World<P> {
             loss: None,
             lossy_direct: false,
             direct_delay: None,
+            link_lag: 0,
             hairpin: false,
         };
         for i in 0..clients {
@@ -1144,7 +1148,7 @@ impl<P: Policy> World<P> {
                 let mut bytes = vec![0u8; packet.len() + 2];
                 let n = frame(&packet, &mut bytes).unwrap();
                 bytes.truncate(n);
-                self.put(self.delay, Msg::RelayLink { link, bytes });
+                self.put(self.delay + self.link_lag, Msg::RelayLink { link, bytes });
             }
         }
     }
