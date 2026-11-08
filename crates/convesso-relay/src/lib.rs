@@ -14,9 +14,10 @@
 //! ```
 //!
 //! What it trusts, and when:
-//! - a client's UDP address, and a TCP link's binding to a key, only from a
-//!   transport packet that opened under that client's keys with a counter
-//!   above every one accepted before;
+//! - a client's UDP address only from a transport packet that opened under
+//!   that client's keys with a counter above every one accepted before; a TCP
+//!   link's binding to a key from any transport packet that opened under that
+//!   key on the link, whatever arrived over UDP meanwhile;
 //! - nothing to an address that is not confirmed beyond the handshake's own
 //!   answer, which is never larger than what it answers;
 //! - the sender of every deliver is the key of the session the forward
@@ -710,10 +711,8 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             }
             Output::Event(_) | Output::Nothing => (None, None),
         };
-        if let Some(authenticated) = self.endpoint.last_authenticated()
-            && authenticated.newest
-        {
-            self.authenticated(authenticated.peer, from, now);
+        if let Some(authenticated) = self.endpoint.last_authenticated() {
+            self.authenticated(authenticated.peer, authenticated.newest, from, now);
         }
         if let Some((to, len)) = transmit {
             self.emit(to, len, Some(from), now);
@@ -724,8 +723,17 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         self.drain_from(Some(from), now);
     }
 
-    /// `peer` authenticated a packet no one can have recorded, from `from`.
-    fn authenticated(&mut self, peer: PeerId, from: Dest, now: Instant) {
+    /// `peer` authenticated a packet from `from`: `newest` when its counter
+    /// was above every one accepted before. A UDP address is taken only from
+    /// the newest packet: a late one, from an address the client has left,
+    /// would take its packets back there. A link is taken from any packet on
+    /// it: a link is its own ordered stream, opened by the client, so a packet
+    /// on it proves it whatever arrived over UDP meanwhile; a stale packet
+    /// could only come on a link replaced, and that is closed and forgotten.
+    fn authenticated(&mut self, peer: PeerId, newest: bool, from: Dest, now: Instant) {
+        if !newest && matches!(from, Dest::Udp(_)) {
+            return;
+        }
         let Some(client) = self.clients.get_mut(peer.as_bytes()) else {
             return;
         };
@@ -754,15 +762,20 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
                     None
                 } else {
                     let old = client.link.replace(id);
-                    // A new link: the client (re)connected, from a restart or
-                    // another network. The UDP addresses its earlier packets
-                    // proved may be gone; its next UDP packet proves one again,
-                    // and until then the link carries what is for it.
-                    for udp in [client.udp4.take(), client.udp6.take()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        self.owners.remove(&Dest::Udp(udp.address));
+                    // A new link, newer than anything over UDP: the client
+                    // (re)connected, from a restart or another network. The
+                    // UDP addresses its earlier packets proved may be gone;
+                    // its next UDP packet proves one again, and until then the
+                    // link carries what is for it. A packet over UDP newer
+                    // than this one proved its address after the link: that
+                    // address stays.
+                    if newest {
+                        for udp in [client.udp4.take(), client.udp6.take()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            self.owners.remove(&Dest::Udp(udp.address));
+                        }
                     }
                     let Some(link) = self.links.get_mut(&id) else {
                         return;
@@ -883,7 +896,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         }
         #[cfg(test)]
         if is_first_contact(packet)
-            && let Some(ephemeral) = packet.get(6..38).and_then(|e| e.try_into().ok())
+            && let Some(ephemeral) = packet.get(10..42).and_then(|e| e.try_into().ok())
         {
             self.first_contacts_forwarded.push((recipient, ephemeral));
         }

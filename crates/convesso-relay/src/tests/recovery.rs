@@ -415,3 +415,97 @@ fn six_peers_active_at_once_on_a_board_of_four() {
         assert!(longest_gap[peer] <= 3000, "peer {peer}: never 3 s without");
     }
 }
+
+/// The testbed's report: a board resting on its TCP link, its relay session
+/// gone idle after six minutes of silence, is woken by the relay when a member
+/// sends to it through the relay, the member knowing no direct path.
+#[test]
+fn the_relay_wakes_a_board_resting_on_its_link() {
+    let mut world = World::new(Open, Config::default(), 3);
+    world.direct = false;
+    world.open_link(0);
+    world.run_for(2000);
+    world.send(1, 0, b"before").unwrap();
+    world.run_for(2000);
+    assert_eq!(
+        received(&world, 0, 1, b"before"),
+        1,
+        "reached before the silence"
+    );
+    world.run_for(360_000);
+    let result = ping(&mut world, 1, 0, false, 30_000);
+    report("the relay wakes a board resting on its link", &result);
+    assert!(result.0.is_some(), "the member reached the board");
+}
+
+/// The testbed's second report: UDP between the board and the relay works, and
+/// its TCP link is slower than UDP. The relay must still hold the link as the
+/// board's, so that after six minutes of silence it wakes the board there.
+#[test]
+fn the_relay_wakes_a_board_whose_link_is_slower_than_udp() {
+    for lag in [0, 5, 30, 200] {
+        let mut world = World::new(Open, Config::default(), 3);
+        world.direct = false;
+        world.link_lag = lag;
+        world.open_link(0);
+        world.run_for(2000);
+        world.send(1, 0, b"before").unwrap();
+        world.run_for(2000);
+        assert_eq!(
+            received(&world, 0, 1, b"before"),
+            1,
+            "lag {lag}: reached before"
+        );
+        world.run_for(360_000);
+        let result = ping(&mut world, 1, 0, false, 30_000);
+        report(&format!("link {lag} ms slower than UDP"), &result);
+        assert!(
+            result.0.is_some(),
+            "lag {lag}: the member reached the board"
+        );
+    }
+}
+
+/// The testbed's setup more closely: the board holds its session with a and
+/// sends to it by address; b and d have sessions with it too; after six
+/// minutes of silence, a, b, d and e ping it through the relay, one after the
+/// other, then all at once.
+#[test]
+fn the_relay_wakes_a_board_holding_a_session() {
+    for (together, lag) in [(false, 0), (true, 0), (false, 30), (true, 30)] {
+        let mut world = World::new(Open, Config::default(), 5);
+        world.direct = false;
+        world.link_lag = lag;
+        world.open_link(0);
+        world.run_for(2000);
+        world.send(0, 1, b"to a").unwrap();
+        world.run_for(1000);
+        let a = world.clients[1].peer_id();
+        world.clients[0].endpoint.hold(a, SESSION, true).unwrap();
+        for member in [2, 3] {
+            world.send(member, 0, b"hello").unwrap();
+            world.run_for(1000);
+        }
+        world.run_for(360_000);
+        if together {
+            for member in 1..5 {
+                world.send(member, 0, b"ping").unwrap();
+            }
+            world.run_for(3000);
+            for member in 1..5 {
+                let got = received(&world, 0, member, b"ping");
+                eprintln!("[wake] together, link {lag} ms slower: member {member} reached: {got}");
+                assert!(got >= 1, "member {member} reached the board");
+            }
+        } else {
+            for member in 1..5 {
+                let result = ping(&mut world, member, 0, false, 30_000);
+                report(
+                    &format!("one after the other, link {lag} ms slower, member {member}"),
+                    &result,
+                );
+                assert!(result.0.is_some());
+            }
+        }
+    }
+}
