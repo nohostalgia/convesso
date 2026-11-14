@@ -27,11 +27,11 @@ fn a_closed_link_is_reopened_at_once() {
     assert!(world.clients[0].link.is_some());
 }
 
-/// Scenario: an unreachable relay is retried at most once a minute: the
-/// backoff grows from about a second to the cap, never waits more than 90
-/// seconds, and once capped never less than 60.
+/// Scenario: an unreachable relay is retried every 15 to 22.5 seconds: the
+/// backoff grows from about a second to the cap, never waits more than 22.5
+/// seconds, and once capped never less than 15.
 #[test]
-fn an_unreachable_relay_is_retried_at_most_once_a_minute() {
+fn an_unreachable_relay_is_retried_every_15_to_22_seconds() {
     let mut world = World::new(Open, Config::default(), 1);
     world.clients[0].tcp_refused = true;
     let now = world.instant();
@@ -41,14 +41,96 @@ fn an_unreachable_relay_is_retried_at_most_once_a_minute() {
     let gaps: Vec<u64> = opens.windows(2).map(|w| w[1] - w[0]).collect();
     std::println!("attempts: {}, gaps (ms): {gaps:?}", opens.len());
     assert!(gaps[0] >= 1_000 && gaps[0] <= 1_500, "{gaps:?}");
-    assert!(gaps.iter().all(|&gap| gap <= 90_000), "{gaps:?}");
-    let capped = gaps.iter().position(|&gap| gap >= 60_000).unwrap();
-    assert!(gaps[capped..].iter().all(|&gap| gap >= 60_000), "{gaps:?}");
-    assert!(opens.len() <= 7 + 60, "at most one a minute once capped");
+    assert!(gaps.iter().all(|&gap| gap <= 22_500), "{gaps:?}");
+    let capped = gaps.iter().position(|&gap| gap >= 15_000).unwrap();
+    assert!(gaps[capped..].iter().all(|&gap| gap >= 15_000), "{gaps:?}");
+    assert!(opens.len() <= 5 + 240, "at most one every 15 s once capped");
     // The relay comes back: the next attempt succeeds.
     world.clients[0].tcp_refused = false;
-    world.run_for(91_000);
+    world.run_for(23_000);
     assert!(world.clients[0].link.is_some());
+}
+
+/// A client whose UDP and TCP to the relay fail, its backoff at the cap.
+fn cut_off_and_capped() -> World<Open> {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.direct = false;
+    world.open_link(1);
+    world.clients[0].tcp_refused = true;
+    world.clients[0].udp_blocked = true;
+    let now = world.instant();
+    world.clients[0].endpoint.set_reachable(true, now);
+    world.run_for(5 * 60_000);
+    world
+}
+
+/// Scenario: a packet to send brings the link forward: the relay is back
+/// just after an attempt, so the next one is 15 seconds away; the
+/// application sends, the link is asked for at once, and the datagram
+/// arrives.
+#[test]
+fn a_packet_to_send_brings_the_link_forward() {
+    let mut world = cut_off_and_capped();
+    let last = *world.clients[0].opens.last().unwrap();
+    world.run_until(last + 100);
+    world.clients[0].tcp_refused = false;
+    let sent_at = world.now;
+    world.send(0, 1, b"now").unwrap();
+    world.run_for(2000);
+    assert_eq!(
+        world.clients[0].opens.last(),
+        Some(&sent_at),
+        "asked for at once"
+    );
+    let a = world.clients[0].peer_id();
+    let got = world.clients[1]
+        .events
+        .iter()
+        .any(|e| matches!(e, Ev::Datagram { peer, data, .. } if *peer == a && data == b"now"));
+    assert!(got, "the datagram reached the peer");
+}
+
+/// Scenario: sending brings the link forward at most once a second: ten
+/// datagrams a second for a minute towards an unreachable relay.
+#[test]
+fn sending_brings_the_link_forward_at_most_once_a_second() {
+    let mut world = cut_off_and_capped();
+    let start = world.now;
+    let before = world.clients[0].opens.len();
+    while world.now < start + 60_000 {
+        let _ = world.send(0, 1, b"tick");
+        world.run_for(100);
+    }
+    let opens = &world.clients[0].opens[before..];
+    let gaps: Vec<u64> = opens.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        opens.len() >= 30,
+        "brought forward: {} attempts",
+        opens.len()
+    );
+    assert!(gaps.iter().all(|&gap| gap >= 1_000), "{gaps:?}");
+}
+
+/// Scenario: proven UDP brings nothing forward: with UDP to the relay
+/// working, packets go over it, and the link attempts keep the backoff.
+#[test]
+fn proven_udp_brings_nothing_forward() {
+    let mut world = cut_off_and_capped();
+    world.clients[0].udp_blocked = false;
+    let start = world.now;
+    let before = world.clients[0].opens.len();
+    let mut delivered = 0;
+    while world.now < start + 60_000 {
+        let _ = world.send(0, 1, b"tick");
+        let _ = world.send(1, 0, b"tock");
+        world.run_for(500);
+        delivered = world.clients[1].datagrams().len();
+    }
+    assert!(delivered > 100, "UDP carries the traffic: {delivered}");
+    let opens = &world.clients[0].opens[before..];
+    let gaps: Vec<u64> = opens.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(opens.len() <= 5, "{} attempts", opens.len());
+    assert!(gaps.iter().all(|&gap| gap >= 15_000), "{gaps:?}");
 }
 
 /// Scenario: a link that dies silently is noticed within 80 seconds, and

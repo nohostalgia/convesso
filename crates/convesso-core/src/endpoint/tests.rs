@@ -2903,7 +2903,8 @@ fn a_dial_without_hints_goes_through_the_relay_alone() {
 }
 
 /// Scenario: new hints bring the next attempt forward: given at 2 s, they get
-/// the third attempt then; the fourth stays at 7 s, and no fifth comes.
+/// the third attempt then; the fourth stays at 5 s, and the rest at theirs.
+/// Scenario: new hints after the last attempt send nothing.
 #[test]
 fn new_hints_bring_the_next_attempt_forward() {
     let mut a = Dialler::new(1);
@@ -2925,11 +2926,49 @@ fn new_hints_bring_the_next_attempt_forward() {
         "the third attempt, now"
     );
     assert_eq!(a.drain(3000).len(), 0, "not again at 3 s");
-    assert_eq!(a.drain(7000).len(), 1, "the fourth at 7 s");
+    assert_eq!(a.drain(5000).len(), 1, "the fourth at 5 s");
+    for at in [7000, 9000, 11_000, 13_000] {
+        assert_eq!(a.drain(at).len(), 1, "an attempt at {at} ms");
+    }
     a.endpoint
-        .set_hints(b_peer, &[h1], Instant::from_millis(8000))
+        .set_hints(b_peer, &[h1], Instant::from_millis(14_000))
         .unwrap();
-    assert_eq!(a.drain(8000).len(), 0, "no fifth attempt");
+    assert_eq!(a.drain(14_000).len(), 0, "no ninth attempt");
+}
+
+/// Scenario: a response to an attempt no longer kept is ignored, on a bounded
+/// endpoint: after five attempts, a response to the first opens nothing, and
+/// one to the second, still kept, opens the session.
+#[test]
+fn a_response_to_an_attempt_no_longer_kept_is_ignored() {
+    let mut net = Net::new();
+    net.drop_to_b = true;
+    let _ = net.a_sends(b"hello");
+    for second in [1, 3, 5, 7] {
+        net.at(second);
+    }
+    let attempts: Vec<Vec<u8>> = net
+        .a
+        .sent
+        .iter()
+        .filter(|p| p[0] == 0x01 && crate::handshake::messages::is_first_contact_type(p[1]))
+        .cloned()
+        .collect();
+    assert_eq!(attempts.len(), 5);
+    net.drop_to_b = false;
+    // A responder that saw none of them yet: B as it would be after a restart.
+    net.b = Node::new(0, [10, 0, 0, 2, 0, 2], 999);
+    let first = net
+        .deliver(true, &attempts[0])
+        .expect("a response to the first");
+    assert_eq!(net.deliver(false, &first), None);
+    assert!(!net.a.events.iter().any(|e| matches!(e, Ev::Connected(_))));
+    let second = net
+        .deliver(true, &attempts[1])
+        .expect("a response to the second");
+    let _ = net.deliver(false, &second);
+    net.settle();
+    assert!(net.a.events.iter().any(|e| matches!(e, Ev::Connected(_))));
 }
 
 /// Scenario: without a relay every attempt goes to every hint, until the
@@ -2945,7 +2984,7 @@ fn without_a_relay_every_attempt_goes_to_every_hint() {
     let (first_to, _) = a.connect(0, 0);
     let mut sent = vec![first_to];
     sent.extend(a.drain(0).into_iter().map(|(to, _)| to));
-    for at in [1000, 3000, 7000, 15_000] {
+    for at in [1000, 3000, 5000, 7000, 9000, 11_000, 13_000, 15_000] {
         sent.extend(a.drain(at).into_iter().map(|(to, _)| to));
     }
     let attempts = crate::handshake::ATTEMPT_OFFSETS.len();
@@ -4274,7 +4313,7 @@ fn a_datagram_too_large_for_a_first_contact_waits() {
     assert_eq!(net.b_datagrams(), vec![large]);
 }
 
-/// A dial whose four attempts are all admitted hands the payload over at
+/// A dial whose first five attempts are all admitted hands the payload over at
 /// most once per attempt, and the datagram is never sent again.
 #[test]
 fn early_data_arrives_at_most_once_per_attempt() {
@@ -4284,10 +4323,11 @@ fn early_data_arrives_at_most_once_per_attempt() {
     net.a_sends(b"hello").unwrap();
     net.at(1);
     net.at(3);
+    net.at(5);
     net.drop_to_a = false;
     net.at(7);
     let delivered = payloads(&net.b).len();
-    assert!((1..=4).contains(&delivered), "{delivered}");
+    assert!((1..=5).contains(&delivered), "{delivered}");
     assert!(net.b_datagrams().is_empty());
     assert!(net.a.events.iter().any(|e| matches!(e, Ev::Connected(_))));
 }

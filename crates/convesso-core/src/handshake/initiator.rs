@@ -3,8 +3,8 @@
 //! A dial sends a first contact at its start and, while nothing has answered,
 //! a new one with a fresh ephemeral key and index at each of
 //! [`ATTEMPT_OFFSETS`](super::ATTEMPT_OFFSETS); it gives up at
-//! [`GIVE_UP_AFTER`](super::GIVE_UP_AFTER). A response to any attempt completes
-//! it. Anything that does not decrypt under an attempt is ignored, so a forged
+//! [`GIVE_UP_AFTER`](super::GIVE_UP_AFTER). A response to any of its
+//! [`ATTEMPTS_KEPT`](super::ATTEMPTS_KEPT) newest attempts completes it. Anything that does not decrypt under an attempt is ignored, so a forged
 //! response cannot end a dial; a genuine refusal, or a genuine "version not
 //! supported", does.
 //!
@@ -26,8 +26,8 @@ use zeroize::Zeroize;
 
 use super::messages::{self, INITIATION_NOISE_LEN, RESPONSE_NOISE_LEN, WireDecision};
 use super::{
-    ATTEMPT_OFFSETS, ChannelBinding, Context, ContextTooLong, Entropy, GIVE_UP_AFTER, Index,
-    MAX_PAYLOAD, NO_PSK, PROLOGUE_MAX, Psk, RefusalCode,
+    ATTEMPT_OFFSETS, ATTEMPTS_KEPT, ChannelBinding, Context, ContextTooLong, Entropy,
+    GIVE_UP_AFTER, Index, MAX_PAYLOAD, NO_PSK, PROLOGUE_MAX, Psk, RefusalCode,
 };
 use crate::dos::{self, COOKIE_LIFETIME, Cookie};
 use crate::identity::{Address, Identity, PeerId};
@@ -171,7 +171,7 @@ pub struct Dial {
     context: Context,
     psk: Psk,
     started: Instant,
-    attempts: [Maybe<Attempt>; ATTEMPT_OFFSETS.len()],
+    attempts: [Maybe<Attempt>; ATTEMPTS_KEPT],
     sent: usize,
     /// Whether it is in progress: opened, not yet over. False in an empty
     /// dial, which sends nothing (`DESIGN.md §2`).
@@ -195,7 +195,7 @@ impl crate::storage::Empty for Dial {
         context: Context::EMPTY,
         psk: NO_PSK,
         started: Instant::from_millis(0),
-        attempts: [const { Maybe::None }; ATTEMPT_OFFSETS.len()],
+        attempts: [const { Maybe::None }; ATTEMPTS_KEPT],
         sent: 0,
         live: false,
         cookie: None,
@@ -325,7 +325,7 @@ impl Dial {
         self.context = context;
         self.psk = psk.unwrap_or(NO_PSK);
         self.started = now;
-        self.attempts = [const { Maybe::None }; ATTEMPT_OFFSETS.len()];
+        self.attempts = [const { Maybe::None }; ATTEMPTS_KEPT];
         self.sent = 0;
         self.live = true;
         self.cookie = None;
@@ -486,7 +486,7 @@ impl Dial {
         let mut pending = [PendingFirstContact {
             version: Version::V1,
             mac1: [0; 16],
-        }; ATTEMPT_OFFSETS.len()];
+        }; ATTEMPTS_KEPT];
         let mut count = 0;
         for (slot, attempt) in pending.iter_mut().zip(self.attempts.iter().flatten()) {
             slot.mac1 = attempt.mac1;
@@ -564,7 +564,9 @@ impl Dial {
         let Some(mac1) = out.get(..len).and_then(wire::carried_mac1) else {
             return 0;
         };
-        if let Some(slot) = self.attempts.get_mut(attempt) {
+        // The newest attempts are kept: this one takes the place of the one
+        // `ATTEMPTS_KEPT` back.
+        if let Some(slot) = self.attempts.get_mut(attempt % ATTEMPTS_KEPT) {
             *slot = Maybe::Some(Attempt {
                 index,
                 mac1,
@@ -585,6 +587,18 @@ impl Dial {
     #[must_use]
     pub const fn started(&self) -> Instant {
         self.started
+    }
+
+    /// The index of the attempt the next one will take the place of, if any:
+    /// whoever registered it releases it once the next attempt is sent.
+    pub(crate) fn index_replaced_next(&self) -> Option<Index> {
+        if self.sent >= ATTEMPT_OFFSETS.len() {
+            return None;
+        }
+        match self.attempts.get(self.sent % ATTEMPTS_KEPT) {
+            Some(Maybe::Some(attempt)) => Some(attempt.index),
+            _ => None,
+        }
     }
 
     /// The indices its attempts registered, which responses name: kept once
@@ -613,9 +627,9 @@ impl Dial {
     }
 
     /// Sends the next attempt at `now` rather than at its offset: the peer has
-    /// new address hints, which the attempt will reach. The attempts after it
-    /// keep their offsets; a dial with its four attempts sent sends nothing
-    /// more.
+    /// new address hints, which the attempt will reach, or its relay said
+    /// the peer arrived. The attempts after it keep their offsets; a dial with
+    /// all its attempts sent sends nothing more.
     pub(crate) fn hurry(&mut self, now: Instant) {
         if self.live && self.sent > 0 && self.sent < ATTEMPT_OFFSETS.len() {
             self.hurry = Some(now);

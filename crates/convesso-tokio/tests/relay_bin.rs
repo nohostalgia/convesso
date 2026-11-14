@@ -141,7 +141,7 @@ fn every_limit_is_configurable() {
          packets_burst = 4\nfirst_contacts_per_recipient = 5\nfirst_contacts_burst = 6\n\
          handshakes_per_ip = 7\nhandshakes_burst = 8\nlinks_per_ip = 9\n\
          new_links_per_second = 200\nnew_links_burst = 1000\nqueue_per_recipient = 4096\n\
-         link_silence_seconds = 300\nnot_connected_every_ms = 250\n"
+         link_silence_seconds = 300\nnot_connected_every_ms = 250\nseekers_per_recipient = 7\n"
     ))
     .unwrap()
     .relay_config()
@@ -163,6 +163,7 @@ fn every_limit_is_configurable() {
         queue_per_recipient: 4096,
         link_silence: Duration::from_secs(300),
         not_connected_every: Duration::from_millis(250),
+        seekers_per_recipient: 7,
     };
     assert_eq!(config, expected);
 

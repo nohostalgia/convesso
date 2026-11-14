@@ -58,6 +58,12 @@
       "bytes": "03019a1cd3770e4d67e4fc960a255c64e6b03740f6f9a2394ca5ba59c2cb18c43eda"
     },
     {
+      "name": "arrived",
+      "type": "arrived",
+      "peer": "9a1cd3770e4d67e4fc960a255c64e6b03740f6f9a2394ca5ba59c2cb18c43eda",
+      "bytes": "06019a1cd3770e4d67e4fc960a255c64e6b03740f6f9a2394ca5ba59c2cb18c43eda"
+    },
+    {
       "name": "register",
       "type": "register",
       "address": "fcc8e0ec7b8c46e76f10b57d84691a295e94233bd1a66df8f6198d89ebf9a6d7",
@@ -103,8 +109,8 @@
       "defect": "empty"
     },
     {
-      "name": "unknown frame type 0x06",
-      "bytes": "06f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c10",
+      "name": "unknown frame type 0x07",
+      "bytes": "07f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c10",
       "defect": "unknown type"
     },
     {
@@ -160,6 +166,21 @@
     {
       "name": "not connected with reserved kind",
       "bytes": "0302f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c10",
+      "defect": "reserved kind"
+    },
+    {
+      "name": "arrived of 35 bytes",
+      "bytes": "0601f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c1000",
+      "defect": "wrong length"
+    },
+    {
+      "name": "arrived of 33 bytes",
+      "bytes": "0601f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c",
+      "defect": "wrong length"
+    },
+    {
+      "name": "arrived with reserved kind",
+      "bytes": "0602f9735d1234f7137f9991864ec864698cd0fb0c96a4a77b1aa812eae6aa303c10",
       "defect": "reserved kind"
     },
     {

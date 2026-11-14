@@ -98,6 +98,9 @@ pub struct Config {
     pub link_silence: Duration,
     /// At most one not-connected notice this often per sender and recipient.
     pub not_connected_every: Duration,
+    /// Clients told a recipient is not connected that are told when it
+    /// arrives, per recipient: the newest are kept.
+    pub seekers_per_recipient: usize,
 }
 
 impl Default for Config {
@@ -114,6 +117,7 @@ impl Default for Config {
             queue_per_recipient: 256 * 1024,
             link_silence: Duration::from_secs(180),
             not_connected_every: Duration::from_secs(1),
+            seekers_per_recipient: 32,
         }
     }
 }
@@ -126,6 +130,10 @@ pub const UDP_PROVEN_FOR: Duration = convesso_core::endpoint::UDP_PROVEN_FOR;
 /// deliveries for it waiting for its confirmation: the pending handshake's
 /// lifetime.
 const PENDING_FOR: Duration = Duration::from_secs(5);
+
+/// How long a client that sought a recipient not connected is told of its
+/// arrival: a dial's life, after which it has no dial left to bring forward.
+const SEEKING_FOR: Duration = convesso_core::handshake::GIVE_UP_AFTER;
 
 /// The largest packet the relay sends a client: a deliver of the largest
 /// carried packet, sealed.
@@ -415,6 +423,9 @@ pub struct Relay<P, E> {
     ips: HashMap<IpAddr, IpState>,
     new_links: Bucket,
     notices: HashMap<([u8; 32], [u8; 32]), Instant>,
+    /// For each recipient not connected, the clients that sought it and until
+    /// when they are told of its arrival (`PROTOCOL.md §6`).
+    seekers: HashMap<[u8; 32], Vec<(PeerId, Instant)>>,
     actions: VecDeque<Action>,
     out: Vec<u8>,
     /// The packet being handled already reported its sender's address: a
@@ -428,6 +439,9 @@ pub struct Relay<P, E> {
     /// what the tests of a dial's attempts read.
     #[cfg(test)]
     first_contacts_forwarded: Vec<([u8; 32], [u8; 32])>,
+    /// Each arrived frame sent: to whom, naming whom, when (ms).
+    #[cfg(test)]
+    arrivals_sent: Vec<([u8; 32], [u8; 32], u64)>,
 }
 
 fn is_first_contact(packet: &[u8]) -> bool {
@@ -466,12 +480,15 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             ips: HashMap::new(),
             new_links: Bucket::full(config.new_links_burst, now),
             notices: HashMap::new(),
+            seekers: HashMap::new(),
             actions: VecDeque::new(),
             out: vec![0; MAX_OUT],
             #[cfg(test)]
             unconfirmed: HashMap::new(),
             #[cfg(test)]
             first_contacts_forwarded: Vec::new(),
+            #[cfg(test)]
+            arrivals_sent: Vec::new(),
             reported: false,
         })
     }
@@ -613,6 +630,10 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         });
         let clients = &self.clients;
         self.owners.retain(|_, key| clients.contains_key(key));
+        self.seekers.retain(|_, seekers| {
+            seekers.retain(|(_, until)| now < *until);
+            !seekers.is_empty()
+        });
         let every = self.config.not_connected_every;
         self.notices.retain(|_, at| now < at.saturating_add(every));
         let config = self.config;
@@ -713,6 +734,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         };
         if let Some(authenticated) = self.endpoint.last_authenticated() {
             self.authenticated(authenticated.peer, authenticated.newest, from, now);
+            self.arrived(authenticated.peer, now);
         }
         if let Some((to, len)) = transmit {
             self.emit(to, len, Some(from), now);
@@ -868,7 +890,12 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
                 }
             }
             // The relay's own frames, from a client, and anything malformed.
-            Ok(Frame::Deliver { .. } | Frame::NotConnected { .. } | Frame::Observed { .. })
+            Ok(
+                Frame::Deliver { .. }
+                | Frame::NotConnected { .. }
+                | Frame::Observed { .. }
+                | Frame::Arrived { .. },
+            )
             | Err(_) => {}
         }
     }
@@ -881,6 +908,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             .get_mut(&recipient)
             .filter(|client| client.reachable(now))
         else {
+            self.seeking(sender, recipient, now);
             self.not_connected(sender, recipient, now);
             return;
         };
@@ -912,6 +940,63 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             return;
         };
         self.send_to(peer, frame.get(..len).unwrap_or_default(), now);
+    }
+
+    /// `sender` sought `recipient`, which is not connected: it is told when the
+    /// recipient arrives, for a dial's life. The newest seekers are kept.
+    fn seeking(&mut self, sender: PeerId, recipient: [u8; 32], now: Instant) {
+        let most = self.config.seekers_per_recipient;
+        if most == 0 {
+            return;
+        }
+        let until = now.saturating_add(SEEKING_FOR);
+        let seekers = self.seekers.entry(recipient).or_default();
+        if let Some(seeker) = seekers.iter_mut().find(|(key, _)| *key == sender) {
+            seeker.1 = until;
+            return;
+        }
+        if seekers.len() >= most
+            && let Some(oldest) = seekers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(at, _)| at)
+        {
+            seekers.swap_remove(oldest);
+        }
+        seekers.push((sender, until));
+    }
+
+    /// `peer` authenticated a packet and can be reached: each client still
+    /// seeking it is told once, with an arrived frame.
+    fn arrived(&mut self, peer: PeerId, now: Instant) {
+        if self
+            .clients
+            .get(peer.as_bytes())
+            .is_none_or(|client| client.path(now).is_none())
+        {
+            return;
+        }
+        let Some(seekers) = self.seekers.remove(peer.as_bytes()) else {
+            return;
+        };
+        let mut frame = [0u8; relay::ROUTED_HEADER_LEN];
+        let Ok(len) = relay::encode(
+            &Frame::Arrived {
+                peer: *peer.as_bytes(),
+            },
+            &mut frame,
+        ) else {
+            return;
+        };
+        for (seeker, until) in seekers {
+            if now < until {
+                #[cfg(test)]
+                self.arrivals_sent
+                    .push((*seeker.as_bytes(), *peer.as_bytes(), now.as_millis()));
+                self.send_to(seeker, frame.get(..len).unwrap_or_default(), now);
+            }
+        }
     }
 
     /// Tells `sender`, at most once per interval, that `recipient` is not here.

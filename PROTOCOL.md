@@ -144,10 +144,12 @@ refusing are the same length. Codes `0x0001` (capacity exhausted) and `0x0002` (
 - **A context can be bound to one peer.** Everyone else is then treated as a stranger.
 - **The responder's result is pending** for 5 seconds. It becomes a session when the initiator's
   first transport packet arrives (§5), so a replayed first contact never displaces a session.
-- **Retries.** An initiator sends a new first contact, with a fresh ephemeral key, 1, 3 and 7
-  seconds after the first, and gives up at 15 seconds. When the application gives the peer new
-  address hints during a dial, the next of these is sent at once; never more than four, nor any
-  after 15 seconds.
+- **Retries.** An initiator sends a new first contact, with a fresh ephemeral key, 1, 3, 5, 7, 9,
+  11 and 13 seconds after the first, and gives up at 15 seconds: a peer that becomes reachable
+  during a dial is tried within 2 seconds. It answers to its four newest attempts only; the
+  responder keeps two per peer, so no answer to an older one comes. When the application gives
+  the peer new address hints during a dial, or the relay says the peer arrived (§6), the next of
+  these is sent at once; never more than eight, nor any after 15 seconds.
 - **Channel binding.** Both sides expose the Noise handshake hash, 32 bytes, equal at both ends
   and different for every handshake.
 - **Both ends agree on what a handshake does.** It opens a session when the first contact was an
@@ -327,6 +329,7 @@ or a sender is the byte `0x01` followed by a 32-byte peer id.
 | `0x03` | not connected | relay to client | recipient (33) | 34 |
 | `0x04` | register | client to relay | the client's address (32) | 33 |
 | `0x05` | observed address | relay to client | link (`0x00` UDP, `0x01` TCP), family (`0x04` or `0x06`), address (4 or 16), port (2) | 9 or 21 |
+| `0x06` | arrived | relay to client | the arrived peer (33) | 34 |
 
 A carried packet is 1 to 1,380 bytes. A frame that is malformed, or of an unknown type, is ignored.
 
@@ -353,6 +356,12 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
   from that sender through the relay; every check of §3, §4 and §5 applies to it.
 - **Not connected.** When the relay cannot reach a recipient, it tells the sender, at most once a
   second per pair. It is reported as information, not as the failure of a session.
+- **Arrived.** The relay remembers each sender it told that a recipient is not connected, for 15
+  seconds after its latest forward to it (a dial's life), and at most 32 per recipient, the newest
+  kept. When the recipient's relay session next authenticates a packet, each of them gets one
+  arrived frame, and is forgotten. The sender sends the next attempt of its dials to that peer at
+  once, so it is reached a round trip after it comes rather than at the next attempt (§3). Nobody
+  hears of a peer they did not seek; the frame tells nothing but the arrival.
 - **No address is trusted before it is authenticated.** The relay records a client's UDP address
   only from a packet that opened under that client's keys with a new counter. Until then it sends
   an address no more bytes than it received from it. It binds a TCP link to a client on any packet
@@ -376,8 +385,10 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
   tells nobody else.
 - **Keep-alive.** A client keeping a TCP link sends one keep-alive when the link has been silent
   for a minute; the relay answers each. An answer missing for 20 seconds means the link is dead.
-  A failed link is retried after 1 second, doubling up to 60, each wait lengthened at random by up
-  to half.
+  A failed link is retried after 1 second, doubling up to 15 when the link did not open, hung or
+  died, and up to 60 when the relay refused or did not answer the relay session; each wait is
+  lengthened at random by up to half. While a reachable client waits, a packet it has for the relay
+  with UDP not proven asks for the link at once, at most once a second.
 - **One relay at a time.** A client may replace its relay, or remove it, while it runs. Everything
   of the old relay goes: its session, its link (closed without an unavailability event), and the
   public candidates it reported; the relay context is served to the new relay alone. Sessions with

@@ -37,7 +37,7 @@ optional = true
 ["reference-embassy/riscv32imc-unknown-none-elf"]
 "main" = 12384
 "task application" = 12336
-"task driver" = 10832
+"task driver" = 10816
 "task network" = 3200
 
 ["reference-embassy/riscv32imc-unknown-none-elf".indirect]
@@ -54,8 +54,8 @@ optional = true
 "<convesso_embassy::node::Runner<embassy_sync::blocking_mutex::raw::NoopRawMutex, convesso_core::storage::Mcu, convesso_embassy::net::NetDatagrams, convesso_embassy::net::NetStream, convesso_embassy::net::NetInterfaces>>::run::{closure#0}" = 10
 
 ["reference-embassy/thumbv7em-none-eabihf"]
-"main" = 11968
-"task application" = 11944
+"main" = 11976
+"task application" = 11952
 "task driver" = 10512
 "task network" = 3240
 
@@ -95,10 +95,10 @@ optional = true
 "<convesso_stream::channel::Channel<convesso_stream::config::Mcu>>::session_ended::<convesso_embassy::rng::Checked<core::option::Option<&mut dyn convesso_embassy::rng::SecureRng + core::marker::Send>>>" = 1
 
 ["reference-stream/thumbv7em-none-eabihf"]
-"main" = 11864
+"main" = 11872
 "start" = 2384
-"task application" = 11840
-"task driver" = 10448
+"task application" = 11848
+"task driver" = 10456
 "task network" = 3240
 
 ["reference-stream/thumbv7em-none-eabihf".indirect]
@@ -122,6 +122,6 @@ optional = true
 ["reference/riscv32imc-unknown-none-elf".indirect]
 
 ["reference/thumbv7em-none-eabihf"]
-"main" = 24632
+"main" = 24624
 
 ["reference/thumbv7em-none-eabihf".indirect]

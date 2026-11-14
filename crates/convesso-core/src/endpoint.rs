@@ -44,9 +44,9 @@ pub use direct::ExcludeError;
 use index::{Look, Sessions};
 use queues::Queues;
 pub use relayed::{
-    ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, HintError, HintTooLong, KeepAliveTooShort,
-    LINK_ANSWER_WITHIN, LinkFailure, MAX_HINTS, MIN_KEEPALIVE, RELAY_AFTER_HINTS, RelayError,
-    RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
+    ASK_ADDRESS_AT, BACKOFF_CAP, BACKOFF_FIRST, BRING_FORWARD_EVERY, HintError, HintTooLong,
+    KeepAliveTooShort, LINK_ANSWER_WITHIN, LINK_BACKOFF_CAP, LinkFailure, MAX_HINTS, MIN_KEEPALIVE,
+    RELAY_AFTER_HINTS, RelayError, RelayPath, UDP_PROBE_EVERY, UDP_PROVEN_FOR,
 };
 use relayed::{Answer, RelayClient};
 
@@ -2210,9 +2210,17 @@ impl<C: Config> Endpoint<C> {
                 .filter(|_| carried)
                 .unwrap_or_default();
             if let Some(dial) = self.dials.get_mut(&key) {
+                let replaced = dial.index_replaced_next();
                 match dial.poll_with_payload(identity, payload, now, entropy, out) {
                     DialPoll::Send(len) => {
-                        let mut indices = [0 as Index; 4];
+                        // The attempt took the place of the oldest one kept,
+                        // whose index no response can name any more.
+                        if C::INDEXED
+                            && let Some(index) = replaced
+                        {
+                            self.indices.remove(&index);
+                        }
+                        let mut indices = [0 as Index; crate::handshake::ATTEMPTS_KEPT];
                         let mut count = 0;
                         for (slot, index) in indices.iter_mut().zip(dial.attempt_indices()) {
                             *slot = index;

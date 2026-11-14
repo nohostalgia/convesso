@@ -18,6 +18,7 @@ mod dual_stack;
 mod matrix;
 mod revalidation;
 
+mod arrival;
 mod bounded;
 mod client;
 mod frames;
