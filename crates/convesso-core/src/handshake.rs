@@ -71,14 +71,26 @@ pub const PENDING_LIFETIME: Duration = Duration::from_secs(5);
 
 /// When an initiator sends a first contact, counted from the start of a dial.
 ///
-/// Sends at most 4 × 138 bytes per dial, and nothing on an idle device. Without
-/// retries, one lost packet would fail the dial.
-pub const ATTEMPT_OFFSETS: [Duration; 4] = [
+/// Every 2 seconds after the first: a peer that becomes reachable at any time
+/// during the dial is tried within 2 seconds. Not every second: the responder
+/// keeps [`PENDING_PER_PEER`] attempts of a peer, so attempts `t` apart lose a
+/// response to a round trip longer than `2t`. Sends at most 8 × 138 bytes per
+/// dial, and nothing on an idle device. Without retries, one lost packet would
+/// fail the dial.
+pub const ATTEMPT_OFFSETS: [Duration; 8] = [
     Duration::from_secs(0),
     Duration::from_secs(1),
     Duration::from_secs(3),
+    Duration::from_secs(5),
     Duration::from_secs(7),
+    Duration::from_secs(9),
+    Duration::from_secs(11),
+    Duration::from_secs(13),
 ];
+
+/// How many of a dial's newest attempts it keeps, and answers to: an older
+/// one the responder has dropped for two newer ones, so no answer to it comes.
+pub const ATTEMPTS_KEPT: usize = 4;
 
 /// When an unanswered dial is given up, counted from its start.
 pub const GIVE_UP_AFTER: Duration = Duration::from_secs(15);

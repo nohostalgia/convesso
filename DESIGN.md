@@ -197,13 +197,18 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
   inside the handshake with the relay.
 - **The relay tells a client its public address,** inside their session, when it changes, so no
   separate address probes are needed.
+- **A peer that comes is reached at once.** The relay remembers, for a dial's life, who sought a
+  recipient that was not there, and tells them when it comes; their dials try again then, rather
+  than at their next attempt. Nobody else hears of it, and nothing is sent at rest.
 - **The relay does not wait on a slow recipient.** Each client has limits; a packet beyond them,
   or for a recipient whose queue is full, is dropped.
 - **A client backs off until it is registered.** A link attempt that ends before the client is
-  registered on it waits for a backoff of 1 to 60 seconds, with jitter. That covers a link not
-  opened, an opening that hangs, a link that dies, and a relay session the relay refuses or does
-  not answer. A relay shedding load is thus asked at most once a minute, never hammered. Only a
-  link the client was registered on is replaced at once.
+  registered on it waits for a backoff, with jitter: 1 to 15 seconds after a link not opened, an
+  opening that hangs or a link that dies, so that a resting device is back within about 22 seconds
+  of its relay; 1 to 60 seconds after a relay session the relay refuses or does not answer, so that
+  a relay shedding load is asked at most once a minute, never hammered. A packet to send brings the
+  next attempt forward, at most once a second. Only a link the client was registered on is
+  replaced at once.
 - **The application knows whether its relay is available.** It is told when the client is
   registered, and each time an attempt ends or a registered link is lost, with the reason.
 - **One relay at a time, changed while running.** An application moving its devices from one relay

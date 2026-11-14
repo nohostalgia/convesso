@@ -509,3 +509,115 @@ fn the_relay_wakes_a_board_holding_a_session() {
         }
     }
 }
+
+// --- connecting at once ------------------------------------------------------------------
+
+/// A member dials a board through the relay while the board is away, and the
+/// board comes to the relay `back` ms into the dial: the ms from its arrival
+/// to the member's datagram reaching it, if it does before the dial ends.
+fn reached_after_arrival(back: u64) -> Option<u64> {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.direct = false;
+    world.open_link(1);
+    world.run_for(2000);
+    let start = world.now;
+    world.send(1, 0, b"ping").unwrap();
+    world.run_until(start + back);
+    world.open_link(0);
+    let arrived = world.now;
+    while world.now < start + 20_000 {
+        world.run_for(10);
+        if received(&world, 0, 1, b"ping") > 0 {
+            return Some(world.now - arrived);
+        }
+    }
+    None
+}
+
+/// A board that comes to the relay during a member's dial, at each second of
+/// the dial: how long after its arrival the member's datagram reaches it.
+///
+/// | Board back at | Attempts at 0, 1, 3, 7 s | 0 to 13 s every 2, and arrivals |
+/// |---|---|---|
+/// | 0.5 to 6.5 s | 0.6 to 3.6 s after | 0.2 s after |
+/// | 7.5 to 12.5 s | never: no attempt left | 0.2 s after |
+/// | 13.5, 14.5 s | never | never: the last attempt went at 13 s |
+///
+/// A board back after the last attempt is reached by the application's next
+/// dial.
+#[test]
+fn a_board_that_arrives_during_a_dial() {
+    let mut reached = Vec::new();
+    for second in 0..15 {
+        let took = reached_after_arrival(second * 1000 + 500);
+        eprintln!(
+            "[connect] board back {second}.5 s into the dial: {}",
+            took.map_or("NOT reached".to_string(), |ms| format!(
+                "reached {ms} ms after"
+            ))
+        );
+        reached.push(took);
+    }
+    for (second, took) in reached.iter().enumerate().take(13) {
+        assert!(
+            took.is_some_and(|ms| ms <= 300),
+            "back at {second}.5 s: {took:?}"
+        );
+    }
+}
+
+/// The relay is down for `down` ms, its host restarting; then a member pings
+/// a board resting on its link: the ms from the relay's return to the ping
+/// reaching the board.
+fn reached_after_relay_outage(down: u64) -> Option<u64> {
+    let mut world = World::new(Open, Config::default(), 2);
+    world.direct = false;
+    world.open_link(0);
+    world.open_link(1);
+    world.run_for(2000);
+    world.send(1, 0, b"before").unwrap();
+    world.run_for(2000);
+    assert_eq!(received(&world, 0, 1, b"before"), 1);
+    for client in &mut world.clients {
+        client.udp_blocked = true;
+        client.tcp_refused = true;
+    }
+    let relay = crate::Relay::new(
+        identity(0),
+        Open,
+        TestEntropy(7),
+        Config::default(),
+        world.instant(),
+    )
+    .unwrap();
+    world.replace_relay(relay);
+    world.run_for(down);
+    for client in &mut world.clients {
+        client.udp_blocked = false;
+        client.tcp_refused = false;
+    }
+    ping(&mut world, 1, 0, false, 150_000).0
+}
+
+/// A board resting on its link while the relay is down for 30 seconds, 2
+/// minutes and 10 minutes: how long after the relay's return a member reaches
+/// it. With link attempts up to 60 to 90 s apart: 12.1, 40.1 and 1.2 s (the
+/// last as the jitter fell); up to 15 to 22.5 s apart: 11.1, 14.1 and 4.7 s,
+/// never more than the longest wait and a ping's second.
+#[test]
+fn a_board_after_a_relay_outage() {
+    for down in [30_000, 120_000, 600_000] {
+        let took = reached_after_relay_outage(down);
+        assert!(
+            took.is_some_and(|ms| ms <= 22_500 + 1_500),
+            "down {down} ms: {took:?}"
+        );
+        eprintln!(
+            "[connect] relay down {} s: {}",
+            down / 1000,
+            took.map_or("board NOT reached".to_string(), |ms| format!(
+                "board reached {ms} ms after its return"
+            ))
+        );
+    }
+}

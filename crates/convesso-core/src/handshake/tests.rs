@@ -892,7 +892,7 @@ fn retries_follow_the_schedule_then_give_up() {
         }
     }
     let times: Vec<u64> = sent.iter().map(|(at, _)| *at).collect();
-    assert_eq!(times, vec![0, 1000, 3000, 7000]);
+    assert_eq!(times, vec![0, 1000, 3000, 5000, 7000, 9000, 11_000, 13_000]);
     assert_eq!(failed_at, Some(15_000));
 
     // Each attempt has its own index and ephemeral key.
@@ -947,6 +947,51 @@ fn a_late_response_to_an_earlier_attempt_completes() {
         dial.poll(&initiator, t(3000), &mut entropy, &mut out),
         DialPoll::Failed(_)
     ));
+}
+
+/// Scenario: a response to an attempt no longer kept is ignored: after the
+/// attempts at 0, 1, 3, 5 and 7 seconds, the one at 0 has given its place to
+/// the one at 7; a response to it finds no attempt, and one to any of the four
+/// newest completes the dial.
+#[test]
+fn a_response_to_an_attempt_no_longer_kept_is_ignored() {
+    let mut entropy = TestEntropy(1750);
+    let (mut dial, first) = dial(&mut entropy, None);
+    let initiator = identity(INITIATOR);
+    let mut sent = vec![first];
+    let mut out = [0u8; 256];
+    for at in [1000, 3000, 5000, 7000] {
+        let DialPoll::Send(len) = dial.poll(&initiator, t(at), &mut entropy, &mut out) else {
+            panic!("an attempt at {at} ms");
+        };
+        sent.push(out[..len].to_vec());
+    }
+    let late = answer(
+        &mut responder(),
+        &sent[0],
+        t(7100),
+        &mut Fixed::accept(),
+        &mut entropy,
+    )
+    .unwrap();
+    assert!(matches!(
+        dial.handle(&initiator, &late, t(7200)),
+        DialEvent::Ignored
+    ));
+    assert!(dial.attempt_indices().count() == crate::handshake::ATTEMPTS_KEPT);
+    let kept = answer(
+        &mut responder(),
+        &sent[1],
+        t(7300),
+        &mut Fixed::accept(),
+        &mut entropy,
+    )
+    .unwrap();
+    let index = messages::parse_first_contact(&sent[1])
+        .unwrap()
+        .initiator_index;
+    let established = established(dial.handle(&initiator, &kept, t(7400)));
+    assert_eq!(established.local_index(), index);
 }
 
 /// Scenario: two handshakes never share a binding.

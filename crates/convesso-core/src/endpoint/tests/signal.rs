@@ -310,6 +310,45 @@ impl Servers {
     }
 }
 
+/// On the server profile a dial's attempts are found through the map of
+/// indices: it holds the four kept, and releases each one an attempt replaces.
+#[test]
+fn a_server_keeps_the_indices_of_four_attempts_per_dial() {
+    let mut servers = Servers::new();
+    let address = *servers.nodes[1].identity().unwrap().address();
+    let mut out = [0u8; 2048];
+    let _ = servers.nodes[0]
+        .send(
+            Target::Address(&address),
+            b"session",
+            b"unanswered",
+            PATH,
+            Instant::from_millis(0),
+            &mut servers.policy,
+            &mut servers.entropy[0],
+            &mut out,
+        )
+        .unwrap();
+    let mut most = servers.nodes[0].indices.len();
+    for ms in (0..=15_000).step_by(100) {
+        let now = Instant::from_millis(ms);
+        loop {
+            match servers.nodes[0].poll(now, &mut servers.policy, &mut servers.entropy[0], &mut out)
+            {
+                Poll::Wait(_) | Poll::Idle => break,
+                _ => {}
+            }
+        }
+        most = most.max(servers.nodes[0].indices.len());
+    }
+    assert_eq!(most, crate::handshake::ATTEMPTS_KEPT);
+    assert_eq!(
+        servers.nodes[0].indices.len(),
+        0,
+        "all released when the dial gave up"
+    );
+}
+
 /// On the server profile the signal finds its session through the map of
 /// remote indices, which holds one entry per current pair.
 #[test]

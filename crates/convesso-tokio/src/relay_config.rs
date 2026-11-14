@@ -20,6 +20,7 @@
 //! queue_per_recipient = 262144    # bytes waiting on one link
 //! link_silence_seconds = 180      # a silent link is closed
 //! not_connected_every_ms = 1000   # one not-connected notice per sender and recipient
+//! seekers_per_recipient = 32      # clients told when a recipient they sought arrives
 //!
 //! [allowlist]                     # optional: only these clients
 //! keys = ["d75a9801..."]          # Ed25519 addresses, in hex
@@ -112,6 +113,8 @@ pub struct LimitsFile {
     /// Milliseconds between two not-connected notices for one sender and
     /// recipient.
     pub not_connected_every_ms: Option<u64>,
+    /// Clients told of a recipient's arrival, per recipient; 0 tells none.
+    pub seekers_per_recipient: Option<usize>,
 }
 
 /// The `[allowlist]` table.
@@ -264,6 +267,7 @@ impl FileConfig {
             not_connected_every: l
                 .not_connected_every_ms
                 .map_or(d.not_connected_every, Duration::from_millis),
+            seekers_per_recipient: l.seekers_per_recipient.unwrap_or(d.seekers_per_recipient),
         })
     }
 

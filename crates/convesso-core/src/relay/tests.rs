@@ -50,6 +50,9 @@ fn expected<'a>(vector: &Value, packet: &'a [u8]) -> Frame<'a> {
         "not_connected" => Frame::NotConnected {
             recipient: key(&vector["peer"]),
         },
+        "arrived" => Frame::Arrived {
+            peer: key(&vector["peer"]),
+        },
         "register" => Frame::Register {
             address: key(&vector["address"]),
         },

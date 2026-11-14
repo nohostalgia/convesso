@@ -84,10 +84,19 @@ pub const ASK_ADDRESS_AT: [Duration; 4] = [
 /// consecutive failure.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 
-/// The longest wait between link attempts, before jitter: with the jitter of
-/// up to half again, attempts on an unreachable relay come every 60 to 90
-/// seconds, never more than one a minute.
+/// The longest wait after a relay session the relay refused or did not
+/// answer, before jitter: with the jitter of up to half again, a relay that is
+/// there and says no is asked every 60 to 90 seconds, never more than once a
+/// minute.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// The longest wait after a link that did not open, hung or died, before
+/// jitter: a resting client is back within 15 to 22.5 seconds of its relay,
+/// at the cost of an attempt as often while the relay is unreachable.
+pub const LINK_BACKOFF_CAP: Duration = Duration::from_secs(15);
+
+/// At most one link attempt this often is brought forward by packets to send.
+pub const BRING_FORWARD_EVERY: Duration = Duration::from_secs(1);
 
 /// Which way a packet for the relay goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +216,11 @@ pub(crate) struct RelayClient {
     /// Consecutive link attempts that ended before this endpoint was
     /// registered on the link.
     failures: u32,
+    /// The last of them ended with the relay session refused or unanswered,
+    /// rather than with the link: its backoff is capped at [`BACKOFF_CAP`].
+    refused: bool,
+    /// When a packet to send last brought a link attempt forward.
+    brought_forward: Option<Instant>,
     /// Registered on the current link: its relay session live on it, and its
     /// register sent. Only this resets the backoff (`DESIGN.md §6`).
     registered: bool,
@@ -250,6 +264,8 @@ impl RelayClient {
             reachable: false,
             link: LinkState::None,
             failures: 0,
+            refused: false,
+            brought_forward: None,
             registered: false,
             pending: None,
             close_due: false,
@@ -375,6 +391,7 @@ impl RelayClient {
             LinkState::Waiting(Some(now))
         } else {
             self.failures = self.failures.saturating_add(1);
+            self.refused = false;
             LinkState::Waiting(None)
         };
         if self.reachable {
@@ -392,6 +409,7 @@ impl RelayClient {
             self.close_due = true;
             self.register_due = false;
             self.failures = self.failures.saturating_add(1);
+            self.refused = true;
             self.link = LinkState::Waiting(None);
         }
     }
@@ -1237,6 +1255,19 @@ impl<C: Config> Endpoint<C> {
                     Ok(Frame::NotConnected { recipient }) => Output::Event(Event::PeerNotAtRelay {
                         peer: PeerId::vouched(recipient),
                     }),
+                    // A peer this endpoint sought has come to the relay: each
+                    // dial to it tries again at once (`PROTOCOL.md §6`). The
+                    // handshake that follows tells the application.
+                    Ok(Frame::Arrived { peer }) => {
+                        let peer = PeerId::vouched(peer);
+                        self.dials.retain(|(p, _), dial| {
+                            if *p == peer {
+                                dial.hurry(now);
+                            }
+                            true
+                        });
+                        Output::Nothing
+                    }
                     Ok(Frame::Observed { link, address }) => {
                         if link == Link::Udp {
                             self.observed_public(address);
@@ -1575,6 +1606,18 @@ impl<C: Config> Endpoint<C> {
                 RelayPath::Tcp
             }
         } else {
+            // A packet for the relay, with UDP not proven and the link waiting
+            // for its backoff: the link is asked for at once, at most once a
+            // second (`PROTOCOL.md §6`). The packet still tries UDP.
+            if let LinkState::Waiting(Some(at)) = relay.link
+                && at > now
+                && relay
+                    .brought_forward
+                    .is_none_or(|last| now >= last.saturating_add(BRING_FORWARD_EVERY))
+            {
+                relay.brought_forward = Some(now);
+                relay.link = LinkState::Waiting(Some(now));
+            }
             RelayPath::Udp
         }
     }
@@ -1929,7 +1972,12 @@ impl<C: Config> Endpoint<C> {
         }
         if relay.link == LinkState::Waiting(None) {
             let exponent = relay.failures.saturating_sub(1).min(16);
-            let wait = BACKOFF_FIRST.saturating_mul(1 << exponent).min(BACKOFF_CAP);
+            let cap = if relay.refused {
+                BACKOFF_CAP
+            } else {
+                LINK_BACKOFF_CAP
+            };
+            let wait = BACKOFF_FIRST.saturating_mul(1 << exponent).min(cap);
             let mut draw = [0u8; 2];
             entropy.fill(&mut draw);
             let base = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);

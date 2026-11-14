@@ -8,6 +8,7 @@
 //!   0x03 not conn.  kind 0x01 | recipient (32)                        relay -> client
 //!   0x04 register   address (32)                                      client -> relay
 //!   0x05 observed   link (1) | family (1) | address (4|16) | port (2, LE)
+//!   0x06 arrived    kind 0x01 | peer (32)                             relay -> client
 //! TCP link:
 //!   preamble "convesso" 0x01, once in each direction
 //!   length (2, LE) | packet          length 0: keep-alive, at most 1,500
@@ -41,6 +42,8 @@ pub mod frame_type {
     pub const REGISTER: u8 = 0x04;
     /// Relay to client: the address the relay sees the client at.
     pub const OBSERVED: u8 = 0x05;
+    /// Relay to client: a peer the client sought has come to the relay.
+    pub const ARRIVED: u8 = 0x06;
 }
 
 /// The only recipient kind of this version: a `PeerId`.
@@ -90,6 +93,12 @@ pub enum Frame<'a> {
     Register {
         /// Its 32 bytes.
         address: [u8; 32],
+    },
+    /// `peer`, which the client sought within a dial's life, has come to
+    /// the relay: the client's dials to it may try again at once.
+    Arrived {
+        /// The peer's `PeerId` bytes.
+        peer: [u8; 32],
     },
     /// The address the relay sees the client at, on `link`.
     Observed {
@@ -182,10 +191,15 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, FrameError> {
                 }
             })
         }
-        frame_type::NOT_CONNECTED => match rest {
-            [KIND_PEER_ID, peer @ ..] => Ok(Frame::NotConnected {
-                recipient: key(peer)?,
-            }),
+        frame_type::NOT_CONNECTED | frame_type::ARRIVED => match rest {
+            [KIND_PEER_ID, peer @ ..] => {
+                let peer = key(peer)?;
+                Ok(if kind_of_frame == frame_type::ARRIVED {
+                    Frame::Arrived { peer }
+                } else {
+                    Frame::NotConnected { recipient: peer }
+                })
+            }
             [_, peer @ ..] if peer.len() == 32 => Err(FrameError::ReservedKind),
             _ => Err(FrameError::WrongLength),
         },
@@ -291,6 +305,10 @@ pub fn encode(frame: &Frame<'_>, out: &mut [u8]) -> Result<usize, FrameError> {
         }
         Frame::NotConnected { recipient } => {
             write_routed_header(frame_type::NOT_CONNECTED, recipient, out)?;
+            Ok(ROUTED_HEADER_LEN)
+        }
+        Frame::Arrived { peer } => {
+            write_routed_header(frame_type::ARRIVED, peer, out)?;
             Ok(ROUTED_HEADER_LEN)
         }
         Frame::Register { address } => {

@@ -19,7 +19,7 @@ HERE = pathlib.Path(__file__).parent
 OUT = HERE / "relay-v1.json"
 FIRMWARE_OUT = HERE.parent.parent.parent / "firmware" / "src" / "relay_vectors.rs"
 
-FORWARD, DELIVER, NOT_CONNECTED, REGISTER, OBSERVED = 0x01, 0x02, 0x03, 0x04, 0x05
+FORWARD, DELIVER, NOT_CONNECTED, REGISTER, OBSERVED, ARRIVED = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 KIND_PEER_ID = 0x01
 LINK = {"udp": 0x00, "tcp": 0x01}
 MAX_PACKET = 1380
@@ -62,6 +62,8 @@ def frames():
                 "bytes": routed(FORWARD, a, packet(18, 0x00)).hex()})
     out.append({"name": "not connected", "type": "not_connected", "peer": b.hex(),
                 "bytes": (struct.pack("<BB", NOT_CONNECTED, KIND_PEER_ID) + b).hex()})
+    out.append({"name": "arrived", "type": "arrived", "peer": b.hex(),
+                "bytes": (struct.pack("<BB", ARRIVED, KIND_PEER_ID) + b).hex()})
     out.append({"name": "register", "type": "register", "address": address.hex(),
                 "bytes": (bytes([REGISTER]) + address).hex()})
     for link, ip, port in (("udp", "203.0.113.7", 41641), ("tcp", "198.51.100.200", 443),
@@ -69,7 +71,7 @@ def frames():
         out.append({"name": f"observed {link} {ip} port {port}", "type": "observed",
                     "link": link, "ip": ip, "port": port, "bytes": observed(link, ip, port).hex()})
     for frame in out:
-        assert bytes.fromhex(frame["bytes"])[0] in (FORWARD, DELIVER, NOT_CONNECTED, REGISTER, OBSERVED)
+        assert bytes.fromhex(frame["bytes"])[0] in (FORWARD, DELIVER, NOT_CONNECTED, REGISTER, OBSERVED, ARRIVED)
     return out
 
 
@@ -77,7 +79,7 @@ def malformed():
     a = peer_id(b"a")
     cases = [
         ("empty frame", b"", "empty"),
-        ("unknown frame type 0x06", bytes([0x06]) + a, "unknown type"),
+        ("unknown frame type 0x07", bytes([0x07]) + a, "unknown type"),
         ("unknown frame type 0x00", bytes([0x00]) + a, "unknown type"),
         ("forward with reserved kind 0x02", struct.pack("<BB", FORWARD, 0x02) + a + packet(10), "reserved kind"),
         ("deliver with reserved kind 0x00", struct.pack("<BB", DELIVER, 0x00) + a + packet(10), "reserved kind"),
@@ -89,6 +91,9 @@ def malformed():
         ("not connected of 35 bytes", struct.pack("<BB", NOT_CONNECTED, KIND_PEER_ID) + a + b"\x00", "wrong length"),
         ("not connected of 33 bytes", struct.pack("<BB", NOT_CONNECTED, KIND_PEER_ID) + a[:31], "wrong length"),
         ("not connected with reserved kind", struct.pack("<BB", NOT_CONNECTED, 0x02) + a, "reserved kind"),
+        ("arrived of 35 bytes", struct.pack("<BB", ARRIVED, KIND_PEER_ID) + a + b"\x00", "wrong length"),
+        ("arrived of 33 bytes", struct.pack("<BB", ARRIVED, KIND_PEER_ID) + a[:31], "wrong length"),
+        ("arrived with reserved kind", struct.pack("<BB", ARRIVED, 0x02) + a, "reserved kind"),
         ("register of 32 bytes", bytes([REGISTER]) + a[:31], "wrong length"),
         ("register of 34 bytes", bytes([REGISTER]) + a + b"\x00", "wrong length"),
         ("observed with unknown link", struct.pack("<BBB", OBSERVED, 0x02, 0x04) + bytes(4) + b"\x01\x00", "unknown link"),
