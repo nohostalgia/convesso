@@ -141,7 +141,8 @@ fn every_limit_is_configurable() {
          packets_burst = 4\nfirst_contacts_per_recipient = 5\nfirst_contacts_burst = 6\n\
          handshakes_per_ip = 7\nhandshakes_burst = 8\nlinks_per_ip = 9\n\
          new_links_per_second = 200\nnew_links_burst = 1000\nqueue_per_recipient = 4096\n\
-         link_silence_seconds = 300\nnot_connected_every_ms = 250\nseekers_per_recipient = 7\n"
+         link_silence_seconds = 300\nnot_connected_every_ms = 250\nseekers_per_recipient = 7\n\
+         asked_per_sender = 8\nasked_total = 9000\n"
     ))
     .unwrap()
     .relay_config()
@@ -164,6 +165,8 @@ fn every_limit_is_configurable() {
         link_silence: Duration::from_secs(300),
         not_connected_every: Duration::from_millis(250),
         seekers_per_recipient: 7,
+        asked_per_sender: 8,
+        asked_total: 9000,
     };
     assert_eq!(config, expected);
 
@@ -193,6 +196,8 @@ fn a_limit_that_would_stop_the_relay_is_refused() {
         ("bytes_burst = 1000", "bytes_burst"),
         ("queue_per_recipient = 100", "queue_per_recipient"),
         ("link_silence_seconds = 60", "link_silence_seconds"),
+        ("asked_per_sender = 0", "asked_per_sender"),
+        ("asked_total = 0", "asked_total"),
     ] {
         let error = parse(&format!("{HEAD}[limits]\n{line}\n"))
             .unwrap()

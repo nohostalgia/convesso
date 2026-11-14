@@ -199,7 +199,9 @@ Two devices behind NATs often cannot reach each other at first. A relay helps th
   separate address probes are needed.
 - **A peer that comes is reached at once.** The relay remembers, for a dial's life, who sought a
   recipient that was not there, and tells them when it comes; their dials try again then, rather
-  than at their next attempt. Nobody else hears of it, and nothing is sent at rest.
+  than at their next attempt. Nobody else hears of it, and nothing is sent at rest. What the relay
+  remembers for this, and for its not-connected notices, is bounded per sender and in total, so it
+  cannot grow without limit however many clients ask, nor however fast.
 - **The relay does not wait on a slow recipient.** Each client has limits; a packet beyond them,
   or for a recipient whose queue is full, is dropped.
 - **A client backs off until it is registered.** A link attempt that ends before the client is

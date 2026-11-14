@@ -10,7 +10,7 @@
     clippy::too_many_lines
 )]
 
-mod world;
+pub(crate) mod world;
 
 mod attempts;
 mod candidates;
