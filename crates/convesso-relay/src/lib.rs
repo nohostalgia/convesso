@@ -42,6 +42,9 @@ use convesso_core::relay::{self, Frame, Link};
 use convesso_core::storage::Server;
 use convesso_core::time::Instant;
 
+mod asked;
+use asked::Asked;
+
 /// The driver's name for a TCP link.
 pub type LinkId = u64;
 
@@ -99,8 +102,15 @@ pub struct Config {
     /// At most one not-connected notice this often per sender and recipient.
     pub not_connected_every: Duration,
     /// Clients told a recipient is not connected that are told when it
-    /// arrives, per recipient: the newest are kept.
+    /// arrives, per recipient: the newest are kept. 0 tells none.
     pub seekers_per_recipient: usize,
+    /// Recipients not connected that one sender's forwards are remembered for,
+    /// for its notices and its arrivals: the most recently asked are kept.
+    /// At least 1.
+    pub asked_per_sender: usize,
+    /// Pairs of sender and recipient remembered over all senders, about 500
+    /// bytes each: the most recently asked are kept. At least 1.
+    pub asked_total: usize,
 }
 
 impl Default for Config {
@@ -118,6 +128,9 @@ impl Default for Config {
             link_silence: Duration::from_secs(180),
             not_connected_every: Duration::from_secs(1),
             seekers_per_recipient: 32,
+            asked_per_sender: 64,
+            // About 100 MB.
+            asked_total: 200_000,
         }
     }
 }
@@ -130,10 +143,6 @@ pub const UDP_PROVEN_FOR: Duration = convesso_core::endpoint::UDP_PROVEN_FOR;
 /// deliveries for it waiting for its confirmation: the pending handshake's
 /// lifetime.
 const PENDING_FOR: Duration = Duration::from_secs(5);
-
-/// How long a client that sought a recipient not connected is told of its
-/// arrival: a dial's life, after which it has no dial left to bring forward.
-const SEEKING_FOR: Duration = convesso_core::handshake::GIVE_UP_AFTER;
 
 /// The largest packet the relay sends a client: a deliver of the largest
 /// carried packet, sealed.
@@ -422,10 +431,9 @@ pub struct Relay<P, E> {
     links: HashMap<LinkId, LinkState>,
     ips: HashMap<IpAddr, IpState>,
     new_links: Bucket,
-    notices: HashMap<([u8; 32], [u8; 32]), Instant>,
-    /// For each recipient not connected, the clients that sought it and until
-    /// when they are told of its arrival (`PROTOCOL.md §6`).
-    seekers: HashMap<[u8; 32], Vec<(PeerId, Instant)>>,
+    /// The forwards it could not carry: for the notices it limits and the
+    /// arrivals it tells (`PROTOCOL.md §6`), bounded.
+    asked: Asked,
     actions: VecDeque<Action>,
     out: Vec<u8>,
     /// The packet being handled already reported its sender's address: a
@@ -479,8 +487,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             links: HashMap::new(),
             ips: HashMap::new(),
             new_links: Bucket::full(config.new_links_burst, now),
-            notices: HashMap::new(),
-            seekers: HashMap::new(),
+            asked: Asked::default(),
             actions: VecDeque::new(),
             out: vec![0; MAX_OUT],
             #[cfg(test)]
@@ -618,7 +625,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
     }
 
     /// Forgets what no longer matters: clients nothing could reach, idle IP
-    /// addresses, old not-connected notices.
+    /// addresses, forwards asked for too long ago.
     fn prune(&mut self, now: Instant) {
         let endpoint = &self.endpoint;
         self.clients.retain(|_, client| {
@@ -630,12 +637,7 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         });
         let clients = &self.clients;
         self.owners.retain(|_, key| clients.contains_key(key));
-        self.seekers.retain(|_, seekers| {
-            seekers.retain(|(_, until)| now < *until);
-            !seekers.is_empty()
-        });
-        let every = self.config.not_connected_every;
-        self.notices.retain(|_, at| now < at.saturating_add(every));
+        self.asked.prune(now);
         let config = self.config;
         // An address with no link and a full bucket holds nothing worth keeping.
         self.ips.retain(|_, ip| {
@@ -650,14 +652,15 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         });
     }
 
-    /// How many clients, links, addresses and notices the relay holds.
+    /// How many clients, links, addresses, and pairs of sender and recipient
+    /// not connected the relay holds.
     #[must_use]
     pub fn table_sizes(&self) -> (usize, usize, usize, usize) {
         (
             self.clients.len(),
             self.links.len(),
             self.ips.len(),
-            self.notices.len(),
+            self.asked.len(),
         )
     }
 
@@ -908,8 +911,9 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
             .get_mut(&recipient)
             .filter(|client| client.reachable(now))
         else {
-            self.seeking(sender, recipient, now);
-            self.not_connected(sender, recipient, now);
+            // Only a dial is helped by an arrival.
+            let seeking = is_first_contact(packet);
+            self.not_connected(sender, recipient, seeking, now);
             return;
         };
         if is_first_contact(packet)
@@ -942,31 +946,6 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         self.send_to(peer, frame.get(..len).unwrap_or_default(), now);
     }
 
-    /// `sender` sought `recipient`, which is not connected: it is told when the
-    /// recipient arrives, for a dial's life. The newest seekers are kept.
-    fn seeking(&mut self, sender: PeerId, recipient: [u8; 32], now: Instant) {
-        let most = self.config.seekers_per_recipient;
-        if most == 0 {
-            return;
-        }
-        let until = now.saturating_add(SEEKING_FOR);
-        let seekers = self.seekers.entry(recipient).or_default();
-        if let Some(seeker) = seekers.iter_mut().find(|(key, _)| *key == sender) {
-            seeker.1 = until;
-            return;
-        }
-        if seekers.len() >= most
-            && let Some(oldest) = seekers
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, until))| *until)
-                .map(|(at, _)| at)
-        {
-            seekers.swap_remove(oldest);
-        }
-        seekers.push((sender, until));
-    }
-
     /// `peer` authenticated a packet and can be reached: each client still
     /// seeking it is told once, with an arrived frame.
     fn arrived(&mut self, peer: PeerId, now: Instant) {
@@ -977,9 +956,10 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         {
             return;
         }
-        let Some(seekers) = self.seekers.remove(peer.as_bytes()) else {
+        let seekers = self.asked.arrived(peer.as_bytes(), now);
+        if seekers.is_empty() {
             return;
-        };
+        }
         let mut frame = [0u8; relay::ROUTED_HEADER_LEN];
         let Ok(len) = relay::encode(
             &Frame::Arrived {
@@ -989,27 +969,33 @@ impl<P: Policy, E: Entropy> Relay<P, E> {
         ) else {
             return;
         };
-        for (seeker, until) in seekers {
-            if now < until {
-                #[cfg(test)]
-                self.arrivals_sent
-                    .push((*seeker.as_bytes(), *peer.as_bytes(), now.as_millis()));
-                self.send_to(seeker, frame.get(..len).unwrap_or_default(), now);
-            }
+        for seeker in seekers {
+            #[cfg(test)]
+            self.arrivals_sent
+                .push((*seeker.as_bytes(), *peer.as_bytes(), now.as_millis()));
+            self.send_to(seeker, frame.get(..len).unwrap_or_default(), now);
         }
     }
 
-    /// Tells `sender`, at most once per interval, that `recipient` is not here.
-    fn not_connected(&mut self, sender: PeerId, recipient: [u8; 32], now: Instant) {
-        let pair = (*sender.as_bytes(), recipient);
-        if self
-            .notices
-            .get(&pair)
-            .is_some_and(|at| now < at.saturating_add(self.config.not_connected_every))
-        {
+    /// Tells `sender`, at most once per interval, that `recipient` is not
+    /// here; when `seeking`, it is told of the recipient's arrival.
+    fn not_connected(&mut self, sender: PeerId, recipient: [u8; 32], seeking: bool, now: Instant) {
+        let config = self.config;
+        let bounds = asked::Bounds {
+            per_sender: config.asked_per_sender,
+            total: config.asked_total,
+            seekers_per_recipient: config.seekers_per_recipient,
+        };
+        if !self.asked.ask(
+            sender,
+            recipient,
+            seeking,
+            bounds,
+            config.not_connected_every,
+            now,
+        ) {
             return;
         }
-        self.notices.insert(pair, now);
         let mut frame = [0u8; relay::ROUTED_HEADER_LEN];
         if let Ok(len) = relay::encode(&Frame::NotConnected { recipient }, &mut frame) {
             self.send_to(sender, frame.get(..len).unwrap_or_default(), now);

@@ -2,6 +2,7 @@
 //! a recipient not connected when that recipient comes, and the client's dial
 //! tries again at once.
 
+use convesso_core::endpoint::{Output, To};
 use convesso_core::identity::PeerId;
 
 use super::world::*;
@@ -213,4 +214,195 @@ fn the_seekers_kept_are_bounded() {
     let mut last: Vec<PeerId> = (9..41).map(|i| world.clients[i].peer_id()).collect();
     last.sort_unstable_by_key(|id| *id.as_bytes());
     assert_eq!(told, last);
+}
+
+// --- what the relay remembers is bounded -------------------------------------------------
+
+/// Client `i` forwards, through its live relay session, a packet of 60 bytes
+/// to `peer`: shaped as a first contact (`01 01`), or as a transport packet
+/// (`01 04`).
+fn forward_raw(world: &mut World<Open>, i: usize, peer: PeerId, first_contact: bool) {
+    let now = world.instant();
+    let client = &mut world.clients[i];
+    let mut out = [0x01u8; 2048];
+    if !first_contact {
+        out[1] = 0x04;
+    }
+    let output = client
+        .endpoint
+        .through_relay(
+            peer,
+            60,
+            now,
+            &mut client.policy,
+            &mut client.entropy,
+            &mut out,
+        )
+        .unwrap();
+    let Output::Transmit {
+        to: To::Relay(_),
+        len,
+    } = output
+    else {
+        panic!("the relay session is live");
+    };
+    world.inject_from(i, &out[..len]);
+}
+
+/// How many made-up recipients a client forwards to: well over the 64 the
+/// relay keeps per sender. The module's own tests take 10,000.
+const MADE_UP: usize = 200;
+
+/// A recipient that never connects; derived once, a key costing a scalar
+/// multiplication.
+fn made_up(i: usize) -> PeerId {
+    static KEYS: std::sync::OnceLock<Vec<PeerId>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        (0..MADE_UP)
+            .map(|i| identity(10_000 + i).peer_id())
+            .collect()
+    })[i]
+}
+
+fn bounds(config: &Config) -> crate::asked::Bounds {
+    crate::asked::Bounds {
+        per_sender: config.asked_per_sender,
+        total: config.asked_total,
+        seekers_per_recipient: config.seekers_per_recipient,
+    }
+}
+
+/// Scenario: one client cannot fill the relay: first contacts to 200
+/// made-up recipients leave at most 64 pairs for it, and at most one notice
+/// per forward.
+#[test]
+fn one_client_cannot_fill_the_relay() {
+    let mut world = board_away(2);
+    let sender = world.clients[1].peer_id();
+    let notices = |world: &World<Open>| {
+        world.clients[1]
+            .events
+            .iter()
+            .filter(|e| matches!(e, Ev::NotAtRelay(_)))
+            .count()
+    };
+    let before = notices(&world);
+    for i in 0..MADE_UP {
+        forward_raw(&mut world, 1, made_up(i), true);
+        world.relay.asked.check(bounds(&Config::default()));
+        assert!(world.relay.asked.of_sender(&sender) <= 64);
+    }
+    world.run_for(500);
+    assert_eq!(world.relay.asked.len(), 64);
+    assert!(notices(&world) - before <= MADE_UP);
+}
+
+/// Scenario: many clients stay within the total, the newest kept; and
+/// nothing outlives its time.
+#[test]
+fn many_clients_stay_within_the_total() {
+    let config = Config {
+        asked_total: 100,
+        ..Config::default()
+    };
+    let mut world = World::new(Open, config, 10);
+    world.direct = false;
+    for i in 0..10 {
+        world.open_link(i);
+    }
+    world.run_for(2000);
+    for i in 0..10 {
+        for r in 0..64 {
+            forward_raw(&mut world, i, made_up(r), true);
+            world.relay.asked.check(bounds(&config));
+        }
+        world.run_for(10);
+    }
+    world.run_for(100);
+    world.relay.asked.check(bounds(&config));
+    assert_eq!(world.relay.asked.len(), 100);
+    assert_eq!(world.relay.asked.of_sender(&world.clients[9].peer_id()), 64);
+    assert_eq!(world.relay.asked.of_sender(&world.clients[8].peer_id()), 36);
+    world.run_for(15_000);
+    assert!(world.relay.asked.is_empty(), "nothing after 15 s");
+    assert_eq!(world.relay.table_sizes().3, 0);
+}
+
+/// Scenario: a client asking for a few peers is unaffected while another
+/// fills its bound: its arrivals, and its notices.
+#[test]
+fn a_client_asking_for_a_few_peers_is_unaffected() {
+    let mut world = World::new(Open, Config::default(), 5);
+    world.direct = false;
+    for i in 3..5 {
+        world.open_link(i);
+    }
+    world.run_for(2000);
+    // Two: a board, as every client here, dials two peers at once.
+    for peer in 0..2 {
+        world.send(3, peer, b"call").unwrap();
+    }
+    for r in 0..MADE_UP {
+        forward_raw(&mut world, 4, made_up(r), true);
+        if r % 20 == 19 {
+            world.run_for(5);
+        }
+    }
+    world.run_for(500);
+    assert_eq!(world.relay.asked.of_sender(&world.clients[4].peer_id()), 64);
+    for peer in 0..2 {
+        let id = world.clients[peer].peer_id();
+        assert!(world.clients[3].events.contains(&Ev::NotAtRelay(id)));
+        world.open_link(peer);
+    }
+    world.run_for(1000);
+    let legit = world.clients[3].peer_id();
+    for peer in 0..2 {
+        let id = world.clients[peer].peer_id();
+        let told: Vec<PeerId> = arrivals_naming(&world, id)
+            .into_iter()
+            .map(|(to, _)| to)
+            .collect();
+        assert_eq!(told, vec![legit], "peer {peer}");
+        assert!(world.when(3, &Ev::Connected(id)).is_some(), "peer {peer}");
+    }
+}
+
+/// Scenario: a forward of data makes no seeker: its sender is told the
+/// recipient is not connected, and nothing of its arrival.
+#[test]
+fn a_forward_of_data_makes_no_seeker() {
+    let mut world = board_away(2);
+    let b = world.clients[0].peer_id();
+    forward_raw(&mut world, 1, b, false);
+    world.run_for(500);
+    assert!(world.clients[1].events.contains(&Ev::NotAtRelay(b)));
+    world.open_link(0);
+    world.run_for(1000);
+    assert!(arrivals_naming(&world, b).is_empty());
+}
+
+/// Scenario: a seeker dropped by a bound still reaches the peer: A dials B,
+/// then seeks 64 other recipients, which push B out of what the relay keeps
+/// for A; B comes at 2 s; A is not told, and its attempt at 3 s reaches B.
+#[test]
+fn a_seeker_dropped_by_a_bound_still_reaches_the_peer() {
+    let mut world = board_away(2);
+    let b = world.clients[0].peer_id();
+    let start = world.now;
+    world.send(1, 0, b"call").unwrap();
+    world.run_until(start + 1500);
+    for r in 0..64 {
+        forward_raw(&mut world, 1, made_up(r), true);
+    }
+    world.run_until(start + 2000);
+    world.open_link(0);
+    world.run_until(start + 5000);
+    assert!(arrivals_naming(&world, b).is_empty(), "A was not told");
+    let connected = world.when(1, &Ev::Connected(b)).expect("A reached B");
+    assert!(
+        (start + 3000..start + 3500).contains(&connected),
+        "at its attempt at 3 s: {}",
+        connected - start
+    );
 }

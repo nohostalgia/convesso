@@ -355,11 +355,14 @@ Each keep-alive and its answer cost one TLS record: 22 bytes more each way.
 - **End to end is untouched.** A client hands a delivered packet to its own endpoint as coming
   from that sender through the relay; every check of §3, §4 and §5 applies to it.
 - **Not connected.** When the relay cannot reach a recipient, it tells the sender, at most once a
-  second per pair. It is reported as information, not as the failure of a session.
-- **Arrived.** The relay remembers each sender it told that a recipient is not connected, for 15
-  seconds after its latest forward to it (a dial's life), and at most 32 per recipient, the newest
-  kept. When the recipient's relay session next authenticates a packet, each of them gets one
-  arrived frame, and is forgotten. The sender sends the next attempt of its dials to that peer at
+  second per pair it still remembers. It is reported as information, not as the failure of a
+  session. What the relay remembers of these pairs, for the notices and the arrivals, is bounded
+  per sender, over all senders, and to 15 seconds after the last forward.
+- **Arrived.** The relay remembers each sender of a first contact it could not carry, for 15
+  seconds after its latest such forward (a dial's life), at most 32 per recipient and 64 per
+  sender, the newest kept, and within a bound over all senders. When the recipient's relay session
+  next authenticates a packet, each of them gets one arrived frame, and is forgotten. A seeker
+  dropped by a bound is not told, and reaches the peer at its dial's next attempt. The sender sends the next attempt of its dials to that peer at
   once, so it is reached a round trip after it comes rather than at the next attempt (§3). Nobody
   hears of a peer they did not seek; the frame tells nothing but the arrival.
 - **No address is trusted before it is authenticated.** The relay records a client's UDP address

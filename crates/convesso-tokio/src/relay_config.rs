@@ -21,6 +21,8 @@
 //! link_silence_seconds = 180      # a silent link is closed
 //! not_connected_every_ms = 1000   # one not-connected notice per sender and recipient
 //! seekers_per_recipient = 32      # clients told when a recipient they sought arrives
+//! asked_per_sender = 64           # recipients not connected remembered per sender
+//! asked_total = 200000            # pairs remembered over all senders, ~500 bytes each
 //!
 //! [allowlist]                     # optional: only these clients
 //! keys = ["d75a9801..."]          # Ed25519 addresses, in hex
@@ -115,6 +117,10 @@ pub struct LimitsFile {
     pub not_connected_every_ms: Option<u64>,
     /// Clients told of a recipient's arrival, per recipient; 0 tells none.
     pub seekers_per_recipient: Option<usize>,
+    /// Recipients not connected remembered per sender; at least 1.
+    pub asked_per_sender: Option<usize>,
+    /// Pairs of sender and recipient remembered over all senders; at least 1.
+    pub asked_total: Option<usize>,
 }
 
 /// The `[allowlist]` table.
@@ -194,6 +200,14 @@ impl FileConfig {
             Some(v) => v,
             None => d.links_per_ip,
         };
+        let at_least_one = |name: &str, value: Option<usize>, default: usize| match value {
+            Some(0) => Err(format!("limits.{name}: 0 is below 1")),
+            Some(v) => Ok(v),
+            None => Ok(default),
+        };
+        let asked_per_sender =
+            at_least_one("asked_per_sender", l.asked_per_sender, d.asked_per_sender)?;
+        let asked_total = at_least_one("asked_total", l.asked_total, d.asked_total)?;
         let queue_per_recipient = match l.queue_per_recipient {
             Some(v) if v < MAX_CARRIED => {
                 return Err(format!(
@@ -268,6 +282,8 @@ impl FileConfig {
                 .not_connected_every_ms
                 .map_or(d.not_connected_every, Duration::from_millis),
             seekers_per_recipient: l.seekers_per_recipient.unwrap_or(d.seekers_per_recipient),
+            asked_per_sender,
+            asked_total,
         })
     }
 
